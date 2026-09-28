@@ -4,7 +4,7 @@
 --
 -- After install, run: startup
 
-local BASE_URL = "https://raw.githubusercontent.com/Artmoby7674/aeronautics_ship_os/master"
+local BASE_URL = "https://raw.githubusercontent.com/Artmoby7674/aeronautics_artcorp_os/master"
 
 local files = {
     "startup",
@@ -17,6 +17,11 @@ local files = {
     "lib/hud.lua",
     "lib/gfx.lua",
     "lib/font.lua",
+    "lib/record.lua",
+    "lib/report.lua",
+    "lib/kbd.lua",
+    "lib/waypoints.lua",
+    "kbd.lua",
     "mkconfig.lua",
 }
 

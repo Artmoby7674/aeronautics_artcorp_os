@@ -108,6 +108,91 @@ local LAND_FA_FULL = 2.5    -- m/s excess velocity to reach max duty
 local LAND_FA_SIGN = 1      -- flip if the rear push amplifies drift
 local LAND_ALT_ERR_SHUTDOWN = 20 -- m goal-below-ship error: stop + OS shutdown
 
+-- ============================================================
+-- Waypoint AUTOPILOT (ACTIONS -> AUTOPILOT / >>> in WP popup).
+-- Replaces the old wp_travel. Sequence:
+--   aim   (HOVER)  two steps: CLIMB (goal +AP_CLIMB_GOAL_RATE b/s until prop
+--                  demand hits AP_CLIMB_TOP=13 -> goal freezes -> settle at
+--                  it), then TURN onto the bearing (PD, no overshoot, wait
+--                  stable) — cruise only after both
+--   cruise (CRUISE) bank-to-turn heading hold + rear taper (anti-overshoot)
+--   correct (CRUISE) off-course: reverse-brake to ~AP_CORRECT_SPEED,
+--                   bank back onto bearing, then re-accelerate
+--   arrive (CRUISE) reverse-brake down onto the waypoint XZ
+--   align  (HOVER)  rotate onto wp.heading (<= AP_ALIGN_TOL)
+--   land           auto-land -> full powerOff on touchdown
+-- Short hop (inside AP_HOVER_RANGE — at enable or any time later): the
+-- travel legs (cruise/correct/arrive) run in HOVER — yaw-stick steer +
+-- binary tilt drive, rear never spins up, no bank.
+-- Off-course uses roll-bank only (sustained bank -> yaw). If your ship
+-- does NOT bank-yaw in-game, AP_BANK_SIGN / physics check required.
+-- ============================================================
+local AP_AIM_DEADBAND = 3   -- deg: stop yawing when this close to bearing
+local AP_AIM_TOL = 5        -- deg: "facing target" to leave aim phase
+local AP_OFFCOURSE = 10     -- deg: heading error that triggers slow+correct
+local AP_CORRECT_SPEED = 10 -- m/s: slow down to before re-accelerating
+local AP_CORRECT_TOL = 5    -- deg: heading good enough to re-accelerate
+local AP_ARRIVE_R = 4       -- m: reached the waypoint XZ position
+local AP_BRAKE_R = 12       -- m: leave cruise / start braking here (anti-overshoot)
+local AP_ALIGN_TOL = 2      -- deg: aligned to wp.heading before auto-land
+local AP_STOP_SPEED = 0.6   -- m/s: considered stationary
+local AP_LEVEL_PER = 5      -- m of distance per rear speed level (taper)
+local AP_MAX_LEVEL = 15
+local AP_YAW_SIGN = 1       -- aim/align yaw_cmd sign: +1 maps a left bearing to
+                            -- the stick direction that turns left. Flip if the
+                            -- ship faces AWAY from the waypoint.
+local AP_BANK_SIGN = -1     -- cruise bank direction: -1 = positive bearing err
+                            -- (target left) banks LEFT. Flip if it banks away.
+local AP_BANK_KP = 0.6      -- deg bank per deg heading error
+local AP_BANK_MAX = 8       -- deg max bank command
+local AP_BANK_DEAD = 1      -- deg heading deadband (no bank correction)
+local AP_BANK_RATE_LEAD = 0.6 -- s: back off the bank command by yaw_rate so
+                            -- the turn bleeds off instead of coasting through
+                            -- the bearing (rate lead = angle - k * rate)
+local AP_STAB_OUT = 6       -- max cruise attitude speed-diff units (pitch+roll);
+                            -- matches the hover high-angle cap (6). 10 slashed a
+                            -- side to 0 and rolled violently. Raise for more.
+local AP_YAW_GAIN = 30      -- deg err for full yaw stick (aim)
+local AP_ALIGN_GAIN = 12    -- deg err for full yaw stick (align, finer)
+local AP_YAW_LEAD = 2       -- PD lead: restores the open-loop turn rate that
+                            -- the rate-damping term takes away
+local AP_YAW_RATE_DAMP = 35 -- deg/s of turn rate per full stick (must match
+                            -- rotationControl's rate_target scale)
+local AP_YAW_STILL = 2      -- deg/s: rotation counts as settled (codebase
+                            -- treats <1.5 as stationary, see rotationControl)
+local AP_YAW_EXIT_RATE = 4  -- deg/s: max rotation to leave aim/align (hand
+                            -- over to bank-only cruise with no spin left)
+local AP_CLIMB_GOAL_RATE = 35 -- m/s: aim climb goal rise (until demand hits TOP)
+local AP_CLIMB_TOP = 13       -- prop demand cap AND goal-freeze trigger
+                            -- (= slow-down signal 2, a little under max rpm)
+local AP_CLIMB_KP = 0.6       -- prop units per m/s of velocity error
+local AP_CLIMB_APPROACH = 0.6 -- 1/s: v_des = APPROACH * height error (the brake
+                            -- law that settles the ship AT the frozen goal)
+local AP_CLIMB_MAX_V = 35     -- m/s: clamp on |v_des|
+local AP_CLIMB_TOL = 2        -- m: one-sided gap: at/above goal - tol counts
+                            -- as arrived (paired with |climb_rate| stop)
+local AP_CLIMB_STILL = 0.5    -- m/s: climb rate that counts as settled
+local AP_CEIL_MARGIN = 10     -- m: goal hard-cap = max_altitude - this
+local AP_CLIMB_MIN_GAIN = 5   -- m: climb must gain this much ...
+local AP_CLIMB_MIN_PT = 3     -- s: ... within this long, else HOLD the
+                            -- current altitude and go to the TURN step
+local AP_PHASE_TIMEOUT = 45 -- s failsafe per phase (no-drag ships coast forever)
+local AP_HOVER_RANGE = 500  -- m: inside this (at enable or ANY time later,
+                            -- incl. mid-cruise) the trip runs on HOVER
+                            -- travel — tilt drive + yaw steer, no cruise
+                            -- mode, no rear thrust at all
+local AP_HOVER_SPEED = 20   -- m/s: speed cap for hover tilt travel
+local AP_HOVER_ACCEL = 5    -- m/s^2: full-tilt accel/brake estimate for the
+                            -- braking curve (v^2 <= 2*a*room)
+local AP_HOVER_BAND = 2     -- m/s: hysteresis band (coast between actions)
+
+-- Auto-land roll strengthening (speed-diff only: A/D roll is pitch/yaw here)
+local LAND_ROLL_DEAD = 1    -- deg roll deadband while auto-landing (vs 2 normal)
+local LAND_ROLL_CAP = 5     -- max roll correction units while landing (vs 4 normal)
+
+-- atan2 with a Lua-version-safe fallback (CC provides either form)
+local atan2 = math.atan2 or function(y, x) return math.atan(y, x) end
+
 function Flight.new(config, hardware)
     local self = setmetatable({}, Flight)
     self.config = config
@@ -136,6 +221,11 @@ function Flight.new(config, hardware)
 
     self.estop = false        -- latched by X until reset (R / altitude / mode)
 
+    -- Manual Q/E stick forwarded by os_main every tick. The autopilot's
+    -- aim/align phases add it to their own yaw_cmd; cruise/correct/arrive
+    -- ignore it (bank-to-turn owns the heading there).
+    self.pilot_yaw = 0
+
     -- Stability pulse train + auto-unflip state
     self.stab_phase = 0   -- 0..1 duty window for time-domain stability pulses
     self.inv_time = 0     -- seconds spent near-or-at 180 (auto-unflip trigger)
@@ -151,6 +241,12 @@ function Flight.new(config, hardware)
     -- Explicit heading-hold state (0 is a valid heading — do not use as sentinel)
     self.heading_valid = false
     self.yaw_rate_dps = 0
+
+    -- Waypoint AUTOPILOT state (nil = idle); wp_event is a one-shot
+    -- { kind = "arrived"|"cancelled", name, reason } consumed by os_main
+    -- for both autopilot start and finish notifications.
+    self.ap = nil
+    self.wp_event = nil
 
     self.state = {
         altitude = 0,
@@ -218,6 +314,10 @@ function Flight:setMode(mode)
     self.mode = mode
     self.estop = false
 
+    -- NOTE (autopilot): setMode no longer cancels travel. The autopilot
+    -- OWNS the mode and switches HOVER<->CRUISE itself; a manual mode
+    -- change while autopilot is active is blocked upstream in os_main.
+
     for _, pid in pairs(self.pid) do
         pid:reset()
     end
@@ -253,8 +353,10 @@ function Flight:pollShift(shift_value)
     local level = (shift_value or 0) > 0 and 1 or 0
     local toggled = false
     if level == 1 and self.shift_armed and self.shift_level == 0 then
-        self:toggleMode()
-        toggled = true
+        if not self.ap then -- autopilot owns the mode; do not fight it
+            self:toggleMode()
+            toggled = true
+        end
         self.shift_armed = false
     elseif level == 0 then
         self.shift_armed = true
@@ -295,6 +397,11 @@ function Flight:setAutoLand(on)
     end
     self.auto_land = on
     if on then
+        -- NOTE (autopilot): no longer cancels travel here. When the
+        -- autopilot's align phase fires setAutoLand(true) it must NOT
+        -- self-cancel. Manual L is blocked upstream in os_main while
+        -- the autopilot is active.
+
         self.land_state = Flight.LAND_ARMED
         -- Record the heading the moment auto-landing fires: the whole
         -- sequence holds this heading even if the ship rotates later.
@@ -318,6 +425,422 @@ end
 
 function Flight:toggleAutoLand()
     return self:setAutoLand(not self.auto_land)
+end
+
+-- ============================================================
+-- Waypoint AUTOPILOT
+-- ============================================================
+
+-- Signed bearing error from the nose to the target (deg).
+-- cross.y = fz*tl - fx*tz ; sign flipped per-actuator below (yaw vs bank).
+function Flight:apBearingError(dist, dx, dz)
+    local state = self.state
+    local fwd = state.forward or { x = 1, y = 0, z = 0 }
+    local fl = math.sqrt((fwd.x or 0) ^ 2 + (fwd.z or 0) ^ 2)
+    if fl < 1e-6 then fl = 1 end
+    local fx, fz = (fwd.x or 0) / fl, (fwd.z or 0) / fl
+    local tl, tz = 0, 1
+    if dist > 0.001 then tl, tz = dx / dist, dz / dist end
+    local dot = fx * tl + fz * tz
+    local cross = fz * tl - fx * tz
+    return math.deg(atan2(cross, dot))
+end
+
+-- Yaw stick from a heading error (deg) + RATE FEEDBACK (PD): P maps the
+-- error to stick (gain = deg err for full stick), D subtracts the measured
+-- turn rate scaled to rotationControl's deg/s-per-stick, so the ship starts
+-- BRAKING well before reaching the bearing instead of coasting through it
+-- at full rate (pure-P overshoot: the deadband went hands-off = no yaw
+-- actuation at all, leaving only the current rotation to carry it past).
+-- sign maps through AP_YAW_SIGN.
+function Flight:apYawCmd(err, gain, dead)
+    if math.abs(err) <= dead and math.abs(self.state.yaw_rate or 0) <= AP_YAW_STILL then
+        return 0
+    end
+    -- PD: lead = P on the angle error (sign-wrapped), damp = D on the turn
+    -- rate (ship frame, NOT wrapped — wrapping both makes the inner rate
+    -- loop degenerate at AP_YAW_SIGN=-1). The inner loop maps stick to rate
+    -- at 35 deg/s per stick, so with lead = 2*err/gain the steady state is
+    -- rate = 35*err/gain — identical to the old pure-P turn rate, but the
+    -- damp term brakes the rotation as the bearing is approached instead of
+    -- coasting through it (the old deadband went hands-off = no yaw
+    -- actuation at all, leaving the ship to swing past on momentum).
+    local lead = AP_YAW_LEAD * clamp(err / gain, -1, 1)
+    local damp = (self.state.yaw_rate or 0) / AP_YAW_RATE_DAMP
+    -- lead can reach AP_YAW_LEAD (2) before the rate builds; clamp the
+    -- final stick so rotationControl never sees |stick| > 1 (35 deg/s cap).
+    return clamp(AP_YAW_SIGN * lead - damp, -1, 1)
+end
+
+function Flight:startAutopilot(wp)
+    if self.estop then return false, "E-STOP LATCHED" end
+    if self.unflip then return false, "UNFLIP RUNNING" end
+    if self.auto_land then return false, "AUTO-LAND ACTIVE" end
+    if self.ap then return false, "AUTOPILOT ACTIVE" end
+    if self.landed then return false, "TAKE OFF FIRST" end
+    if type(wp) ~= "table" or tonumber(wp.x) == nil or tonumber(wp.z) == nil then
+        return false, "BAD WAYPOINT"
+    end
+    -- Normalise to HOVER (from CRUISE too): the aim phase then owns the mode.
+    if self.mode == Flight.MODE_CRUISE then self:setMode(Flight.MODE_HOVER) end
+    local pos = self.state.position or { x = 0, y = 0, z = 0 }
+    local dx, dz = tonumber(wp.x) - (pos.x or 0), tonumber(wp.z) - (pos.z or 0)
+    local start_dist = math.sqrt(dx * dx + dz * dz)
+    if start_dist <= AP_ARRIVE_R then return false, "ALREADY THERE" end
+
+    self.ap = {
+        name = tostring(wp.name or "WP"),
+        x = tonumber(wp.x),
+        z = tonumber(wp.z),
+        heading = ((tonumber(wp.heading) or 0) % 360 + 360) % 360,
+        phase = "aim",
+        pt = 0,          -- seconds in current phase (timeout failsafe)
+        paused = false,  -- unflip pause; resumes where it left off
+        brake_reverse = false, -- post-dispatch reverse brake this tick
+        start_dist = start_dist,
+        dist = start_dist,
+        err = 0,
+        progress = 0,
+        eta = nil,
+        speed = 0,
+        alt = self.state.altitude or 0,  -- captured flight altitude (all phases)
+        step = "climb",  -- aim sub-step: climb first (always), then turn
+        climb_goal = self.state.altitude or 0, -- rises +AP_CLIMB_GOAL_RATE b/s
+        climb_alt0 = self.state.altitude or 0, -- for the stall failsafe
+        climb_frozen = false, -- demand hit AP_CLIMB_TOP: goal stops rising
+        ceil = ((self.config.limits or {}).max_altitude or 320) - AP_CEIL_MARGIN,
+        hover_only = start_dist < AP_HOVER_RANGE, -- short hop: hover travel
+    }
+    if not self.heading_valid then self:captureHeading() end
+    self.wp_event = nil
+    return true, "AUTOPILOT: " .. self.ap.name
+end
+
+-- The ONLY way to stop an autopilot besides the on-screen CANCEL button:
+-- e-stop and shutdown keep working as emergencies.
+function Flight:cancelAutopilot(reason)
+    if not self.ap then return false end
+    local nm = self.ap.name
+    self.ap = nil
+    self.outputs.rear_fw = 0
+    self.outputs.rear_bw = 0
+    self.outputs.rear_rev = 0
+    self.targets.yaw_cmd = 0
+    self.targets.move_forward = 0
+    -- free the ship: drop back to hover (rear off) if we were cruising
+    if self.mode == Flight.MODE_CRUISE and not self.landed then
+        self:setMode(Flight.MODE_HOVER)
+    end
+    self.targets.speed = 0
+    if reason then
+        self.wp_event = { kind = "cancelled", name = nm, reason = reason }
+    end
+    return true
+end
+
+-- rear output helper: level 0..15, optional reverse-face activation
+function Flight:apRear(level, rev)
+    self.outputs.rear_fw = level
+    self.outputs.rear_bw = level
+    self.outputs.rear_rev = (rev and 1) or 0
+end
+
+-- Hover-only travel drive (ap.hover_only): W/S-style binary tilt toward the
+-- waypoint. want = the speed the distance-to-go can still absorb at full
+-- tilt (v^2 <= 2*a*room, capped at AP_HOVER_SPEED); bang-bang with
+-- AP_HOVER_BAND hysteresis, coast in between so the ship does not surge
+-- (no drag: coasting holds speed). Braking compares the SIGNED speed along
+-- the nose, so backward drift gets forward tilt instead of runaway reverse.
+function Flight:apHoverDrive(dist)
+    local v = self.state.velocity or {}
+    local f = self.state.forward or {}
+    local fwd_speed = (v.x or 0) * (f.x or 0) + (v.z or 0) * (f.z or 0)
+    local room = math.max(dist - AP_ARRIVE_R, 0)
+    local want = math.min(AP_HOVER_SPEED, math.sqrt(2 * AP_HOVER_ACCEL * room))
+    local step = (self.config.limits or {}).hover_speed or 2
+    if fwd_speed > want + AP_HOVER_BAND
+        or (want <= AP_STOP_SPEED and fwd_speed > AP_STOP_SPEED) then
+        self.targets.move_forward = -step -- reverse tilt: brake / back off
+    elseif fwd_speed < want - AP_HOVER_BAND then
+        self.targets.move_forward = step  -- nose toward the waypoint
+    else
+        self.targets.move_forward = 0     -- on the profile: coast
+    end
+end
+
+function Flight:updateAutopilot(dt)
+    local ap = self.ap
+    if not ap then return end
+    local state = self.state
+
+    -- Unflip pause: hold phase, resume cleanly when the ship is upright.
+    if self.unflip then
+        ap.paused = true
+        return
+    end
+    if ap.paused then
+        ap.paused = false
+        ap.pt = 0
+    end
+
+    -- Emergencies / outside interference end the run.
+    if self.estop then self:cancelAutopilot("e-stop") return end
+    if self.auto_land and ap.phase ~= "land" then
+        self:cancelAutopilot("auto-land") return
+    end
+
+    -- Geometry: horizontal distance + signed bearing error (deg).
+    local pos = state.position or { x = 0, y = 0, z = 0 }
+    local dx, dz = ap.x - (pos.x or 0), ap.z - (pos.z or 0)
+    local dist = math.sqrt(dx * dx + dz * dz)
+    local err = self:apBearingError(dist, dx, dz)
+    local speed = state.speed or 0
+    local hover = (self.config.limits or {}).hover_throttle or 6
+
+    ap.dist = dist
+    ap.err = err
+    ap.speed = speed
+    if ap.start_dist > 1 then
+        ap.progress = math.max(0, math.min(1, (ap.start_dist - dist) / ap.start_dist))
+    end
+    ap.eta = (speed > 0.5) and (dist / speed) or nil
+
+    ap.pt = (ap.pt or 0) + dt
+    local function setPhase(ph)
+        if ap.phase ~= ph then
+            ap.phase = ph
+            ap.pt = 0
+        end
+    end
+    local function timedOut()
+        return ap.pt > AP_PHASE_TIMEOUT
+    end
+
+    -- Autopilot owns these axes; manual inputs are gated off upstream.
+    self.targets.move_forward = 0
+    ap.brake_reverse = false
+
+    -- Live upgrade: inside AP_HOVER_RANGE the rest of the run switches to
+    -- hover travel (yaw-steer + tilt drive) — INCLUDING mid-cruise, so a
+    -- long run drops to hover 500 m out and brakes on the tilt profile.
+    if not ap.hover_only and ap.dist < AP_HOVER_RANGE then
+        ap.hover_only = true
+    end
+
+    -- SHORT HOP (ap.hover_only): the travel legs run with HOVER controls
+    -- only — yaw-stick steer + binary tilt drive (apHoverDrive). No cruise
+    -- mode, no rear thrust, no bank; steering is continuous (no off-course
+    -- detour) and the braking curve v^2 <= 2*a*room handles arrival.
+    if ap.hover_only and (ap.phase == "cruise" or ap.phase == "correct"
+        or ap.phase == "arrive") then
+        if self.mode ~= Flight.MODE_HOVER then self:setMode(Flight.MODE_HOVER) end
+        self.targets.speed = 0
+        self.targets.altitude = ap.alt
+        self.targets.yaw_cmd = clamp(
+            self:apYawCmd(err, AP_YAW_GAIN, AP_AIM_DEADBAND), -1, 1)
+        self:apHoverDrive(dist)
+        if ap.phase == "correct" and math.abs(err) <= AP_CORRECT_TOL then
+            setPhase("cruise")
+        end
+        if dist <= AP_BRAKE_R then
+            setPhase("arrive")
+        end
+        if dist <= AP_ARRIVE_R and speed <= AP_STOP_SPEED then
+            self.targets.yaw_cmd = 0
+            self.targets.move_forward = 0
+            setPhase("align")
+        elseif ap.phase ~= "cruise" and timedOut() then
+            -- correct/arrive failsafe only — cruise never times out
+            self.targets.move_forward = 0
+            if ap.phase == "arrive" then
+                self.targets.yaw_cmd = 0
+                setPhase("align")
+            else
+                setPhase("cruise") -- correct gave up: resume hover travel
+            end
+        end
+        return
+    end
+
+    if ap.phase == "aim" then
+        -- HOVER, two steps — CLIMB FIRST (always, even for short hops), then
+        -- TURN onto the bearing. Cruise only once both are done.
+        if self.mode ~= Flight.MODE_HOVER then self:setMode(Flight.MODE_HOVER) end
+
+        if ap.step ~= "turn" then
+            -- STEP 1 — CLIMB: the goal rises +AP_CLIMB_GOAL_RATE b/s until
+            -- prop demand hits AP_CLIMB_TOP (13 = slow-down signal 2); then
+            -- the goal FREEZES and the velocity-profile law
+            -- (v_des = AP_CLIMB_APPROACH * height error) settles the ship at
+            -- it — no drag means a fixed-thrust climb would sail past.
+            if not ap.climb_frozen then
+                ap.climb_goal = math.min(
+                    ap.climb_goal + AP_CLIMB_GOAL_RATE * dt, ap.ceil)
+            end
+            local h_err = ap.climb_goal - state.altitude
+            local vdes = clamp(
+                AP_CLIMB_APPROACH * h_err, -AP_CLIMB_MAX_V, AP_CLIMB_MAX_V)
+            local demand = clamp(hover + AP_CLIMB_KP
+                * (vdes - (state.climb_rate or 0)), 0, AP_CLIMB_TOP)
+            ap.climb_demand = demand -- updateHover applies it as base speed
+            if demand >= AP_CLIMB_TOP then ap.climb_frozen = true end
+            self.targets.altitude = ap.climb_goal
+            self.targets.yaw_cmd = clamp(self.pilot_yaw or 0, -1, 1) -- Q/E only
+            if ap.pt >= AP_CLIMB_MIN_PT
+                and (state.altitude - (ap.climb_alt0 or 0)) < AP_CLIMB_MIN_GAIN then
+                -- STALLED CLIMB (gained < 5 m in 3 s): hold here — freeze
+                -- the goal at the current altitude and move on to the
+                -- heading phase instead of waiting out the phase timeout.
+                ap.climb_goal = state.altitude
+                ap.alt = state.altitude -- hold THIS during the turn (once!)
+                ap.step = "turn"
+                ap.climb_demand = nil -- props back to the altitude PID
+                ap.pt = 0 -- the rotation gets its own timeout window
+            elseif (ap.climb_frozen
+                and math.abs(state.climb_rate or 0) <= AP_CLIMB_STILL
+                -- "stopped climbing" = vertical motion is gone AND we are
+                -- at/above the goal band (ONE-sided: the abs check used to
+                -- fail at the overshoot peak and wait out another slow
+                -- cycle) or the climb has simply run long enough.
+                and (h_err <= AP_CLIMB_TOL or ap.pt >= AP_CLIMB_MIN_PT))
+                or timedOut() then
+                -- Capture the hold altitude ONCE; the turn step must not
+                -- re-capture it or the goal follows any sag downward.
+                ap.alt = state.altitude
+                ap.step = "turn"
+                ap.climb_demand = nil -- hand the props back to the altitude PID
+                ap.pt = 0 -- the rotation gets its own timeout window
+            end
+        else
+            -- STEP 2 — TURN: HOLD the altitude captured once when the climb
+            -- ended (ap.alt). Re-capturing here would let the goal follow
+            -- the ship down through any rotation sag instead of holding it.
+            -- Auto PD stick + manual Q/E assist (pilot_yaw), clamped so
+            -- rotationControl never sees |stick| > 1.
+            self.targets.altitude = ap.alt
+            self.targets.yaw_cmd = clamp(
+                self:apYawCmd(err, AP_YAW_GAIN, AP_AIM_DEADBAND) + (self.pilot_yaw or 0),
+                -1, 1)
+            -- Exit only when the rotation has actually died (PD braking):
+            -- handing over to bank-only cruise mid-spin = off the bearing.
+            local facing = math.abs(err) <= AP_AIM_TOL
+                and math.abs(self.state.yaw_rate or 0) <= AP_YAW_EXIT_RATE
+            if facing or timedOut() then
+                self.targets.yaw_cmd = 0
+                if ap.hover_only then
+                    -- short hop: the travel legs stay in HOVER (rear never on)
+                    self.targets.speed = 0
+                else
+                    self:setMode(Flight.MODE_CRUISE) -- freezes altitude at current
+                    self.targets.speed = AP_MAX_LEVEL
+                end
+                setPhase("cruise")
+            end
+        end
+
+    elseif ap.phase == "cruise" then
+        -- CRUISE: bank-to-turn heading hold + rear taper (anti-overshoot).
+        if self.mode ~= Flight.MODE_CRUISE then
+            self:setMode(Flight.MODE_CRUISE)
+            self.targets.speed = AP_MAX_LEVEL
+        end
+        self.targets.yaw_cmd = 0
+        self.targets.altitude = ap.alt
+        if math.abs(err) > AP_OFFCOURSE then
+            setPhase("correct")
+        elseif dist <= AP_BRAKE_R then
+            setPhase("arrive")
+        else
+            self.targets.speed = clamp(math.floor(dist / AP_LEVEL_PER), 1, AP_MAX_LEVEL)
+        end
+
+    elseif ap.phase == "correct" then
+        -- Off-course: stay in cruise, reverse-brake to ~AP_CORRECT_SPEED,
+        -- bank back onto the bearing, then re-accelerate.
+        if self.mode ~= Flight.MODE_CRUISE then self:setMode(Flight.MODE_CRUISE) end
+        self.targets.yaw_cmd = 0
+        self.targets.altitude = ap.alt
+        local slow = speed <= AP_CORRECT_SPEED
+        if slow then
+            self.targets.speed = 1 -- crawl so we can still turn
+        else
+            self.targets.speed = 0 -- level 0 = brake wire
+            -- reverse face only if the hardware has it; apRear with a forward
+            -- level would otherwise ACCELERATE us on ships lacking it
+            ap.brake_reverse = self:hasFeature("rear_reverse")
+        end
+        if slow and math.abs(err) <= AP_CORRECT_TOL then
+            ap.brake_reverse = false
+            self.targets.speed = AP_MAX_LEVEL
+            setPhase("cruise")
+        elseif dist <= AP_BRAKE_R then
+            ap.brake_reverse = false
+            setPhase("arrive")
+        elseif timedOut() then
+            ap.brake_reverse = false
+            self.targets.speed = AP_MAX_LEVEL
+            setPhase("cruise")
+        end
+
+    elseif ap.phase == "arrive" then
+        -- CRUISE: brake down onto the waypoint XZ (anti-overshoot).
+        if self.mode ~= Flight.MODE_CRUISE then self:setMode(Flight.MODE_CRUISE) end
+        self.targets.yaw_cmd = 0
+        self.targets.altitude = ap.alt
+        local room = math.max(dist - AP_ARRIVE_R, 0)
+        local want = math.min(AP_MAX_LEVEL, math.sqrt(room * 3)) -- v^2 <= 2*a*d
+        if speed > want + 1 then
+            self.targets.speed = 0
+            ap.brake_reverse = self:hasFeature("rear_reverse")
+        else
+            self.targets.speed = clamp(math.floor(want), 0, AP_MAX_LEVEL)
+        end
+        if (dist <= AP_ARRIVE_R and speed <= AP_STOP_SPEED) or timedOut() then
+            ap.brake_reverse = false
+            self.targets.speed = 0
+            self:setMode(Flight.MODE_HOVER)
+            setPhase("align")
+        end
+
+    elseif ap.phase == "align" then
+        -- HOVER: rotate onto the stored heading (<= AP_ALIGN_TOL).
+        if self.mode ~= Flight.MODE_HOVER then self:setMode(Flight.MODE_HOVER) end
+        self.targets.speed = 0
+        local herr = angleError(ap.heading, state.yaw or 0)
+        -- Manual Q/E assist allowed here too (above the waypoint: turning
+        -- onto the saved heading before auto-land).
+        self.targets.yaw_cmd = clamp(
+            self:apYawCmd(herr, AP_ALIGN_GAIN, AP_ALIGN_TOL) + (self.pilot_yaw or 0),
+            -1, 1)
+        -- Same rotation gate as aim: don't start auto-land while still spinning.
+        local aligned = math.abs(herr) <= AP_ALIGN_TOL
+            and math.abs(self.state.yaw_rate or 0) <= AP_YAW_EXIT_RATE
+        if aligned or timedOut() then
+            self.targets.yaw_cmd = 0
+            -- may report ALREADY LANDED; the "land" phase handles both cases
+            self:setAutoLand(true)
+            setPhase("land")
+        end
+
+    elseif ap.phase == "land" then
+        -- auto-land is running; its own runaway failsafe handles stalls.
+        self.targets.yaw_cmd = 0
+        self.targets.speed = 0
+        if self.landed or self.land_state == Flight.LAND_DONE then
+            local nm = ap.name
+            self.ap = nil
+            self.wp_event = { kind = "arrived", name = nm }
+            self.shutdown_request = "autopilot landed"
+            return
+        end
+    end
+
+    -- Reverse brake must be written AFTER the mode function wrote the rear
+    -- outputs (updateHover always zeroes them; updateCruise writes level).
+    if ap.brake_reverse then
+        local brk = clamp(math.ceil(speed * 3), 1, 8)
+        self:apRear(brk, true)
+    end
 end
 
 function Flight:updateState()
@@ -626,6 +1149,11 @@ function Flight:update()
 
     self:updateAutoLand(dt)
 
+    -- Waypoint AUTOPILOT: runs after the mode function wrote its outputs so
+    -- it can override the rear with a reverse brake. It owns mode/yaw/alt/
+    -- speed for the NEXT tick (one 20 Hz tick of latency, imperceptible).
+    self:updateAutopilot(dt)
+
     if self.landed and not self.auto_land then
         -- idle on ground: creep + anti-drift (unless pilot already commanded climb)
         local climbing = self.targets.altitude > self.state.altitude + 0.5
@@ -838,41 +1366,67 @@ function Flight:updateHover(dt)
 
     -- Stability via prop speed REDUCTION only (never tilt, never speeding a
     -- prop above the altitude-PID base): PID leveling + gyro damp toward 0
-    -- deg attitude, with a stepped cap by attitude error so corrections stay
-    -- gentle — 0 below 2 deg (deadband; larger = the ship leans and strafes
-    -- off-course, smaller = wobble/overshoot returns), at most 1 unit at
-    -- 2-10 deg, at most 2 above 10 deg. Full authority hands-off; fades while
-    -- the W/S pitch stick is held so the pilot always wins. PIDs update
-    -- every tick so the derivative state stays fresh under pilot override.
+    -- deg attitude, stepped cap by attitude error: 0 below 2 deg (deadband;
+    -- larger = the ship leans and strafes off-course, smaller = wobble/
+    -- overshoot returns), 2 units at 2-6 deg, 4 at 6-12 deg, 6 above 12 deg
+    -- (high-angle authority — 4 was "not strong enough, ship goes into weird
+    -- angles"). STABILITY ALWAYS WINS under the autopilot: only a MANUAL
+    -- W/S stick fades the pitch axis (the pilot's angle-maneuver override);
+    -- AP-driven forward tilt does NOT fade it. PIDs update every tick so the
+    -- derivative state stays fresh under override.
     local pitch_out = self.pid.pitch:update(0, state.pitch, dt)
     local roll_out = self.pid.roll:update(0, state.roll, dt)
-    local pitch_auth = 1 - math.min(1, math.abs(fwd))
+    local pitch_auth = (self.ap and 1) or (1 - math.min(1, math.abs(fwd)))
     local function stabCap(att)
         local a = math.abs(att)
         if a < 2 then return 0 end
-        if a > 10 then return 2 end
-        return 1
+        if a <= 6 then return 2 end
+        if a <= 12 then return 4 end
+        return 6
+    end
+    -- Auto-land roll strengthening (speed-diff only: A/D roll-via-tilt is not
+    -- a roll here — tilt is pitch/yaw — so we tighten the differential-stabiliser
+    -- deadband and raise its cap while landing so the ship stays levelled).
+    -- CRITICAL: keep this; without it touchdown can be made on a leaning hull.
+    local roll_dead = self.auto_land and LAND_ROLL_DEAD or 2
+    local roll_top = self.auto_land and LAND_ROLL_CAP or 4
+    local function rollCap(att)
+        local a = math.abs(att)
+        if a < roll_dead then return 0 end
+        if a <= 6 then return math.max(1, math.floor(roll_top / 2 + 0.5)) end
+        if a <= 12 then return roll_top end
+        return roll_top + 2
     end
     local pitch_cap = stabCap(state.pitch) * pitch_auth
-    local roll_cap = stabCap(state.roll)
-    local pitch_corr = clamp(pitch_out - 0.15 * (state.pitch_rate or 0), -pitch_cap, pitch_cap)
-    local roll_corr = clamp(roll_out - 0.15 * (state.roll_rate or 0), -roll_cap, roll_cap)
+    local roll_cap = rollCap(state.roll)
+    local pitch_corr = clamp(pitch_out - 0.25 * (state.pitch_rate or 0), -pitch_cap, pitch_cap)
+    local roll_corr = clamp(roll_out - 0.25 * (state.roll_rate or 0), -roll_cap, roll_cap)
 
-    -- Time-domain precision: strength is quantized (1-2 units), so trim with
-    -- duration instead — a pulse train (STAB_PERIOD window) whose duty grows
-    -- 0 -> 0.3 -> 1.0 across the 2 deg deadband and the 2-10 deg band. Small
-    -- errors get short bursts, larger errors more on-time; above 10 deg the
-    -- capped correction holds continuously. Zero duty (deadband or stick
-    -- override via pitch_auth) gates the axis off entirely.
+    -- Time-domain precision: strength is quantized, so trim with duration —
+    -- a pulse train (STAB_PERIOD window) whose duty grows 0 -> 0.5 -> 1.0
+    -- across the 2 deg deadband and the 2-10 deg band (floor raised from
+    -- 0.3: at low error the old train was off 70% of the time, which read
+    -- as "not correcting" during a climb). Above 10 deg the capped
+    -- correction holds continuously. Zero duty (deadband or stick override
+    -- via pitch_auth) gates the axis off entirely.
     self.stab_phase = (self.stab_phase + dt / STAB_PERIOD) % 1
     local function stabDuty(att)
         local a = math.abs(att)
         if a < 2 then return 0 end
         if a > 10 then return 1 end
-        return 0.3 + 0.7 * (a - 2) / 8
+        return 0.5 + 0.5 * (a - 2) / 8
+    end
+    local function rollDuty(att)
+        local a = math.abs(att)
+        if a < roll_dead then return 0 end
+        if a > 10 then return 1 end
+        if self.auto_land then
+            return 0.6 + 0.4 * (a - roll_dead) / (10 - roll_dead) -- stronger, sooner
+        end
+        return 0.5 + 0.5 * (a - 2) / 8
     end
     local pitch_duty = stabDuty(state.pitch) * pitch_auth
-    local roll_duty = stabDuty(state.roll)
+    local roll_duty = rollDuty(state.roll)
     if self.stab_phase >= pitch_duty then pitch_corr = 0 end
     if self.stab_phase >= roll_duty then roll_corr = 0 end
 
@@ -901,6 +1455,14 @@ function Flight:updateHover(dt)
 
     if not flying then
         base_speed = 0
+    end
+
+    -- A/P aim CLIMB step: the autopilot owns the uniform prop speed with
+    -- the velocity-profile demand computed in updateAutopilot, so the ship
+    -- settles AT the frozen goal instead of sailing past it (no drag).
+    -- Attitude stabilisation (reduce-only, above) stays active on top.
+    if flying and self.ap and self.ap.phase == "aim" and self.ap.climb_demand then
+        base_speed = clamp(self.ap.climb_demand, hmin, hmax)
     end
 
     -- LAND_DESCEND uses the same hover+PID law as normal flight: the walking
@@ -933,6 +1495,7 @@ function Flight:updateHover(dt)
     -- Hover: rear thrusters always off (cruise only)
     self.outputs.rear_fw = 0
     self.outputs.rear_bw = 0
+    self.outputs.rear_rev = 0 -- never inherit a stale reverse (e.g. after landing)
 end
 
 function Flight:updateCruise(dt)
@@ -969,6 +1532,41 @@ function Flight:updateCruise(dt)
 
     self:setUniformSpeed(base_speed)
 
+    -- Sustained bank for heading control + PITCH LEVELLING (AUTOPILOT
+    -- cruise phases only): drive the roll PID to a NON-ZERO setpoint so the
+    -- ship banks and the bank's tilted lift vector yaws it onto the bearing,
+    -- and drive the pitch PID to 0 so rear thrust along the nose cannot
+    -- pitch the ship into a dive (R1: cruise had ZERO attitude control, so
+    -- autopilot spiralled into the ground and unflip then bailed on the
+    -- landed check). No stabCap/stabDuty here (those gate toward level);
+    -- both axes hold continuously, capped at AP_STAB_OUT per axis.
+    -- If your ship does NOT bank->yaw, flip AP_BANK_SIGN first, then physics.
+    if self.ap and not self.ap.paused
+        and (self.ap.phase == "cruise" or self.ap.phase == "correct"
+             or self.ap.phase == "arrive") then
+        local err = self.ap.err or 0
+        -- Rate lead: while the bank yaws the ship onto the bearing, subtract
+        -- the ongoing yaw rate from the error so the command starts easing
+        -- BEFORE the bearing is reached — no overshoot / coast-through.
+        local eff = err - AP_BANK_RATE_LEAD * (state.yaw_rate or 0)
+        local roll_target = 0
+        if math.abs(eff) > AP_BANK_DEAD then
+            roll_target = clamp(AP_BANK_KP * eff, -AP_BANK_MAX, AP_BANK_MAX) * AP_BANK_SIGN
+        end
+        local roll_out = self.pid.roll:update(roll_target, state.roll, dt)
+        local roll_corr = clamp(roll_out - 0.15 * (state.roll_rate or 0), -AP_STAB_OUT, AP_STAB_OUT)
+        local pitch_out = self.pid.pitch:update(0, state.pitch, dt)
+        local pitch_corr = clamp(pitch_out - 0.15 * (state.pitch_rate or 0), -AP_STAB_OUT, AP_STAB_OUT)
+        local p_front = math.max(pitch_corr, 0)
+        local p_rear = math.max(-pitch_corr, 0)
+        local r_left = math.max(-roll_corr, 0)
+        local r_right = math.max(roll_corr, 0)
+        self.outputs.FL_speed = clamp((self.outputs.FL_speed or base_speed) - p_front - r_left, 0, 15)
+        self.outputs.FR_speed = clamp((self.outputs.FR_speed or base_speed) - p_front - r_right, 0, 15)
+        self.outputs.RL_speed = clamp((self.outputs.RL_speed or base_speed) - p_rear - r_left, 0, 15)
+        self.outputs.RR_speed = clamp((self.outputs.RR_speed or base_speed) - p_rear - r_right, 0, 15)
+    end
+
     self.outputs.FL_tilt = 0
     self.outputs.FR_tilt = 0
     self.outputs.RL_tilt = 0
@@ -979,6 +1577,7 @@ function Flight:updateCruise(dt)
     if self.landed then
         self.outputs.rear_fw = 0
         self.outputs.rear_bw = 0
+        self.outputs.rear_rev = 0
         return
     end
 
@@ -991,6 +1590,7 @@ function Flight:updateCruise(dt)
     local level = clamp(targets.speed or 0, 0, 15)
     self.outputs.rear_fw = level
     self.outputs.rear_bw = level
+    self.outputs.rear_rev = 0 -- cruise has no brake; wp travel sets this AFTER this tick
 end
 
 function Flight:applyOutputs()
@@ -1139,6 +1739,8 @@ function Flight:emergencyStop()
     self.estop = true
     self.tune_pending = false
     self.tune_requested = false
+    self:cancelAutopilot(nil) -- e-stop also aborts the autopilot (no event: estop announces itself)
+    self.wp_event = nil       -- do not replay a stale arrived/cancelled event after reboot
     self.unflip = nil       -- cutAllOutputs below also drops the reverse link
     self.inv_time = 0
     self.inv_cooldown = 0
@@ -1240,6 +1842,15 @@ function Flight:getStatus()
         unflip = self.unflip ~= nil,
         position = self.state.position,
         land_position = self.land_position,
+        ap = self.ap and {
+            name = self.ap.name,
+            phase = self.ap.phase,
+            dist = self.ap.dist,
+            progress = self.ap.progress,
+            eta = self.ap.eta,
+            speed = self.ap.speed,
+            paused = self.ap.paused,
+        } or nil,
         pid_gains = {
             altitude = self.pid.altitude:getGains(),
             pitch = self.pid.pitch:getGains(),

@@ -100,16 +100,24 @@ local function diffDevices(before, after)
 end
 
 local function waitForNewDevice(before)
+    -- auto-detect: scans every 0.5 s, no extra keypress needed
+    local warned = false
+    local timer = os.startTimer(0.5)
     while true do
-        os.pullEvent("key")
-        local after = scanNetwork()
-        local new = diffDevices(before, after)
-        if #new > 0 then
-            return new[1]
+        local ev, a = os.pullEvent()
+        if ev == "timer" and a == timer then
+            timer = os.startTimer(0.5)
+            local new = diffDevices(before, scanNetwork())
+            if #new > 0 then
+                os.cancelTimer(timer)
+                return new[1]
+            end
+            if not warned then
+                warned = true
+                print("  No new device yet - modem must be adjacent")
+                print("  to the computer and right-clicked.")
+            end
         end
-        print("  No new device detected. Make sure the modem is")
-        print("  placed adjacent to the computer and right-clicked.")
-        print("  Press any key to try again.")
     end
 end
 
@@ -117,6 +125,13 @@ local function promptContinue(msg)
     print(msg)
     print("  Press any key when ready...")
     os.pullEvent("key")
+end
+
+-- print in blue (device names), fall back to white on mono terms
+local function blue(s)
+    if term.isColor() then term.setTextColor(colors.blue) end
+    write(s)
+    if term.isColor() then term.setTextColor(colors.white) end
 end
 
 -- ============================================================
@@ -248,6 +263,7 @@ local function sanitizeSlotName(raw)
     if #raw > 24 then raw = raw:sub(1, 24) end
     if raw:match("^assignments_") then return nil end
     if raw:match("^pid_") then return nil end -- would collide with pid_<slot>.lua
+    if raw:match("^wp_") then return nil end -- would collide with wp_<slot>.lua
     return raw
 end
 
@@ -513,6 +529,7 @@ local peripheral_desc = {
     output_RR = "Rear-right propeller relay",
     output_REAR = "Rear thruster relay",
     main_monitor = "HUD display monitor",
+    printer = "Network printer (flight reports)",
     speaker = "Audio speaker",
 }
 
@@ -523,7 +540,7 @@ local function peripheralOrder()
         engine_relay = 4,
         output_FL = 5, output_FR = 6, output_RL = 7, output_RR = 8,
         output_REAR = 9,
-        main_monitor = 10, speaker = 11,
+        main_monitor = 10, speaker = 11, printer = 12,
     }
 end
 
@@ -632,15 +649,18 @@ else
     print("")
 
     for i, req in ipairs(required) do
-        print("  [" .. i .. "/" .. #required .. "] Connect: " .. req.desc)
-        print("            Target name: " .. req.target)
-        print("")
-        promptContinue("  Connect the device's modem to the network cable, then right-click it.")
+        write("  [" .. i .. "/" .. #required .. "] Connect: ")
+        blue(req.desc)
+        write("  (")
+        blue(req.target)
+        print(")")
+        promptContinue("  Plug in this device's modem, then right-click it.")
 
         local new_dev = waitForNewDevice(baseline)
         assignments[req.key] = new_dev.name
-        print("  -> Detected: " .. new_dev.name .. " (" .. new_dev.type .. ")")
-        print("  -> Assigned: " .. req.key)
+        write("  -> ")
+        blue(req.key)
+        print(" = " .. new_dev.name)
         print("")
 
         table.insert(baseline, new_dev)
@@ -651,9 +671,10 @@ else
     end
 end
 
--- Apply assignments to config (skip bookkeeping keys)
+-- Apply assignments to config (skip bookkeeping keys; kbd_computer is a
+-- rednet id, NOT a peripheral - never put it in config.peripherals)
 for key, name in pairs(assignments) do
-    if key ~= "config_version" and key ~= "ship_id" then
+    if key ~= "config_version" and key ~= "ship_id" and key ~= "kbd_computer" then
         config.peripherals[key] = name
     end
 end
@@ -672,16 +693,15 @@ if #optional > 0 then
         local wrapped = current and peripheral.wrap(current)
         if not wrapped then
             any_new = true
-            print("[3b] Optional peripheral: " .. key ..
-                " (" .. (peripheral_desc[key] or key) .. ")")
-            print("  Connect this device's modem, then right-click it.")
-            print("  Press any key when ready...")
-            os.pullEvent("key")
+            write("[3b] Optional: ")
+            blue(key)
+            print("  (" .. (peripheral_desc[key] or key) .. ")")
+            promptContinue("  Plug in this device's modem, then right-click it.")
             local new_dev = waitForNewDevice(baseline)
             assignments[key] = new_dev.name
             config.peripherals[key] = new_dev.name
             table.insert(baseline, new_dev)
-            print("  -> Assigned: " .. key .. " = " .. new_dev.name)
+            print("  -> " .. key .. " = " .. new_dev.name)
             print("")
         end
     end
@@ -695,6 +715,115 @@ if #optional > 0 then
     end
 end
 
+print("")
+
+-- [3c] Printer (flight reports): auto-detect, optional pin to the network
+-- name. Prompted only on a fresh wizard; later boots just report/detect.
+local printer_dev = peripheral.find("printer")
+if not printer_dev and not has_saved then
+    print("[3c] Printer (flight reports): not detected")
+    print("  Plug in the printer's modem, then right-click it.")
+    print("  Press any key to rescan, S to skip (auto-find works later).")
+    while true do
+        local _, code = os.pullEvent("key")
+        if code == keysLib.s then break end
+        printer_dev = peripheral.find("printer")
+        if printer_dev then break end
+        print("  Not detected - any key to retry, S to skip.")
+    end
+end
+if printer_dev then
+    local pname = peripheral.getName(printer_dev)
+    if pname then
+        if assignments.printer ~= pname then
+            assignments.printer = pname
+            saveAssignments()
+        end
+        config.peripherals.printer = pname
+        write("[3c] Printer: ")
+        blue(pname)
+        print("")
+    end
+elseif has_saved then
+    config.peripherals.printer = nil -- stale pin from a previous name
+    print("[3c] Printer: not connected (auto-find will pick it up)")
+else
+    print("[3c] Printer: skipped (auto-find will pick it up)")
+end
+print("")
+
+-- [3d] Network keyboard computer (kbd): pair over rednet (optional).
+-- Saved ids: assignments.kbd_computer -> config/kbd_last_id marker file.
+-- Unpaired saved boot waits up to 30 s for the hello so this screen stays.
+local kbd_id = tonumber(assignments.kbd_computer or "")
+    or tonumber(config.kbd_id or "") or nil
+if not kbd_id then
+    local f = fs.open("config/kbd_last_id", "r")
+    if f then
+        kbd_id = tonumber(f.readAll() or "") or nil
+        f.close()
+    end
+end
+
+local function showKbdInfo(wait_secs)
+    write("[3d] Keyboard computer: ")
+    if kbd_id then
+        blue("#" .. kbd_id)
+        print("  (pairs automatically when online)")
+    else
+        blue("not paired yet")
+        print("")
+        if term.isColor() then term.setTextColor(colors.blue) end
+        print("  Run 'kbd' on a computer wired to this network.")
+        if term.isColor() then term.setTextColor(colors.white) end
+        print("  Press any key to continue" ..
+            (wait_secs and (", auto-continue in " .. wait_secs .. "s")
+                or " (pairs automatically later)") .. "...")
+    end
+end
+
+local function waitKbdPair(timeout)
+    for _, mname in ipairs(peripheral.getNames()) do
+        local mtype = peripheral.getType(mname) or ""
+        if mtype:find("modem") then pcall(rednet.open, mname) end
+    end
+    local t_id = timeout and os.startTimer(timeout)
+    while not kbd_id do
+        local ev, a, b = os.pullEvent()
+        if ev == "rednet_message" and type(b) == "table"
+            and b.proto == "artkbd" and b.op == "hello" then
+            kbd_id = tonumber(a)
+        elseif ev == "key" then
+            break
+        elseif ev == "timer" and a == t_id then
+            print("  No keyboard heard - continuing (it can pair later).")
+            break
+        end
+    end
+    if t_id then os.cancelTimer(t_id) end
+end
+
+if kbd_id then
+    showKbdInfo(nil)
+elseif has_saved then
+    showKbdInfo(30)
+    waitKbdPair(30)
+else
+    print("[3d] Network keyboard computer (kbd): optional")
+    if term.isColor() then term.setTextColor(colors.blue) end
+    print("  Run 'kbd' on a second computer wired to this network.")
+    if term.isColor() then term.setTextColor(colors.white) end
+    print("  Press any key to continue without it (pairs later)...")
+    waitKbdPair(nil)
+end
+if kbd_id then
+    assignments.kbd_computer = tostring(kbd_id)
+    saveAssignments()
+    config.kbd_id = kbd_id
+    write("  -> Paired: keyboard computer ")
+    blue("#" .. kbd_id)
+    print("")
+end
 print("")
 
 -- ============================================================

@@ -38,6 +38,7 @@ local C = {
     tab_off_bg = 7,
     tab_off_fg = 8,
     bar_bg   = 7,
+    blue     = 11,
     power_on   = 14, -- red
     power_off  = 8,  -- gray
     boot_bg    = 9,
@@ -58,9 +59,17 @@ local initialized = false
 local chrome_dirty = true
 local content_dirty = true
 local unflip_shown = false -- last seen status.unflip (drives full redraw)
+local ap_shown = false     -- last seen status.ap ~= nil (drives green chrome)
 local power_dirty = true
 local ship_label = "FLIGHT OS"
 local render_config = nil -- last config passed to HUD.render (features for ACTIONS)
+
+-- Waypoint window state (full-monitor modal opened from ACTIONS)
+local wp_list = {}  -- cached copy of the waypoint list
+local wp_view = nil -- nil = closed, "list" | "popup" | "confirm"
+local wp_shown = false -- whether the previous frame had the modal open
+local wp_sel = nil  -- selected waypoint index (popup/confirm)
+local wp_scroll = 0
 
 local L = {}
 
@@ -271,26 +280,36 @@ end
 -- ============================================================
 
 local function drawChrome()
+    -- While the autopilot runs, the chrome outlines switch to light green
+    -- (C.good) so the pilot can see at a glance that the ship is flying itself.
+    local edge = ap_shown and C.good or C.border
     Gfx.clear(C.bg)
-    Gfx.fillRect(0, 0, L.W, L.border, C.border)
-    Gfx.fillRect(0, L.H - L.border, L.W, L.border, C.border)
-    Gfx.fillRect(0, 0, L.border, L.H, C.border)
-    Gfx.fillRect(L.W - L.border, 0, L.border, L.H, C.border)
+    Gfx.fillRect(0, 0, L.W, L.border, edge)
+    Gfx.fillRect(0, L.H - L.border, L.W, L.border, edge)
+    Gfx.fillRect(0, 0, L.border, L.H, edge)
+    Gfx.fillRect(L.W - L.border, 0, L.border, L.H, edge)
 
     Gfx.fillRect(L.border, L.border, L.W - 2 * L.border, L.header_h, C.panel)
-    Gfx.fillRect(L.border, L.border + L.header_h, L.W - 2 * L.border, 2, C.border)
+    Gfx.fillRect(L.border, L.border + L.header_h, L.W - 2 * L.border, 2, edge)
 
     -- title starts after shutdown circle
     local title_x = L.border + 22
     Gfx.text(title_x, L.border + 6, "ARTCORPOS", C.title)
-    Gfx.text(title_x + 60, L.border + 6, ship_label ~= "FLIGHT OS" and ship_label or "ATLAS", C.accent)
+    Gfx.text(title_x + 60, L.border + 6, ship_label ~= "FLIGHT OS" and ship_label or "ATLAS",
+        ap_shown and C.good or C.accent)
 
-    Gfx.fillRect(L.strip_x - 3, L.body_y - 2, 3, L.body_h + 4, C.border)
+    Gfx.fillRect(L.strip_x - 3, L.body_y - 2, 3, L.body_h + 4, edge)
 
     for i, tab in ipairs(TABS) do
         local x, y, w, h = tabRect(i)
         local on = tab.id == active_tab
         Gfx.fillRect(x, y, w, h, on and C.tab_on_bg or C.tab_off_bg)
+        if ap_shown then
+            Gfx.fillRect(x, y, w, 1, C.good)
+            Gfx.fillRect(x, y + h - 1, w, 1, C.good)
+            Gfx.fillRect(x, y, 1, h, C.good)
+            Gfx.fillRect(x + w - 1, y, 1, h, C.good)
+        end
         local label_txt = fit(tab.label, w - 4)
         local tw = Font.textWidth(label_txt)
         local tx = x + math.floor((w - tw) / 2)
@@ -359,15 +378,17 @@ local function drawNavStatic()
     local x = L.content_x
     local y = L.body_y + 2
     label(x, y, "NAVIGATION")
-    Gfx.fillRect(x, y + 10, L.content_w, 2, C.panel)
-    label(x, y + 20, "HEADING")
-    label(x, y + 40, "TARGET ALT")
-    label(x, y + 60, "ALT ERROR")
-    label(x, y + 86, "POSITION")
+    Gfx.fillRect(x, y + 8, L.content_w, 2, C.panel)
+    -- position block, top-left (buttons occupy the top-right)
+    label(x, y + 16, "X")
+    label(x, y + 34, "Y")
+    label(x, y + 52, "Z")
     Gfx.fillRect(x, y + 96, L.content_w, 2, C.panel)
-    label(x, y + 106, "X")
-    label(x, y + 126, "Y")
-    label(x, y + 146, "Z")
+    label(x, y + 106, "HEADING")
+    label(x, y + 124, "TARGET ALT")
+    label(x, y + 142, "ALT ERROR")
+    Gfx.fillRect(x, y + 154, L.content_w, 2, C.panel)
+    label(x, y + 162, "AUTOPILOT")
 end
 
 local function drawAlarmsStatic()
@@ -386,6 +407,8 @@ local ACTION_BTNS = {
     { id = "gear",  label = "GEAR",      feat = "gear" },
     { id = "estop", label = "E-STOP" },
     { id = "tune",  label = "AUTO-TUNE", feat = "auto_tune" },
+    { id = "autopilot", label = "AUTOPILOT" },
+    { id = "apcancel",  label = "CANCEL A/P" },
 }
 
 local function actionBtnRect(i)
@@ -394,6 +417,23 @@ local function actionBtnRect(i)
     local row = math.floor((i - 1) / 2)
     local x = L.content_x + 4 + col * (bw + gap)
     local y = L.body_y + 16 + row * (bh + gap)
+    return x, y, bw, bh
+end
+
+-- NAV tab: 4 buttons, top-right of the content area (2x2)
+local NAV_BTNS = {
+    { id = "rec",     label = "REC" },
+    { id = "print",   label = "PRINT" },
+    { id = "quickwp", label = "QUICK WP" },
+    { id = "newwp",   label = "NEW WP" },
+}
+
+local function navBtnRect(i)
+    local bw, bh, gap = 64, 18, 4
+    local col = (i - 1) % 2
+    local row = math.floor((i - 1) / 2)
+    local x = L.content_x + L.content_w - (2 * bw + gap) + col * (bw + gap)
+    local y = L.body_y + 14 + row * (bh + gap)
     return x, y, bw, bh
 end
 
@@ -422,6 +462,17 @@ local function drawActionsDynamic(s)
         elseif btn.id == "gear" and s.gear_down then
             bg = C.good
             fg = 15
+        elseif btn.id == "autopilot" and s.ap then
+            bg = C.good
+            fg = 15
+        elseif btn.id == "apcancel" then
+            if s.ap then
+                bg = C.good -- light green: the one live control during autopilot
+                fg = 15
+            else
+                bg = C.bar_bg
+                fg = C.dim
+            end
         end
         Gfx.fillRect(bx, by, bw, bh, bg)
         Gfx.fillRect(bx, by, bw, 1, C.border)
@@ -434,6 +485,132 @@ local function drawActionsDynamic(s)
         end
         local tw = Font.textWidth(txt)
         Gfx.text(bx + math.floor((bw - tw) / 2), by + math.floor((bh - Font.height) / 2), txt, fg)
+    end
+end
+
+-- ============================================================
+-- Waypoint window: full-monitor modal (list -> popup -> delete confirm)
+-- ============================================================
+local function wpListRect()
+    return 16, 14, L.W - 32, L.H - 28
+end
+
+local function wpPopupRect()
+    local pw, ph = 210, 118
+    return math.floor((L.W - pw) / 2), math.floor((L.H - ph) / 2), pw, ph
+end
+
+local function wpConfirmRect()
+    local pw, ph = 220, 76
+    return math.floor((L.W - pw) / 2), math.floor((L.H - ph) / 2), pw, ph
+end
+
+local function wpMaxRows(ph)
+    return math.max(1, math.floor((ph - 50) / 16))
+end
+
+local function wpBox(x, y, w, h, bg)
+    Gfx.fillRect(x, y, w, h, bg)
+    Gfx.fillRect(x, y, w, 1, C.border)
+    Gfx.fillRect(x, y + h - 1, w, 1, C.border)
+    Gfx.fillRect(x, y, 1, h, C.border)
+    Gfx.fillRect(x + w - 1, y, 1, h, C.border)
+end
+
+local function wpCenter(x, y, w, h, txt, fg)
+    local tw = Font.textWidth(txt)
+    Gfx.text(x + math.floor((w - tw) / 2),
+        y + math.floor((h - Font.height) / 2), txt, fg)
+end
+
+-- Bold label: draws the glyph twice, offset 1px, for a heavier stroke.
+local function wpCenterBold(x, y, w, h, txt, fg)
+    local tw = Font.textWidth(txt)
+    local bx = x + math.floor((w - tw) / 2)
+    local by = y + math.floor((h - Font.height) / 2)
+    Gfx.text(bx, by, txt, fg)
+    Gfx.text(bx + 1, by, txt, fg)
+end
+
+local function drawWpWindow()
+    -- never show popup/confirm with a stale selection (e.g. deleted list)
+    if wp_view ~= "list" and (not wp_sel or not wp_list[wp_sel]) then
+        wp_view = "list"
+        wp_sel = nil
+    end
+    Gfx.fillRect(0, 0, L.W, L.H, C.bg)
+
+    if wp_view == "list" then
+        local px, py, pw, ph = wpListRect()
+        wpBox(px, py, pw, ph, C.panel)
+        Gfx.text(px + 8, py + 6,
+            fit("WAYPOINTS (" .. #wp_list .. ")", pw - 60), C.accent)
+        wpBox(px + pw - 20, py + 4, 16, 16, C.bar_bg)
+        wpCenter(px + pw - 20, py + 4, 16, 16, "X", C.text)
+        if #wp_list == 0 then
+            Gfx.text(px + 12, py + 34, fit("No waypoints yet", pw - 24), C.dim)
+            Gfx.text(px + 12, py + 50,
+                fit("Use QUICK WP / NEW WP on the NAV tab", pw - 24), C.dim)
+        else
+            local maxrows = wpMaxRows(ph)
+            for k = 1, maxrows do
+                local i = wp_scroll + k
+                local w = wp_list[i]
+                if not w then break end
+                local ry = py + 26 + (k - 1) * 16
+                Gfx.fillRect(px + 4, ry, pw - 8, 14,
+                    (k % 2 == 0) and C.bar_bg or C.bg)
+                Gfx.text(px + 8, ry + 3, fit(tostring(w.name), 90), C.accent)
+                local info = string.format("X%.0f Z%.0f H%.0f",
+                    tonumber(w.x) or 0, tonumber(w.z) or 0,
+                    tonumber(w.heading) or 0)
+                local iw = Font.textWidth(info)
+                Gfx.text(px + pw - 12 - iw, ry + 3, info, C.text)
+            end
+            if #wp_list > maxrows then
+                if wp_scroll > 0 then
+                    wpBox(px + pw - 46, py + ph - 20, 18, 16, C.bar_bg)
+                    wpCenter(px + pw - 46, py + ph - 20, 18, 16, "^", C.text)
+                end
+                if wp_scroll + maxrows < #wp_list then
+                    wpBox(px + pw - 24, py + ph - 20, 18, 16, C.bar_bg)
+                    wpCenter(px + pw - 24, py + ph - 20, 18, 16, "v", C.text)
+                end
+            end
+        end
+
+    elseif wp_view == "popup" and wp_sel and wp_list[wp_sel] then
+        local w = wp_list[wp_sel]
+        local px, py, pw, ph = wpPopupRect()
+        wpBox(px, py, pw, ph, C.panel)
+        wpBox(px + 4, py + 4, 14, 14, C.bar_bg)
+        wpCenter(px + 4, py + 4, 14, 14, "X", C.text)
+        Gfx.text(px + 24, py + 6, fit(tostring(w.name), pw - 32), C.accent)
+        local rows = {
+            { "X", string.format("%.1f", tonumber(w.x) or 0) },
+            { "Z", string.format("%.1f", tonumber(w.z) or 0) },
+            { "H", string.format("%.0f", tonumber(w.heading) or 0) },
+        }
+        for i, r in ipairs(rows) do
+            local ry = py + 28 + (i - 1) * 18
+            Gfx.text(px + 16, ry, r[1], C.dim)
+            Gfx.text(px + 40, ry, r[2], C.text)
+        end
+        -- travel = blue arrow (>>>), delete = red cross - both bold
+        wpBox(px + 16, py + ph - 30, 56, 22, C.blue)
+        wpCenterBold(px + 16, py + ph - 30, 56, 22, ">>>", 15)
+        wpBox(px + pw - 72, py + ph - 30, 56, 22, C.bad)
+        wpCenterBold(px + pw - 72, py + ph - 30, 56, 22, "X", 15)
+
+    elseif wp_view == "confirm" and wp_sel and wp_list[wp_sel] then
+        local w = wp_list[wp_sel]
+        local px, py, pw, ph = wpConfirmRect()
+        wpBox(px, py, pw, ph, C.panel)
+        Gfx.text(px + 14, py + 12, fit("Delete \"" .. tostring(w.name) .. "\"?", pw - 28), C.text)
+        wpBox(px + 16, py + ph - 28, 70, 20, C.bad)
+        wpCenter(px + 16, py + ph - 28, 70, 20, "YES", 15)
+        wpBox(px + pw - 86, py + ph - 28, 70, 20, C.bar_bg)
+        wpCenter(px + pw - 86, py + ph - 28, 70, 20, "NO", C.text)
     end
 end
 
@@ -560,20 +737,80 @@ end
 local function drawNavDynamic(s)
     local x = L.content_x
     local y = L.body_y + 2
-    local vw = L.content_w - 90
+    local w = L.content_w
+    local pos = s.position or {}
 
-    slotText(x + 90, y + 20, vw, string.format("%.1f", s.yaw or 0), C.accent, "right")
-    slotText(x + 90, y + 40, vw, string.format("%.1f", s.target_altitude or 0), C.accent, "right")
+    -- position, top-left
+    slotText(x + 40, y + 16, 88, string.format("%.1f", pos.x or 0), C.text, "left")
+    slotText(x + 40, y + 34, 88,
+        string.format("%.1f", pos.y or (s.altitude or 0)), C.text, "left")
+    slotText(x + 40, y + 52, 88, string.format("%.1f", pos.z or 0), C.text, "left")
+
+    -- 4 buttons, top-right
+    for i, btn in ipairs(NAV_BTNS) do
+        local bx, by, bw, bh = navBtnRect(i)
+        local bg, fg = C.panel, C.text
+        if btn.id == "rec" and s.recording then
+            bg, fg = C.bad, 15
+        elseif btn.id == "print" then
+            if s.printing then
+                bg, fg = C.warn, 15
+            elseif not s.has_printer then
+                fg = C.dim
+            end
+        end
+        Gfx.fillRect(bx, by, bw, bh, bg)
+        Gfx.fillRect(bx, by, bw, 1, C.border)
+        Gfx.fillRect(bx, by + bh - 1, bw, 1, C.border)
+        Gfx.fillRect(bx, by, 1, bh, C.border)
+        Gfx.fillRect(bx + bw - 1, by, 1, bh, C.border)
+        local txt = (btn.id == "rec" and s.recording) and "STOP" or btn.label
+        local tw = Font.textWidth(txt)
+        Gfx.text(bx + math.floor((bw - tw) / 2),
+            by + math.floor((bh - Font.height) / 2), txt, fg)
+    end
+
+    -- status line: keyboard prompt > printing > recent kbd event > recording
+    Gfx.fillRect(x, y + 82, w, Font.height + 4, C.bg) -- y+82..95: keeps the y+96 divider clear
+    local st = nil
+    if s.kbd_prompt then
+        st = s.kbd_prompt
+    elseif s.printing then
+        st = "PRINTING " .. tostring(s.printing)
+    elseif s.kbd_last then
+        st = s.kbd_last
+    elseif s.recording then
+        local t = s.rec_t or 0
+        st = string.format("REC %d:%02d | %d SAMP",
+            math.floor(t / 60), math.floor(t) % 60, s.rec_n or 0)
+    end
+    if st then
+        Gfx.text(x, y + 86, fit(st, w), C.accent)
+    end
+
+    -- navigation rows
+    slotText(x + 90, y + 106, w - 90, string.format("%.1f", s.yaw or 0), C.accent, "right")
+    slotText(x + 90, y + 124, w - 90, string.format("%.1f", s.target_altitude or 0), C.accent, "right")
     local err = (s.altitude or 0) - (s.target_altitude or 0)
     local ec = C.good
     if math.abs(err) > 10 then ec = C.bad elseif math.abs(err) > 3 then ec = C.warn end
-    slotText(x + 90, y + 60, vw, string.format("%+.1f", err), ec, "right")
+    slotText(x + 90, y + 142, w - 90, string.format("%+.1f", err), ec, "right")
 
-    local pos = s.position or {}
-    slotText(x + 50, y + 106, vw - 50, string.format("%.1f", pos.x or 0), C.text, "left")
-    slotText(x + 50, y + 126, vw - 50,
-        string.format("%.1f", pos.y or (s.altitude or 0)), C.text, "left")
-    slotText(x + 50, y + 146, vw - 50, string.format("%.1f", pos.z or 0), C.text, "left")
+    -- autopilot row: objective distance, route progress %, ETA
+    if s.ap then
+        local ap = s.ap
+        local d = math.floor(tonumber(ap.dist) or 0)
+        local pct = math.floor((tonumber(ap.progress) or 0) * 100 + 0.5)
+        local eta = ap.eta
+        local eta_s = (eta and eta >= 0) and string.format("%dm%02ds",
+            math.floor(eta / 60), math.floor(eta % 60)) or "--"
+        local txt = string.format("%s %dm %d%% ETA %s",
+            tostring(ap.name):upper(), d, pct, eta_s)
+        if ap.paused then txt = "PAUSED " .. txt end
+        slotText(x + 90, y + 162, w - 90, fit(txt, w - 90), C.good, "left")
+    else
+        slotText(x + 90, y + 162, w - 90, "-", C.dim, "left")
+    end
 end
 
 local function drawAlarmsDynamic(s, status_msg)
@@ -657,6 +894,13 @@ local function drawDynamic(s, status_msg)
         drawActionsDynamic(s)
     end
 
+    -- Waypoint window: full-monitor modal over everything (the unflip
+    -- banner below still draws on top of it - safety first).
+    if wp_view then
+        drawWpWindow()
+        drawShutdownButton() -- the wp window would cover it; keep it visible
+    end
+
     -- Auto-unflip warning: black on red, drawn last so it sits on top.
     if s.unflip then
         local msg = fit("AUTOMATIC UNFLIP SEQUENCE", L.content_w - 12)
@@ -718,6 +962,21 @@ function HUD.render(mon, status, config, status_msg)
         chrome_dirty = true
         content_dirty = true
     end
+    -- Autopilot start/end switches the chrome to green outlines: force a
+    -- full redraw so the change is immediate (not only on tab change).
+    if (status.ap ~= nil) ~= ap_shown then
+        ap_shown = (status.ap ~= nil)
+        chrome_dirty = true
+        content_dirty = true
+    end
+    -- Modal closed: it painted over the static chrome/content, which only
+    -- redraw on dirty flags - force a full redraw so everything comes back
+    -- (otherwise only the per-frame dynamic widgets repopulate).
+    if wp_shown and not wp_view then
+        chrome_dirty = true
+        content_dirty = true
+    end
+    wp_shown = wp_view ~= nil
     Gfx.begin()
     if chrome_dirty then
         drawChrome()
@@ -754,6 +1013,9 @@ end
 -- so the next boot matches a first-time OS start.
 function HUD.resetState()
     active_tab = "flight"
+    wp_view = nil
+    wp_sel = nil
+    wp_scroll = 0
     chrome_dirty = true
     content_dirty = true
     power_dirty = true
@@ -767,6 +1029,46 @@ function HUD.nextTab()
             return nxt.id
         end
     end
+end
+
+-- ============================================================
+-- Waypoint window API (called by os_main)
+-- ============================================================
+function HUD.setWaypoints(list)
+    wp_list = type(list) == "table" and list or {}
+    if wp_sel and wp_sel > #wp_list then
+        wp_sel = nil
+        wp_view = "list"
+    end
+    local maxrows = wpMaxRows(select(3, wpListRect()))
+    if wp_scroll > #wp_list then wp_scroll = 0 end
+    if wp_scroll > 0 and wp_scroll >= #wp_list - maxrows + 1 then
+        wp_scroll = math.max(0, #wp_list - maxrows)
+    end
+    if wp_view == "confirm" and not wp_sel then wp_view = "list" end
+end
+
+function HUD.wpOpen()
+    wp_view = "list"
+    wp_scroll = 0
+    wp_sel = nil
+end
+
+function HUD.wpClose()
+    wp_view = nil
+    wp_sel = nil
+end
+
+function HUD.wpIsOpen()
+    return wp_view ~= nil
+end
+
+-- After a confirmed delete: back to the list (os_main refreshes via
+-- setWaypoints first, which keeps this view).
+function HUD.wpAfterDelete()
+    wp_sel = nil
+    wp_view = "list"
+    wp_scroll = 0
 end
 
 function HUD.prevTab()
@@ -784,6 +1086,77 @@ end
 -- out-of-grid coordinates are treated as pixels (pixel-space events).
 local last_touch_t, last_touch_x, last_touch_y = -1, -1, -1
 
+-- Waypoint window hits. Returns a command ("wp:travel:N", "wp:confirmdel:N")
+-- or "wp:noop" for internal transitions/blocked clicks - never nil, so the
+-- cell sampler stops and taps never fall through to the tabs underneath.
+local function wpHitTest(x, y)
+    if wp_view ~= "list" and wp_view ~= nil
+        and (not wp_sel or not wp_list[wp_sel]) then
+        wp_view = "list"
+        wp_sel = nil
+    end
+    if wp_view == "list" then
+        local px, py, pw, ph = wpListRect()
+        if inRect(px + pw - 20, py + 4, 16, 16, x, y) then
+            wp_view = nil
+            return "wp:noop"
+        end
+        if inRect(px, py, pw, ph, x, y) then
+            local maxrows = wpMaxRows(ph)
+            for k = 1, maxrows do
+                local i = wp_scroll + k
+                if not wp_list[i] then break end
+                local ry = py + 26 + (k - 1) * 16
+                if inRect(px + 4, ry, pw - 8, 14, x, y) then
+                    wp_sel = i
+                    wp_view = "popup"
+                    return "wp:noop"
+                end
+            end
+            if #wp_list > maxrows then
+                if wp_scroll > 0
+                    and inRect(px + pw - 46, py + ph - 20, 18, 16, x, y) then
+                    wp_scroll = math.max(0, wp_scroll - maxrows)
+                    return "wp:noop"
+                end
+                if wp_scroll + maxrows < #wp_list
+                    and inRect(px + pw - 24, py + ph - 20, 18, 16, x, y) then
+                    wp_scroll = wp_scroll + maxrows
+                    return "wp:noop"
+                end
+            end
+        end
+        return "wp:noop" -- modal: clicks outside the panel do nothing
+
+    elseif wp_view == "popup" then
+        local px, py, pw, ph = wpPopupRect()
+        if inRect(px + 4, py + 4, 14, 14, x, y) then
+            wp_view = "list"
+            return "wp:noop"
+        end
+        if inRect(px + 16, py + ph - 30, 56, 22, x, y) then
+            return "wp:travel:" .. tostring(wp_sel)
+        end
+        if inRect(px + pw - 72, py + ph - 30, 56, 22, x, y) then
+            wp_view = "confirm"
+            return "wp:noop"
+        end
+        return "wp:noop"
+
+    elseif wp_view == "confirm" then
+        local px, py, pw, ph = wpConfirmRect()
+        if inRect(px + 16, py + ph - 28, 70, 20, x, y) then
+            return "wp:confirmdel:" .. tostring(wp_sel)
+        end
+        if inRect(px + pw - 86, py + ph - 28, 70, 20, x, y) then
+            wp_view = "popup"
+            return "wp:noop"
+        end
+        return "wp:noop"
+    end
+    return "wp:noop"
+end
+
 local function hitTest(x, y)
     if splash_active and boot_rect
         and inRect(boot_rect.x - 6, boot_rect.y - 9, boot_rect.w + 12, boot_rect.h + 18, x, y) then
@@ -794,11 +1167,26 @@ local function hitTest(x, y)
         return "shutdown"
     end
 
+    -- Waypoint window is modal: it swallows everything (except shutdown,
+    -- which stays live as a safety).
+    if wp_view then
+        return wpHitTest(x, y)
+    end
+
     if active_tab == "actions" then
         for i, btn in ipairs(ACTION_BTNS) do
             local bx, by, bw, bh = actionBtnRect(i)
             if inRect(bx, by, bw, bh, x, y) then
                 return "act:" .. btn.id
+            end
+        end
+    end
+
+    if active_tab == "nav" then
+        for i, btn in ipairs(NAV_BTNS) do
+            local bx, by, bw, bh = navBtnRect(i)
+            if inRect(bx, by, bw, bh, x, y) then
+                return "nav:" .. btn.id
             end
         end
     end

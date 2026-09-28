@@ -14,6 +14,10 @@ end
 
 local Flight = loadLib("lib.flight")
 local Hardware = loadLib("lib.hardware")
+local Rec = loadLib("lib.record")
+local Report = loadLib("lib.report")
+local Kbd = loadLib("lib.kbd")
+local WP = loadLib("lib.waypoints")
 
 local OS = {}
 local config = nil
@@ -169,6 +173,32 @@ function OS.start(cfg, hardware)
     hw.engineOutputsOff()
     clutch_engaged = false
 
+    -- Waypoints (config/wp_<slot>.lua) + network keyboard for wp input
+    local wpn = WP.load(config.slot or "ship")
+    print("  Waypoints loaded: " .. tostring(wpn))
+    local net_ok = Kbd.openNet()
+    if config.kbd_id then -- pre-seed pairing from the setup wizard
+        Kbd.id = tonumber(config.kbd_id) or Kbd.id
+    end
+    if not Kbd.id then -- last runtime pairing (config/kbd_last_id)
+        local f = fs.open("config/kbd_last_id", "r")
+        if f then
+            Kbd.id = tonumber(f.readAll() or "") or nil
+            f.close()
+        end
+    end
+    Kbd.onPaired = function(id) -- persist so boots can skip the pairing wait
+        local wf = fs.open("config/kbd_last_id", "w")
+        if wf then
+            wf.writeLine(tostring(id))
+            wf.close()
+        end
+        print("  Keyboard computer #" .. tostring(id) .. " paired (saved)")
+    end
+    print("  Network: rednet " .. (net_ok and "OPEN" or "NO MODEM") ..
+        ", keyboard " .. (Kbd.id and ("#" .. Kbd.id) or "not paired yet"))
+    print("  Kbd link: " .. Kbd.stats())
+
     local mon = hw.getDevice("main_monitor")
     if mon then
         local hud = loadLib("lib.hud")
@@ -228,7 +258,7 @@ end
 
 function OS.mainLoop(controlTimer)
     while running do
-        local event, param1, param2, param3 = os.pullEvent()
+        local event, param1, param2, param3, param4 = os.pullEvent()
         local now = os.clock()
 
         if event == "key" then
@@ -248,6 +278,20 @@ function OS.mainLoop(controlTimer)
             end
         elseif event == "monitor_touch" then
             pcall(OS.handleMonitorTouch, param2, param3)
+        elseif event == "rednet_message" then
+            local kok, kerr = pcall(Kbd.onMessage, param1, param2, param3)
+            if not kok then
+                print("[" .. string.format("%.0f", os.clock()) ..
+                    "] kbd message error: " .. tostring(kerr))
+            end
+        elseif event == "modem_message" then
+            -- raw kbd->ship channel (bypasses rednet's dedup/filter)
+            local kok, kerr = pcall(Kbd.onModemRaw, param1, param2,
+                param3, param4)
+            if not kok then
+                print("[" .. string.format("%.0f", os.clock()) ..
+                    "] kbd raw error: " .. tostring(kerr))
+            end
         elseif event == "peripheral" then
             OS.handlePeripheralConnect(param1, param2)
         elseif event == "peripheral_detach" then
@@ -298,6 +342,7 @@ function OS.bootTick()
     end
 
     if t >= clutch_at then
+        -- IMPORTANT: this couples engines -> propellers (flight). Never remove.
         if not clutch_engaged and hasFeature("clutch") then
             hw.setClutch(true)
             clutch_engaged = true
@@ -330,6 +375,27 @@ function OS.controlTick()
         return
     end
 
+    -- ###############################################################
+    -- # CRITICAL - FLIGHT ENABLER - DO NOT DELETE OR "OPTIMIZE AWAY" #
+    -- ###############################################################
+    -- This is what actually couples the engines to the propellers.
+    -- Without this block the clutch is never engaged during normal
+    -- operation, the engines spin freely, and the ship CANNOT fly.
+    -- (The boot-time coupling in OS.bootTick only runs when the
+    -- engine_auto_start feature is on, so ships with that feature off
+    -- never coupled the clutch at all -- hence this explicit coupling.)
+    -- It is load-bearing for flight; removing it grounds the ship.
+    if hasFeature("clutch") and not clutch_engaged then
+        if hw.setClutch(true) then
+            clutch_engaged = true
+            print("[" .. string.format("%.0f", os.clock()) ..
+                "] Clutch COUPLED -> propellers (flight enabled)")
+            status_message = "CLUTCH ON"
+            status_time = os.clock()
+        end
+    end
+    -- ###############################################################
+
     local keys = hw.readInputs()
 
     -- Engine relay front/back = UP/DOWN tab keys: rising edge switches the
@@ -355,13 +421,27 @@ function OS.controlTick()
     OS._tab_edge.up = up_d
     OS._tab_edge.down = dn_d
 
+    -- Flight recorder (10 s samples) + keyboard ask timeout
+    Rec.tick(os.clock(), flight.state.position)
+    Kbd.tick(os.clock())
+
     local shift = keys.SHIFT or 0
-    if hasFeature("cruise_mode") and flight:pollShift(shift) then
+    -- During AUTOPILOT most manual flight controls are inert: only the
+    -- on-screen CANCEL button (and e-stop / shutdown) may alter flight —
+    -- EXCEPT the manual Q/E yaw stick, which survives into the autopilot's
+    -- two rotation phases (aim/align; see the pilot_yaw read below).
+    -- Tab switching (UP/DOWN) stays live so the pilot can still read menus.
+    local ap_active = flight.ap ~= nil
+    local shifted = false
+    if hasFeature("cruise_mode") then
+        -- always poll so the rising-edge arming stays fresh; Flight:pollShift
+        -- itself refuses to toggle the mode while the autopilot owns it.
+        shifted = flight:pollShift(shift)
+    end
+    if shifted and not ap_active then
         status_message = "Mode: " .. flight.mode
         status_time = os.clock()
         print("[" .. string.format("%.0f", os.clock()) .. "] Mode -> " .. flight.mode .. " (shift)")
-    elseif not hasFeature("cruise_mode") then
-        -- ignore shift when cruise feature disabled
     end
 
     -- Redstone Space/Ctrl altitude steps (rising edge + hold repeat @ 20Hz)
@@ -385,10 +465,26 @@ function OS.controlTick()
             end
         end
     end
-    altHold("space", sp, step)
-    altHold("ctrl", ct, -step)
+    -- Manual Q/E yaw stick, read every tick: while the autopilot runs it
+    -- survives as flight.pilot_yaw and Flight adds it to its own yaw_cmd in
+    -- the two rotation phases — aim (not facing the goal yet) and align
+    -- (above the waypoint, turning onto the saved heading). Cruise/correct/
+    -- arrive ignore it: bank-to-turn owns the heading there with the rear
+    -- thrusters at speed.
+    local pilot_yaw = 0
+    if keys.Q and keys.Q > 0 then pilot_yaw = -1
+    elseif keys.E and keys.E > 0 then pilot_yaw = 1 end
+    flight.pilot_yaw = pilot_yaw
 
-    flight:processInputs(keys)
+    if not ap_active then
+        altHold("space", sp, step)
+        altHold("ctrl", ct, -step)
+        flight:processInputs(keys)
+    else
+        -- keep the held-repeat counters cleared so release does not burst
+        OS._alt_ticks.space = 0
+        OS._alt_ticks.ctrl = 0
+    end
     flight:update()
 
     -- Safety shutdown requested by flight (auto-land goal runaway):
@@ -401,6 +497,20 @@ function OS.controlTick()
             "] Safety shutdown: " .. tostring(why))
         OS.powerOff()
         return
+    end
+
+    -- Waypoint autopilot events (arrival / cancellation)
+    if flight.wp_event then
+        local e = flight.wp_event
+        flight.wp_event = nil
+        if e.kind == "arrived" then
+            status_message = "ARRIVED: " .. tostring(e.name)
+            print("[" .. string.format("%.0f", os.clock()) ..
+                "] WP arrived: " .. tostring(e.name))
+        else
+            status_message = "WP CANCELLED: " .. tostring(e.name)
+        end
+        status_time = os.clock()
     end
 
     if flight.tune_status and flight.tune_status ~= "" then
@@ -421,11 +531,28 @@ end
 function OS.doAction(name)
     if power_state ~= "on" or not flight then return end
 
+    -- AUTOPILOT: the manual flight actions are inert so nothing can wrest
+    -- control from the sequence. Only emergencies (estop), the window toggle
+    -- and the autopilot's own CANCEL button are allowed through.
+    if flight.ap ~= nil and name ~= "estop"
+        and name ~= "apcancel" and name ~= "autopilot" then
+        status_message = "AUTOPILOT ACTIVE - use CANCEL"
+        status_time = os.clock()
+        return
+    end
+
     if name == "estop" then
         flight:emergencyStop()
         status_message = "EMERGENCY STOP"
         status_time = os.clock()
         print("[" .. string.format("%.0f", os.clock()) .. "] EMERGENCY STOP")
+
+    elseif name == "apcancel" then
+        -- reason nil: cancelAutopilot stays quiet, the status line reports it
+        local ok = flight:cancelAutopilot(nil)
+        status_message = ok and "AUTOPILOT CANCELLED" or "NO AUTOPILOT"
+        status_time = os.clock()
+        if ok then print(ts() .. " autopilot cancelled") end
 
     elseif name == "land" then
         if not hasFeature("auto_land") then
@@ -467,7 +594,224 @@ function OS.doAction(name)
             status_message = ok and "Auto-tuning altitude PID..." or ("Auto-tune: " .. tostring(msg))
             status_time = os.clock()
         end
+
+    elseif name == "autopilot" then
+        -- Toggle the waypoint window (list -> popup -> travel/delete)
+        local hud = loadLib("lib.hud")
+        if hud.wpIsOpen() then
+            hud.wpClose()
+        else
+            hud.setWaypoints(WP.list)
+            hud.wpOpen()
+        end
     end
+end
+
+-- ============================================================
+-- Printer / recorder / waypoint actions (NAV tab + wp window)
+-- ============================================================
+function OS.findPrinter()
+    if OS._printer_off and os.clock() - OS._printer_off < 5 then
+        return nil -- throttle scans right after a detach
+    end
+    if OS._printer_cache then
+        local ok, alive = pcall(function()
+            return peripheral.getName(OS._printer_cache) ~= nil
+        end)
+        if ok and alive then return OS._printer_cache end
+        OS._printer_cache = nil
+    end
+    local pname = config and config.peripherals and config.peripherals.printer
+    local pr = nil
+    if pname then
+        pr = peripheral.wrap(pname)
+        -- a wired-network name can be reused: make sure it is really a printer
+        if pr and type(pr.newPage) ~= "function" then pr = nil end
+    end
+    if not pr then
+        pr = peripheral.find("printer")
+    end
+    OS._printer_cache = pr
+    return pr
+end
+
+local function ts()
+    return string.format("[%02.0f]", os.clock())
+end
+
+local function validName(v)
+    return type(v) == "string" and v ~= "" and #v <= 10
+        and v:match("^%w+$") ~= nil
+end
+
+function OS.doNav(op)
+    if power_state ~= "on" or not flight then return end
+
+    if op == "rec" then
+        local on = Rec.toggle(flight.state.position)
+        if on then
+            status_message = "REC STARTED (10s samples)"
+            print(ts() .. " recorder started")
+        else
+            status_message = string.format("REC STOPPED (%d samples)", Rec.count())
+            print(ts() .. " recorder stopped: " .. Rec.count() .. " samples")
+        end
+        status_time = os.clock()
+
+    elseif op == "print" then
+        if OS.printing then
+            status_message = "ALREADY PRINTING"
+            status_time = os.clock()
+            return
+        end
+        if Rec.count() < 2 then
+            status_message = "NO RECORDING - PRESS REC FIRST"
+            status_time = os.clock()
+            return
+        end
+        local pr = OS.findPrinter()
+        if not pr then
+            status_message = "NO PRINTER FOUND"
+            status_time = os.clock()
+            return
+        end
+        OS.printing = "1/3"
+        status_time = os.clock()
+        local title = (ship_info and ship_info.name) or config.name or "SHIP"
+        local ok, msg = Report.print(pr, Rec.data(), title, Rec.stats(),
+            Rec.INTERVAL)
+        OS.printing = nil
+        status_message = msg or (ok and "PRINTED" or "PRINT FAILED")
+        status_time = os.clock()
+        print(ts() .. " print: " .. status_message)
+
+    elseif op == "quickwp" then
+        if Kbd.isPending() then
+            Kbd.cancel("cancelled")
+            status_message = "KBD CANCELLED"
+            status_time = os.clock()
+            return
+        end
+        local pos = flight.state.position
+        local heading = ((flight.state.yaw or 0) % 360 + 360) % 360
+        local x, z = pos.x, pos.z
+        local ok, err = Kbd.ask({ { "Name", "name" } }, function(values, kerr)
+            if not values then
+                status_message = "KBD: " .. tostring(kerr or "failed")
+                status_time = os.clock()
+                return
+            end
+            local name = values[1]
+            if not validName(name) then
+                status_message = "BAD NAME (1-10 letters/digits)"
+                status_time = os.clock()
+                return
+            end
+            local n, aerr = WP.add({ name = name, x = x, z = z,
+                heading = heading })
+            if not n then
+                status_message = "WP SAVE FAILED"
+                status_time = os.clock()
+                return
+            end
+            local hud = loadLib("lib.hud")
+            hud.setWaypoints(WP.list)
+            status_message = "WP SAVED: " .. name
+            status_time = os.clock()
+            print(ts() .. " waypoint saved: " .. name ..
+                string.format(" (%.1f, %.1f, H%.0f)", x, z, heading))
+        end)
+        if not ok then
+            status_message = "KBD: " .. tostring(err)
+            status_time = os.clock()
+        else
+            status_message = Kbd.promptText() or "KBD..."
+            status_time = os.clock()
+        end
+
+    elseif op == "newwp" then
+        if Kbd.isPending() then
+            Kbd.cancel("cancelled")
+            status_message = "KBD CANCELLED"
+            status_time = os.clock()
+            return
+        end
+        local ok, err = Kbd.ask({
+            { "X", "number" },
+            { "Z", "number" },
+            { "Heading", "number" },
+            { "Name", "name" },
+        }, function(values, kerr)
+            if not values then
+                status_message = "KBD: " .. tostring(kerr or "failed")
+                status_time = os.clock()
+                return
+            end
+            local x, z, h = tonumber(values[1]), tonumber(values[2]),
+                tonumber(values[3])
+            local name = values[4]
+            if not x or not z or not h then
+                status_message = "BAD NUMBER INPUT"
+                status_time = os.clock()
+                return
+            end
+            if not validName(name) then
+                status_message = "BAD NAME (1-10 letters/digits)"
+                status_time = os.clock()
+                return
+            end
+            local n, aerr = WP.add({ name = name, x = x, z = z, heading = h })
+            if not n then
+                status_message = "WP SAVE FAILED"
+                status_time = os.clock()
+                return
+            end
+            local hud = loadLib("lib.hud")
+            hud.setWaypoints(WP.list)
+            status_message = "WP SAVED: " .. name
+            status_time = os.clock()
+            print(ts() .. " waypoint saved: " .. name ..
+                string.format(" (%.1f, %.1f, H%.0f)", x, z, h % 360))
+        end)
+        if not ok then
+            status_message = "KBD: " .. tostring(err)
+            status_time = os.clock()
+        else
+            status_message = Kbd.promptText() or "KBD..."
+            status_time = os.clock()
+        end
+    end
+end
+
+-- Actions coming from the waypoint window ("travel:N", "confirmdel:N",
+-- "noop").
+function OS.doWp(op)
+    local i = tonumber(op:match("^travel:(%d+)$") or "")
+        or tonumber(op:match("^confirmdel:(%d+)$") or "")
+    if op:match("^travel:") then
+        local wp = i and WP.list[i]
+        if not wp then return end
+        local ok, msg = flight and flight:startAutopilot(wp)
+        status_message = msg or (ok and "AUTOPILOT" or "AUTOPILOT FAILED")
+        status_time = os.clock()
+        if ok then
+            local hud = loadLib("lib.hud")
+            hud.wpClose()
+            print(ts() .. " autopilot -> " .. tostring(wp.name))
+        end
+    elseif op:match("^confirmdel:") then
+        local wp = i and WP.list[i]
+        if not wp then return end
+        local name = wp.name
+        WP.remove(i)
+        local hud = loadLib("lib.hud")
+        hud.setWaypoints(WP.list)
+        hud.wpAfterDelete()
+        status_message = "WP DELETED: " .. tostring(name)
+        status_time = os.clock()
+        print(ts() .. " waypoint deleted: " .. tostring(name))
+    end
+    -- "noop" and anything else: view transition already handled by the HUD
 end
 
 function OS.handleKey(key, held)
@@ -489,6 +833,22 @@ function OS.handleKey(key, held)
     if power_state == "booting" then
         return
     end
+
+    -- Tab navigation: keyboard arrows mirror the redstone UP/DOWN relays.
+    -- Arrows stay live even during autopilot (only flight controls are inert).
+    if key == keys.up or key == keys.down then
+        local hud = loadLib("lib.hud")
+        local id = (key == keys.up) and hud.prevTab() or hud.nextTab()
+        if id then
+            status_message = "Tab: " .. tostring(id):upper()
+            status_time = os.clock()
+        end
+        OS.updateDisplay()
+        return
+    end
+
+    -- Space/Ctrl altitude = a manual flight control: inert during autopilot.
+    if flight and flight.ap then return end
 
     -- Actions (mode/land/gear/estop/…) are monitor-only (ACTIONS tab).
     if key == keys.space then
@@ -548,6 +908,9 @@ function OS.powerOff()
     -- no stale status. (beginBoot still clears the e-stop latch and re-arms
     -- auto-tune on the next boot.) Next screen is the boot splash.
     flight:setMode(Flight.MODE_HOVER)
+    Rec.stop()
+    Kbd.cancel("shutdown")
+    OS.printing = nil
     local hud = loadLib("lib.hud")
     hud.resetState()
     status_message = ""
@@ -576,6 +939,10 @@ function OS.handleMonitorTouch(x, y)
         -- success: powerOff already cleared status (fresh-start splash state)
     elseif action:sub(1, 4) == "act:" then
         OS.doAction(action:sub(5))
+    elseif action:sub(1, 4) == "nav:" then
+        OS.doNav(action:sub(5))
+    elseif action:sub(1, 3) == "wp:" then
+        OS.doWp(action:sub(4))
     elseif action ~= "boot" then
         local tab = action
         if action:sub(1, 4) == "tab:" then
@@ -594,6 +961,9 @@ function OS.handlePeripheralConnect(name, peripheralType)
     print("[" .. string.format("%.0f", os.clock()) .. "] Connected: " .. name)
     status_message = "Connected: " .. name
     status_time = os.clock()
+    OS._printer_cache = nil
+    OS._printer_off = nil
+    Kbd.openNet() -- a freshly attached modem may be the rednet link
     for key, assigned in pairs(config.peripherals or {}) do
         if assigned == name then
             pcall(Hardware.connect)
@@ -605,6 +975,9 @@ function OS.handlePeripheralDisconnect(name)
     print("[" .. string.format("%.0f", os.clock()) .. "] Disconnected: " .. name)
     status_message = "Disconnected: " .. name
     status_time = os.clock()
+    OS._printer_cache = nil
+    OS._printer_off = os.clock()
+    Kbd._opened[name] = nil -- allow re-open if a modem detaches
 end
 
 function OS.updateDisplay()
@@ -636,6 +1009,14 @@ function OS.updateDisplay()
     if not flight then return end
     local ok, err = pcall(function()
         local status = flight:getStatus()
+        -- OS-level fields the NAV tab buttons/status line need
+        status.recording = Rec.isActive()
+        status.rec_t = Rec.duration()
+        status.rec_n = Rec.count()
+        status.kbd_prompt = Kbd.promptText()
+        status.kbd_last = Kbd.lastInfo()
+        status.printing = OS.printing
+        status.has_printer = OS.findPrinter() ~= nil
         hud.render(mon, status, config, status_message)
     end)
     if not ok then

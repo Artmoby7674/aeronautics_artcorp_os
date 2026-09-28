@@ -65,7 +65,8 @@ local function sanitizeSlot(raw)
     raw = raw:gsub("[^%w%-_]", "")
     if raw == "" then return nil end
     if #raw > 24 then raw = raw:sub(1, 24) end
-    if raw:match("^assignments_") or raw:match("^pid_") then return nil end
+    if raw:match("^assignments_") or raw:match("^pid_")
+        or raw:match("^wp_") then return nil end
     return raw
 end
 
@@ -142,8 +143,10 @@ local per = {
     output_RR      = ask("Prop RR relay", "relay_6"),
     output_REAR    = ask("Rear thruster relay", "relay_7"),
     main_monitor   = ask("HUD monitor", "main_monitor"),
+    printer        = ask("Network printer name (blank = auto-find)", ""),
 }
 if not per.engine_relay then per.engine_relay = nil end
+if per.printer == "" then per.printer = nil end
 
 title("6) Output map (relay face per action)")
 print("Default matches ArtCorpOS docs:")
@@ -237,7 +240,8 @@ end
 w("")
 w("    peripherals = {")
     for _, k in ipairs({ "input_1", "input_2", "aux_relay", "engine_relay",
-        "output_FL", "output_FR", "output_RL", "output_RR", "output_REAR", "main_monitor" }) do
+        "output_FL", "output_FR", "output_RL", "output_RR", "output_REAR",
+        "main_monitor", "printer" }) do
         if per[k] then
             w("        " .. k .. " = " .. q(per[k]) .. ",")
         end
@@ -306,6 +310,7 @@ w("    signal = { max = 15, min = 0 },")
     -- listing it unconditionally made startup block on a missing peripheral
     local optional = { "aux_relay" }
     if engine then table.insert(optional, "engine_relay") end
+    if per.printer then table.insert(optional, "printer") end
     local quoted = {}
     for _, name in ipairs(optional) do table.insert(quoted, "\"" .. name .. "\"") end
     w("    optional_peripherals = { " .. table.concat(quoted, ", ") .. " },")
