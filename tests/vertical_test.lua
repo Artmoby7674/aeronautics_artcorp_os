@@ -287,5 +287,136 @@ check("sched: no floor clip", min_fl_h > 0.5 and min_fl_c > 0.5,
 check("sched: climb moment invariance", ratio >= 0.85 and ratio <= 1.15,
     string.format("ratio=%.3f (broken code gives ~0.68)", ratio))
 
+-- 10. AT CRUISE ALTITUDE THE VERTICAL LOOP IS THRUST-LIMITED, NOT GAIN-LIMITED.
+--
+-- Reported in-game: during FAST TRAVEL the ship fell ~210 blocks under its
+-- altitude goal and "did not react". The instinct is to turn the altitude PID
+-- up. Measured here, that does nothing at all, and this block exists to stop
+-- the next person spending a day on it.
+--
+-- Why. Holding level needs cmd = hover_throttle * e^(k*(h-63)), so at the
+-- ceiling the props are already commanded to ~13 of a hard maximum of 15 --
+-- the ceiling discovery stops the climb at props=13, so the leftover margin
+-- IS the 2 units by definition. The vertical loop's usable authority is
+-- therefore
+--     accel = g * (hmax / hover_cmd - 1)
+-- which is a property of the ALTITUDE and the 15-unit hardware ceiling, not
+-- of any gain. Meanwhile the P term saturates at output_limit once the error
+-- passes output_limit/kp (~20 blocks), and updateCruise's
+-- clamp(hover + out, hmin, hmax) then throws the surplus away. So for any
+-- error over ~20 blocks the command is already pinned at hmax and every gain
+-- in the PID produces the identical number.
+do
+    local hmax = (cfg.limits and cfg.limits.hover_max_speed) or 15
+    local CEIL_LIFT = 13 -- AP_CEIL_LIFT: where the probe stops the climb
+    -- the altitude at which holding level needs exactly CEIL_LIFT of props
+    local opalt = PRESS_REF + math.log(CEIL_LIFT / HOVER_T) / PRESS_K
+    local hover_at_op = HOVER_T * math.exp(PRESS_K * (opalt - PRESS_REF))
+    local margin = hmax - hover_at_op
+    local accel = G * (hmax / hover_at_op - 1)
+
+    print(string.format("authority: opalt=%.1f hover=%.2f margin=%.2f accel=%.2f m/s^2 (sea level %.2f)",
+        opalt, hover_at_op, margin, accel,
+        G * (hmax / HOVER_T - 1)))
+
+    -- Command the cruise law directly at a given gain / altitude / error and
+    -- read the prop command back. PID.new copies its gains, so the flight has
+    -- to be built AFTER the config is poked.
+    local function cruiseCmd(kp, alt, err, v)
+        local save = cfg.pid.altitude.kp
+        cfg.pid.altitude.kp = kp
+        local e = makeEnv(alt)
+        e.flight:setMode(Flight.MODE_CRUISE)
+        e.flight.state = e.state          -- Flight.new caches its own copy
+        e.state.altitude = alt
+        e.plant.alt = alt
+        e.state.climb_rate = v or 0
+        e.flight.targets.altitude = alt + err
+        e.flight:updateCruise(DT)
+        local cmd = e.flight.outputs.speed
+        cfg.pid.altitude.kp = save
+        return cmd
+    end
+
+    local kp0 = cfg.pid.altitude.kp
+    local olim = cfg.pid.altitude.output_limit
+    local sat_err = olim / kp0   -- error at which P alone hits output_limit
+
+    check("authority: the ceiling leaves only ~2 prop units of margin",
+        margin > 1.5 and margin < 2.5, string.format("margin=%.2f", margin))
+    check("authority: that margin is a real but feeble 1.7 m/s^2",
+        accel > 1.2 and accel < 2.5, string.format("accel=%.2f", accel))
+    -- P saturates early: this is the whole reason gains stop mattering.
+    check("authority: P saturates by ~20 blocks of error",
+        sat_err > 5 and sat_err < 30, string.format("sat_err=%.1f", sat_err))
+    -- The demand the law computes is genuinely larger than the ship can give.
+    check("authority: the hmax clamp really does discard surplus demand",
+        cruiseCmd(kp0, opalt, 210) == hmax,
+        string.format("cmd=%.2f hmax=%.2f", cruiseCmd(kp0, opalt, 210), hmax))
+
+    -- THE finding: gains are a no-op here. 100x kp must not move the command.
+    local c_lo = cruiseCmd(kp0, opalt, 210)
+    local c_hi = cruiseCmd(kp0 * 100, opalt, 210)
+    check("authority: kp x100 leaves the command BIT-IDENTICAL (kp is not the lever)",
+        c_lo == c_hi, string.format("kp=%.2f -> %.4f, kp=%.0f -> %.4f",
+            kp0, c_lo, kp0 * 100, c_hi))
+    check("authority: a 50-block and a 210-block error command the same thing",
+        cruiseCmd(kp0, opalt, 50) == cruiseCmd(kp0, opalt, 210),
+        string.format("50->%.4f 210->%.4f",
+            cruiseCmd(kp0, opalt, 50), cruiseCmd(kp0, opalt, 210)))
+
+    -- End to end: recovery from the reported fault is thrust-bound, so kp x100
+    -- must not make it any quicker. This is the assertion that actually
+    -- captures the operator's complaint.
+    local function recover210(kp)
+        local save = cfg.pid.altitude.kp
+        cfg.pid.altitude.kp = kp
+        local e = makeEnv(opalt)
+        e.flight:setMode(Flight.MODE_CRUISE)
+        e.flight.state = e.state
+        e.flight.targets.altitude = opalt
+        for _ = 1, 80 do e.step() end      -- settle on altitude
+        e.state.altitude = opalt - 210
+        e.plant.alt = opalt - 210
+        e.plant.v = 0
+        for i = 1, 1200 do
+            e.step()
+            if math.abs(e.plant.alt - opalt) <= 5 then
+                cfg.pid.altitude.kp = save
+                return i * DT
+            end
+        end
+        cfg.pid.altitude.kp = save
+        return nil
+    end
+    local t_lo, t_hi = recover210(kp0), recover210(kp0 * 100)
+    print(string.format("recover 210 blocks: kp=%.2f -> %.1fs, kp=%.0f -> %s",
+        kp0, t_lo or -1, kp0 * 100, t_hi and string.format("%.1fs", t_hi) or "NEVER"))
+    check("authority: recovery from 210 under is finite (ship does come back)",
+        t_lo ~= nil, string.format("t=%s", tostring(t_lo)))
+    check("authority: kp x100 does NOT speed up recovery (thrust-bound)",
+        t_lo ~= nil and t_hi ~= nil and math.abs(t_hi - t_lo) < 0.6,
+        string.format("%.1fs vs %.1fs", t_lo or -1, t_hi or -1))
+    -- Free-body check: all 15 units of thrust at the ceiling is the ceiling of
+    -- what this ship can do, and the acceleration must match the closed form.
+    local acc_meas = (function()
+        local e = makeEnv(opalt)
+        e.flight:setMode(Flight.MODE_CRUISE)
+        e.flight.state = e.state
+        e.state.altitude, e.plant.alt = opalt, opalt
+        e.state.climb_rate = 0
+        e.flight.targets.altitude = opalt
+        for _ = 1, 40 do e.step() end
+        local p = e.plant.props
+        for _, k in ipairs({ "FL", "FR", "RL", "RR" }) do p[k] = hmax end
+        e.plant.cmd = hmax
+        local pres = math.exp(-PRESS_K * (opalt - PRESS_REF))
+        return (pres * (hmax / HOVER_T) - 1) * G
+    end)()
+    check("authority: full thrust at the ceiling matches the closed form",
+        math.abs(acc_meas - accel) < 0.05,
+        string.format("measured=%.3f closed_form=%.3f", acc_meas, accel))
+end
+
 print(string.format("vertical_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("vertical_test FAILED", 0) end

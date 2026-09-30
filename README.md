@@ -243,6 +243,48 @@ The learned ceiling is stored on the in-memory config (`limits.ceiling`) and is
 Note that `limits.max_altitude` (450) is an unrelated operator safety cap on
 *manual* altitude commands, and is not a discovered value.
 
+#### Why the altitude PID gains are not the lever at altitude
+
+Operating at the discovered ceiling looks like a gain-tuning problem and is
+not one. Holding level needs `cmd = hover_throttle · e^(0.004·(h−63))`, so at
+the ceiling the props are already commanded to **13 of a hard maximum of 15** —
+the probe stops at `AP_CEIL_LIFT = 13`, so the leftover margin *is* the 2 units
+by definition. The vertical loop's usable authority is therefore
+
+```
+accel = g · (hmax / hover_cmd − 1)      g = 11,  hmax = 15
+```
+
+| altitude | hover cmd | margin | climb accel |
+|---|---|---|---|
+| y63 (sea level) | 6.0 | 9.0 units | **16.5 m/s²** |
+| y190 | 10.0 | 5.0 units | 7.2 m/s² |
+| y256 (this world's ceiling) | 13.0 | **2.0 units** | **1.7 m/s²** |
+
+That 1.7 m/s² is a property of the altitude and the 15-unit hardware ceiling,
+not of any gain. Measured end-to-end: recovering a 210-block excursion takes
+**21.3 s**, and it takes **21.3 s with `kp` multiplied by 100**.
+
+Two mechanisms make the gains provably inert above ~20 blocks of error:
+
+1. The P term saturates at `output_limit` (7) once the error passes
+   `output_limit / kp` ≈ **20 blocks** — at a 210-block error P alone demands 73.5.
+2. `updateCruise` computes `clamp(hover + alt_output, hmin, hmax)`, so at the
+   ceiling **5 of the 7 commanded units are discarded** and the ship receives 2.
+
+Pinning this in `tests/vertical_test.lua`: `kp × 100` leaves the prop command
+bit-identical, a 50-block and a 210-block error command the same thing, and the
+measured recovery time is gain-independent. `output_limit` and `ki` are no-ops
+here too. **The only lever that speeds up a high-altitude recovery is flying
+lower** — the margin is altitude, and altitude is the thing being spent. If
+stricter holding is ever wanted, it has to come from a cruise altitude below
+the discovered ceiling (e.g. cruise where the props sit at 10, keeping 5 units),
+which is a deliberate trade of cruise height for control authority.
+
+A large *sustained* sag at speed is a different problem from this one: the test
+plant is vertical-only and cannot produce the aerodynamic downforce that a real
+ship develops with speed, so that part needs in-game telemetry.
+
 The yaw-compensation trim (`limits.yaw_roll_coupling`, `limits.yaw_pitch_coupling`, `AP_YAW_FF_MAX`) is **disabled by default (0)**. It is meant to be calibrated per ship from `stab_log.txt` if your hull yaws with a predictable pitch/roll coupling — leaving it at 0 avoids the turn fight observed with a wrong guess.
 
 ### Network keyboard (kbd)
