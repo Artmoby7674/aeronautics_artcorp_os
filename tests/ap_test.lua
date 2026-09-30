@@ -655,5 +655,69 @@ do
     lim.hover_throttle = HOVER_T
 end
 
+-- 9. THE CLIMB IS SMOOTH AND NEVER SAILS OVER THE GOAL.
+--    This is the regression for the reported "brutal climb": props slammed to
+--    max, then to zero, ship fell like a brick, overshot, repeated. The climb
+--    law now uses a FIXED target, a constant-rate transit and a braking
+--    profile, so:
+--      * the collective must move gradually (no 0 <-> 15 slam),
+--      * the peak must stay close to the requested altitude,
+--      * the ship must arrive with almost no vertical speed,
+--      * mid-climb rate must be steady (linear altitude gain, not a series of
+--        surges).
+do
+    local TARGET = 200
+    local env = makeEnv({ alt0 = 60 })
+    local f = env.flight
+    f:startAutopilot{ name = "SMOOTH", x = 800, z = 0, heading = 0, alt = TARGET }
+
+    local peak, max_dcmd, arrive_v = -1e9, 0, nil
+    local prev_cmd, samples, rate_sum, rate_n = nil, {}, 0, 0
+    local braking = true
+    for _ = 1, 4000 do                     -- 200 s
+        env.step()
+        if not finite(env.plant.alt) then break end
+        local cmd = env.plant.cmd
+        if prev_cmd ~= nil then
+            max_dcmd = math.max(max_dcmd, math.abs(cmd - prev_cmd))
+        end
+        prev_cmd = cmd
+        if env.plant.alt > peak then peak = env.plant.alt end
+        -- steady-state window: well clear of the launch transient and the
+        -- braking tail, so this measures the cruise climb, not the endpoints
+        local alt = env.plant.alt
+        if alt > 100 and alt < TARGET - 25 then
+            rate_sum = rate_sum + env.plant.v
+            rate_n = rate_n + 1
+        end
+        if f.ap and f.ap.step == "turn" and arrive_v == nil then
+            arrive_v = math.abs(env.plant.v)
+            braking = false
+        end
+        if arrive_v ~= nil then break end
+    end
+
+    check("climb: reaches the requested altitude",
+        math.abs(env.plant.alt - TARGET) <= 4.0, string.format("alt=%.2f", env.plant.alt))
+    -- The headline requirement: it must not go materially over the goal.
+    check("climb: never sails over the goal (+2 m)",
+        peak <= TARGET + 2.0, string.format("peak=%.2f", peak))
+    -- No per-tick step change anywhere near a 0 <-> 15 slam. The attack
+    -- limiter allows 20/s * 0.05 = 1.0 prop per tick; allow a little slack for
+    -- the hmax clamp but nothing like a full-scale slam.
+    check("climb: collective does not slam (max step <= 1.2 prop/tick)",
+        max_dcmd <= 1.2, string.format("max step=%.3f", max_dcmd))
+    -- Arrives with the vertical motion already killed, which is what stops the
+    -- momentum carrying it through the goal into the turn.
+    check("climb: arrives with ~zero vertical speed",
+        arrive_v ~= nil and arrive_v <= 1.0, string.format("v=%.3f", tostring(arrive_v)))
+    -- Transit is a steady climb, not a surge-and-coast.
+    local mean_rate = (rate_n > 0) and (rate_sum / rate_n) or 0
+    check("climb: transit rate is steady and positive (linear gain)",
+        mean_rate > 1.0 and mean_rate < 9.0, string.format("mean v=%.2f", mean_rate))
+    print(string.format("climb: peak=%.2f held=%.2f arrive_v=%.3f max_step=%.3f mean_v=%.2f",
+        peak, env.plant.alt, arrive_v or -1, max_dcmd, mean_rate))
+end
+
 print(string.format("ap_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("ap_test FAILED", 0) end

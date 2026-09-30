@@ -111,9 +111,9 @@ local LAND_ALT_ERR_SHUTDOWN = 20 -- m goal-below-ship error: stop + OS shutdown
 -- ============================================================
 -- Waypoint AUTOPILOT (ACTIONS -> AUTOPILOT / >>> in WP popup).
 -- Replaces the old wp_travel. Sequence:
---   aim   (HOVER)  two steps: CLIMB (goal +AP_CLIMB_GOAL_RATE b/s until prop
---                  demand hits AP_CLIMB_TOP=13 -> goal freezes -> settle at
---                  it), then TURN onto the bearing (PD, no overshoot, wait
+--   aim   (HOVER)  two steps: CLIMB (fixed target, constant-rate transit,
+--                  braked arrival with ~zero speed and never above the
+--                  goal), then TURN onto the bearing (PD, no overshoot, wait
 --                  stable) — cruise only after both
 --   cruise (CRUISE) bank-to-turn heading hold + rear taper (anti-overshoot)
 --   correct (CRUISE) off-course: reverse-brake to ~AP_CORRECT_SPEED,
@@ -208,24 +208,79 @@ local function tiltPhysicalAngle(command, tilt_max)
     if math.abs(command) < (tilt_max or 12) * AP_TILT_DEADBAND then return 0 end
     return command > 0 and AP_TILT_ANGLE or -AP_TILT_ANGLE
 end
-local AP_CLIMB_GOAL_RATE = 60 -- m/s: aim climb goal rise. The goal is CLAMPED
-                            -- at the target, so a fast rise just means the
-                            -- approach law gets the full height error sooner;
-                            -- it cannot itself cause overshoot.
-local AP_CLIMB_TOP = 13       -- prop demand cap near the goal (settle band),
-                            -- = 2 under max rpm so the ship can still hold
-local AP_CLIMB_SETTLE_BAND = 40 -- m: inside this much height error, drop to
-                            -- AP_CLIMB_TOP so the ship settles; outside it,
-                            -- climb on the full authority available
-local AP_CLIMB_KP = 0.6       -- prop units per m/s of velocity error
-local AP_CLIMB_APPROACH = 0.6 -- 1/s: v_des = APPROACH * height error (the brake
-                            -- law that settles the ship AT the frozen goal)
-local AP_CLIMB_MAX_V = 60     -- m/s: clamp on |v_des|. Thrust, not this, is the
-                            -- real limit -- the clamp only stops a huge height
-                            -- error from demanding an absurd rate
-local AP_CLIMB_TOL = 2        -- m: one-sided gap: at/above goal - tol counts
-                            -- as arrived (paired with |climb_rate| stop)
-local AP_CLIMB_STILL = 0.5    -- m/s: climb rate that counts as settled
+-- CLIMB LAW: constant-rate transit, then brake to arrive with ~zero speed.
+--
+-- The old law chased a goal that ROSE AT 60 m/s while the ship climbed at
+-- ~5 m/s. The height error was therefore always enormous, v_des sat on its
+-- +-60 clamp for the whole climb, and the collective was pinned at 15/15.
+-- At the end the error flipped sign and the collective collapsed to 0: the
+-- ship was thrown at the ceiling with no braking authority, fell back, and
+-- the cycle repeated. That is the "brutal, slams to max, then to zero,
+-- falls like a brick, overshoots again" behaviour.
+--
+-- What replaces it is standard and boring, which is the point:
+--   1. FIXED target. The goal does not move. There is no racing setpoint.
+--   2. LINEAR transit. Far from the goal the ship holds ONE modest climb
+--      rate (AP_CLIMB_V), so the collective sits at a steady moderate value
+--      instead of slamming between the stops.
+--   3. BRAKING PROFILE. v_des = min(V, sqrt(2*a_brake*remaining)), i.e. the
+--      fastest rate from which the ship can still decelerate to zero exactly
+--      at the goal. This is what makes arrival smooth AND makes overshoot
+--      structurally impossible rather than merely unlikely.
+--   4. NEVER UP past the goal. Once altitude >= goal the climb setpoint is
+--      pinned at 0 (never positive) and the collective is capped at hover, so
+--      the ship coasts to a stop ON the goal instead of sailing through it.
+--      Overshoot prevention is deliberately asymmetric: braking is
+--      authoritative, climbing is not.
+--   5. A velocity PID closes the loop on MEASURED climb rate
+--      (sublevel.getLinearVelocity), and a slew limiter caps how far the
+--      collective may move per tick so the props can no longer jump 0 <-> 15.
+local AP_CLIMB_V = 5          -- m/s: cruise climb rate in transit. Deliberately
+                              -- gentle: the ship has to keep 2 prop units in
+                              -- hand for attitude control, and a fast climb
+                              -- costs a proportional amount of that headroom.
+local AP_CLIMB_BRAKE = 0.9    -- m/s^2: assumed braking capability, used only
+                              -- to shape v_des. The velocity PID absorbs any
+                              -- error between this guess and the real ship, so
+                              -- it does not need to be accurate -- only safe
+                              -- (start braking early rather than late).
+local AP_CLIMB_KP = 0.8       -- prop units per (m/s) of climb-rate error
+local AP_CLIMB_KI = 0.10      -- prop units per (m/s) of integrated rate error
+                              -- (trims the steady-state so the ship actually
+                              -- settles ON the goal instead of near it)
+local AP_CLIMB_VLIM = 12      -- m/s: hard clamp on |v_des|
+local AP_CLIMB_TOL = 1.0      -- m: arrival band. Deliberately tight and
+                              -- one-sided, because the user's priority is
+                              -- "never go over the goal"
+local AP_CLIMB_STILL = 0.4    -- m/s: |climb rate| that counts as stopped
+-- Slew limit on the collective (prop units per second). The props are a
+-- 0..15 actuator that the game integrates; a step change of 15 units in one
+-- tick is an enormous impulse and is what made the ship lurch. Limiting the
+-- rate of change turns the old bang-bang into a ramp. Release is slow
+-- (4/s) so a demand that drops -- e.g. the collective being handed back to
+-- the altitude PID -- cannot cut the lift in one tick and drop the ship.
+-- Attack is fast (20/s) so genuine disturbances are still answered promptly.
+local AP_CLIMB_SLEW_ATTACK = 20  -- prop/s allowed when demand is RISING
+local AP_CLIMB_SLEW_RELEASE = 4  -- prop/s allowed when demand is FALLING
+local AP_CLIMB_SETTLE_HOLD = 0.4 -- s: arrival must hold this long before the
+                              -- turn step begins
+local AP_CLIMB_STALL_GAIN = 5   -- m: climb must gain this much ...
+local AP_CLIMB_STALL_PT = 3     -- s: ... within this long, else HOLD the
+                              -- current altitude and go to the TURN step
+local AP_CLIMB_TIMEOUT = 180   -- s: dedicated climb-phase failsafe. The generic
+                              -- AP_PHASE_TIMEOUT (45 s) is a TURN failsafe --
+                              -- a rotation that never settles. It is far too
+                              -- short for a climb: a gentle 5 m/s ascent from
+                              -- the ground to a high ceiling legitimately needs
+                              -- a minute or more, and cutting it off mid-ascent
+                              -- handed the ship to the turn below its target and
+                              -- skipped the ceiling probe entirely. The climb is
+                              -- really bounded by the ceiling probe (physical
+                              -- limit) and the stall failsafe (no progress);
+                              -- this is only a last-resort backstop.
+local AP_CLIMB_KD_CUT = 3     -- m: below this remaining, derivative (rate
+                              -- lead) is faded out so the arrival is governed
+                              -- by the brake profile, not by rate noise
 -- OPERATING CEILING, DISCOVERED RATHER THAN ASSUMED.
 -- The old 285 was a guess: it came from a wiki thrust curve for THIS ship at
 -- 256 rpm and 12.8*sqrt(sails) airflow, but the ship gets shared, the props get
@@ -253,22 +308,7 @@ local AP_CEIL_LIFT = 13    -- prop speed (of hover_max_speed) at which the climb
                             -- to absorb a gust without sinking.
 local AP_CEIL_HARD = 450   -- m: absolute guard. Physics should stop the probe
                            -- long before this; it only catches a mis-tuned
-                           -- hover_throttle, never a real ship.
--- While the ship still has altitude to make up, attitude correction only gets
--- a SLICE of the thrust headroom, so the climb can actually happen. Without
--- this the two fight over the same units and attitude wins every time (it is
--- the faster loop): the ship held 35 m under its target forever, spending the
--- entire climb budget on levelling. Once it is ON altitude the band below
--- stops applying and attitude gets the whole remainder again, so the settled
--- cruise still levels properly and low-altitude handling is unchanged.
-local AP_CLIMB_MIN_GAIN = 5   -- m: climb must gain this much ...
-local AP_CLIMB_MIN_PT = 3     -- s: ... within this long, else HOLD the
-                            -- current altitude and go to the TURN step
-local AP_STOP_TAU = 0.4     -- s: EMA time constant of the climb-stop detector
-                            -- (the ship bobs around the goal: thrust collapses
-                            -- with climb rate and recovers as it falls, so the
-                            -- INSTANTANEOUS rate never sits still at 0.5)
-local AP_STOP_HOLD = 0.2    -- s: settle must hold this long before TURN
+                            -- hover_throttle, never a real ship.
 local AP_PHASE_TIMEOUT = 45 -- s failsafe per phase (no-drag ships coast forever)
 local AP_HOVER_RANGE = 500  -- m: inside this (at enable or ANY time later,
                             -- incl. mid-cruise) the trip runs on HOVER
@@ -687,11 +727,9 @@ function Flight:startAutopilot(wp)
         step = "climb",  -- aim sub-step: climb first (always), then turn
         goal_alt = goal_alt,        -- m: altitude the climb converges on
         needs_climb = goal_alt > alt_now + AP_CLIMB_TOL, -- else skip to TURN
-        climb_goal = alt_now,      -- rises toward goal_alt, then freezes there
         climb_alt0 = alt_now,      -- for the stall failsafe
-        climb_frozen = false,      -- at goal_alt (or demand hit AP_CLIMB_TOP)
-        rate_ema = nil,   -- EMA of climb_rate (bobbing-proof stop detector)
-        stop_hold = 0,    -- s the settle condition has held continuously
+        climb_vi = 0,              -- leaky integral of climb-rate error
+        stop_hold = 0,    -- s the arrival condition has held continuously
         ceil = ceiling,
         hover_only = start_dist < AP_HOVER_RANGE, -- short hop: hover travel
     }
@@ -884,16 +922,14 @@ function Flight:updateAutopilot(dt)
         else
             ap.ceil = self:ceilingTarget()
             ap.goal_alt = math.min(ap.goal_alt, ap.ceil)
-            ap.climb_goal = math.min(ap.climb_goal, ap.ceil)
             if ap.alt and ap.alt > ap.ceil then ap.alt = ap.ceil end
         end
 
         if ap.step ~= "turn" then
             -- STEP 1 — CLIMB toward ap.goal_alt (the waypoint's altitude, or
-            -- simply hold where we are). The goal rises at
-            -- AP_CLIMB_GOAL_RATE but is CLAMPED AT THE TARGET, so the height
-            -- error the approach law has to service stays bounded instead of
-            -- growing to the ceiling.
+            -- the discovered ceiling). The target is FIXED: it does not move
+            -- while the ship flies to it, so the law closes the loop on
+            -- measured climb rate instead of chasing a receding goal.
             if not ap.needs_climb then
                 -- Already at (or above) the target altitude: no climb at all.
                 -- Hand straight to the turn step instead of "settling" a climb
@@ -904,92 +940,96 @@ function Flight:updateAutopilot(dt)
                 ap.pt = 0
             end
             if ap.step == "climb" then
-                if not ap.climb_frozen then
-                    ap.climb_goal = math.min(
-                        ap.climb_goal + AP_CLIMB_GOAL_RATE * dt,
-                        math.min(ap.goal_alt, ap.ceil))
-                    -- reached the target: freeze, the law below settles it there
-                    if ap.climb_goal >= ap.goal_alt - 1e-6 then
-                        ap.climb_frozen = true
-                    end
-                end
-                -- Stop detector: thrust collapses as the ship climbs (rate term)
-                -- and recovers as it falls, so it BOBS around the goal and the
-                -- instantaneous rate flickers through 0.5 m/s over and over.
-                -- EMA the rate (tau AP_STOP_TAU) and require the settle condition
-                -- to hold AP_STOP_HOLD seconds before starting the turn.
+                -- === CLIMB: fixed target, constant-rate transit, braked arrival ===
+                local target = math.min(ap.goal_alt, ap.ceil)
                 local rate = state.climb_rate or 0
-                ap.rate_ema = (ap.rate_ema or rate)
-                    + (rate - (ap.rate_ema or rate)) * math.min(1, dt / AP_STOP_TAU)
-                local h_err = ap.climb_goal - state.altitude
-                local vdes = clamp(
-                    AP_CLIMB_APPROACH * h_err, -AP_CLIMB_MAX_V, AP_CLIMB_MAX_V)
-                -- Feedforward scales with height and current rate (hoverFF), so
-                -- the law still means what it says at altitude: freeze exactly
-                -- when prop demand reaches AP_CLIMB_TOP, hold up to hover_max_speed
-                -- (15) on the freeze tick instead of clipping BELOW what the ship
-                -- needs to hover — the old 0..13 clip under-thruster at y260 and
-                -- the stall failsafe then bailed out of the climb.
-                -- RATE GAIN MUST EXCEED THE FEEDFORWARD'S OWN RATE SLOPE or the
-                -- climb loses its damping and bobs. hover() carries 1/(1 -
-                -- rate/25), so it RISES with climb rate at d(hover)/d(rate) =
-                -- hover/25. At y280 that slope is 0.57, which almost exactly
-                -- cancels the 0.60 KP and leaves ~0 net damping -- that is why
-                -- the climb did ups and downs, and why it got worse the higher
-                -- it went. Folding hover/25 back into the gain makes the net
-                -- rate feedback a constant -AP_CLIMB_KP at EVERY altitude.
-                local k_rate = AP_CLIMB_KP + hover / AP_AIRFLOW
-                local raw = hover + k_rate * (vdes - rate)
-                -- Full authority in transit, and NO freeze on demand while in
-                -- transit. raw >= hmax only means the climb is asking for more
-                -- than the props can deliver, which is what every fast climb
-                -- does -- clipping is the correct response, not giving up
-                -- (freezing there stopped the climb dead at y118 on the first
-                -- test, with 8 prop units still unused). Whether the ship has
-                -- actually run out of thrust is a question about the HOVER
-                -- demand, not the climb demand, and that is what
-                -- ceilingProbe below answers.
-                --
-                -- "Close" is measured against the FINAL target, not the ramping
-                -- goal: the goal rises far faster than the ship, so
-                -- climb_goal - altitude stays small all the way up and a band
-                -- on it would pin the ship at 13/15 immediately.
-                local remain = (math.min(ap.goal_alt, ap.ceil) or ap.climb_goal)
-                    - (state.altitude or 0)
-                if remain <= AP_CLIMB_SETTLE_BAND and raw >= AP_CLIMB_TOP then
-                    ap.climb_frozen = true
+                local remain = target - (state.altitude or 0)
+
+                -- (1) VELOCITY SETPOINT.
+                --     Transit: a single constant climb rate -> linear altitude
+                --     gain, steady moderate collective. Braking: the fastest
+                --     rate we could still stop from in `remain`, so the profile
+                --     arrives at the goal with ~zero speed. At/above the goal
+                --     the setpoint is pinned at 0 and can never go positive:
+                --     the ship coasts to a stop ON the goal rather than
+                --     carrying momentum through it.
+                local vdes
+                if remain <= 0 then
+                    vdes = 0
+                else
+                    local v_brake = math.sqrt(2 * AP_CLIMB_BRAKE * remain)
+                    vdes = math.min(AP_CLIMB_V, v_brake, AP_CLIMB_VLIM)
                 end
-                local demand = clamp(raw, 0, hmax)
-                ap.climb_demand = demand -- updateHover applies it as base speed
-                self.targets.altitude = ap.climb_goal
+
+                -- (2) VELOCITY PID on MEASURED climb rate. I is a leaky
+                --     integrator: it trims the steady-state offset but leaks
+                --     whenever the velocity error is small, so it cannot wind
+                --     up during the long cruise at rate and then fire on
+                --     arrival. D is rate-lead faded out over the last
+                --     AP_CLIMB_KD_CUT metres so the final metres are governed
+                --     by the brake profile instead of by rate noise.
+                local v_err = vdes - rate
+                ap.climb_vi = (ap.climb_vi or 0) + v_err * dt
+                local leak = math.max(0, 1 - dt / 3.0)
+                ap.climb_vi = ap.climb_vi * leak
+                local kd = AP_CLIMB_KP
+                if remain < AP_CLIMB_KD_CUT then
+                    kd = AP_CLIMB_KP * math.max(0, remain / AP_CLIMB_KD_CUT)
+                end
+                local v_out = AP_CLIMB_KP * v_err + AP_CLIMB_KI * ap.climb_vi
+
+                -- (3) COLLECTIVE = feedforward + velocity PID, then the
+                --     asymmetric slew limit. The feedforward keeps the law
+                --     meaning the same thing at any height; the PID supplies
+                --     only the extra (or reduced) thrust that produces the
+                --     commanded vertical acceleration.
+                local demand = clamp(hover + v_out, 0, hmax)
+                if remain <= 0 then
+                    -- AT OR ABOVE THE GOAL: cap at hover. The ship may coast
+                    -- and settle down onto the target, but it is never given
+                    -- more lift than holding station, so it cannot be pushed
+                    -- back over the goal. This is the "never go over" rule.
+                    if demand > hover then demand = hover end
+                end
+                local prev = ap.climb_demand
+                if prev ~= nil then
+                    local rate_lim = (demand > prev) and AP_CLIMB_SLEW_ATTACK
+                        or AP_CLIMB_SLEW_RELEASE
+                    local max_step = rate_lim * dt
+                    demand = clamp(demand, prev - max_step, prev + max_step)
+                end
+                ap.climb_demand = clamp(demand, 0, hmax)
+                self.targets.altitude = target
                 self.targets.yaw_cmd = clamp(self.pilot_yaw or 0, -1, 1) -- Q/E only
-                local stalled = ap.pt >= AP_CLIMB_MIN_PT
-                    and (state.altitude - (ap.climb_alt0 or 0)) < AP_CLIMB_MIN_GAIN
-                local settle = ap.climb_frozen
-                    and math.abs(ap.rate_ema) <= AP_CLIMB_STILL
-                    -- "stopped climbing" = vertical motion is gone AND we are
-                    -- at/above the goal band (ONE-sided: the abs check used to
-                    -- fail at the overshoot peak and wait out another slow
-                    -- cycle) or the climb has simply run long enough.
-                    and (h_err <= AP_CLIMB_TOL or ap.pt >= AP_CLIMB_MIN_PT)
-                ap.stop_hold = (settle and not stalled)
+
+                -- (4) ARRIVAL. No momentum is left at the goal now, so this is
+                --     a short clean confirmation rather than a long settle:
+                --     at/above the goal band AND vertical motion actually
+                --     stopped, held for AP_CLIMB_SETTLE_HOLD seconds.
+                local arrived = remain <= AP_CLIMB_TOL
+                    and math.abs(rate) <= AP_CLIMB_STILL
+                ap.stop_hold = arrived
                     and ((ap.stop_hold or 0) + dt) or 0
+
+                local stalled = ap.pt >= AP_CLIMB_STALL_PT
+                    and (state.altitude - (ap.climb_alt0 or 0)) < AP_CLIMB_STALL_GAIN
                 if stalled then
-                    -- STALLED CLIMB (gained < 5 m in 3 s): hold here — freeze
-                    -- the goal at the current altitude and move on to the
-                    -- heading phase instead of waiting out the phase timeout.
-                    ap.climb_goal = state.altitude
+                    -- STALLED CLIMB (gained < AP_CLIMB_STALL_GAIN m in
+                    -- AP_CLIMB_STALL_PT s): hold here -- freeze the goal at the
+                    -- current altitude and move on to the heading phase instead
+                    -- of waiting out the phase timeout.
                     ap.alt = state.altitude -- hold THIS during the turn (once!)
                     ap.step = "turn"
                     ap.climb_demand = nil -- props back to the altitude PID
                     ap.pt = 0 -- the rotation gets its own timeout window
-                elseif (settle and ap.stop_hold >= AP_STOP_HOLD) or timedOut() then
+                elseif (ap.stop_hold >= AP_CLIMB_SETTLE_HOLD)
+                    or ap.pt >= AP_CLIMB_TIMEOUT then
                     -- Hold the TARGET altitude, not wherever the ship happened
                     -- to be when the climb gave up: capturing state.altitude
                     -- froze the cruise at the overshoot peak and the ship then
                     -- sank through the turn. The altitude PID converges the
                     -- remainder while the turn is already running.
-                    ap.alt = ap.climb_frozen and ap.goal_alt or state.altitude
+                    ap.alt = target
                     ap.step = "turn"
                     ap.climb_demand = nil -- hand the props back to the altitude PID
                     ap.pt = 0 -- the rotation gets its own timeout window
