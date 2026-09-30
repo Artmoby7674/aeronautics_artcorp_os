@@ -805,68 +805,138 @@ do
     lim.hover_throttle = HOVER_T
 end
 
--- 9. THE CLIMB IS SMOOTH AND NEVER SAILS OVER THE GOAL.
+-- 9. THE CLIMB IS SMOOTH, HANDS OVER EARLY, AND NEVER SAILS OVER THE GOAL.
 --    This is the regression for the reported "brutal climb": props slammed to
 --    max, then to zero, ship fell like a brick, overshot, repeated. The climb
---    law now uses a FIXED target, a constant-rate transit and a braking
---    profile, so:
---      * the collective must move gradually (no 0 <-> 15 slam),
---      * the peak must stay close to the requested altitude,
---      * the ship must arrive with almost no vertical speed,
---      * mid-climb rate must be steady (linear altitude gain, not a series of
---        surges).
+--    law uses a FIXED target, a constant-rate transit and a braking profile.
+--
+--    The height-validation gate is now a DISTANCE (AP_CLIMB_VALIDATE = 10 m)
+--    rather than "stopped on the goal". Two measured reasons:
+--      * the v^2 brake profile approaches as sqrt(remaining), so the tail was
+--        always a crawl -- the last 20 blocks cost 6.55 s and the last 10 cost
+--        4.85 s of a 28.7 s climb, serialised in front of the rotation;
+--      * requiring |rate| <= 0.4 m/s before leaving the phase let the ship
+--        arrive at the goal still doing 5+ m/s, where the "never push past the
+--        goal" collective cap turned a hot arrival into a ballistic one and it
+--        sailed 2.87 blocks over. Handing over at 10 blocks costs 2.87 -> 0.00.
+--    The last blocks are closed by the altitude POSITION PID, which the turn
+--    step already runs, so the two overlap instead of queueing. So these
+--    assertions pin the NEW contract: hand over in the validation band with a
+--    bounded rate, then CONVERGE ON THE TARGET during the rotation.
 do
     local TARGET = 200
     local env = makeEnv({ alt0 = 60 })
     local f = env.flight
     f:startAutopilot{ name = "SMOOTH", x = 800, z = 0, heading = 0, alt = TARGET }
 
-    local peak, max_dcmd, arrive_v = -1e9, 0, nil
-    local prev_cmd, samples, rate_sum, rate_n = nil, {}, 0, 0
-    local braking = true
+    local peak, max_dcmd, max_dcmd_turn = -1e9, 0, 0
+    local prev_cmd, rate_sum, rate_n = nil, 0, 0
+    local tail20, tail10 = 0, 0
+    local t, hand_t, hand_remain, hand_v = 0, nil, nil, nil
+    local saw_brake_in_turn = false
     for _ = 1, 4000 do                     -- 200 s
         env.step()
+        t = t + DT
         if not finite(env.plant.alt) then break end
         local cmd = env.plant.cmd
+        -- Slam is measured PER PHASE. The climb->turn handover is smooth (see
+        -- AP_CLIMB_HANDOVER_SLEW); the turn step contains a separate,
+        -- PRE-EXISTING discontinuity at the HOVER->CRUISE mode change, which
+        -- is measured on its own below rather than folded in here.
         if prev_cmd ~= nil then
-            max_dcmd = math.max(max_dcmd, math.abs(cmd - prev_cmd))
+            local d = math.abs(cmd - prev_cmd)
+            if f.ap and f.ap.step == "climb" then
+                max_dcmd = math.max(max_dcmd, d)
+            elseif f.ap and f.ap.step == "turn" then
+                max_dcmd_turn = math.max(max_dcmd_turn, d)
+            end
         end
         prev_cmd = cmd
         if env.plant.alt > peak then peak = env.plant.alt end
-        -- steady-state window: well clear of the launch transient and the
-        -- braking tail, so this measures the cruise climb, not the endpoints
-        local alt = env.plant.alt
-        if alt > 100 and alt < TARGET - 25 then
-            rate_sum = rate_sum + env.plant.v
-            rate_n = rate_n + 1
+        local remain = TARGET - env.plant.alt
+        if f.ap and f.ap.step == "climb" then
+            -- steady-state window: clear of both the launch transient and the
+            -- braking tail, so this measures the cruise climb
+            if env.plant.alt > 100 and remain > 25 then
+                rate_sum = rate_sum + env.plant.v
+                rate_n = rate_n + 1
+            end
+            if remain <= 20 then tail20 = tail20 + DT end
+            if remain <= 10 then tail10 = tail10 + DT end
+        elseif f.ap and f.ap.step == "turn" then
+            if (f.ap.climb_brake or 0) > 0 then saw_brake_in_turn = true end
+            if hand_t == nil then
+                -- the handoff: record what the ship was doing when it handed over
+                hand_t, hand_remain, hand_v = t, remain, math.abs(env.plant.v)
+            end
         end
-        if f.ap and f.ap.step == "turn" and arrive_v == nil then
-            arrive_v = math.abs(env.plant.v)
-            braking = false
-        end
-        if arrive_v ~= nil then break end
+        -- keep running well past the handoff so convergence can be measured
+        if hand_t ~= nil and t > hand_t + 25 then break end
     end
 
-    check("climb: reaches the requested altitude",
-        math.abs(env.plant.alt - TARGET) <= 4.0, string.format("alt=%.2f", env.plant.alt))
-    -- The headline requirement: it must not go materially over the goal.
+    -- (a) THE NEW CONTRACT: hand over in the validation band, i.e. still
+    --     short of the goal rather than sitting on it.
+    check("climb: hands over in the validation band, short of the goal",
+        hand_remain ~= nil and hand_remain >= 4 and hand_remain <= 16,
+        string.format("remain=%.2f at handoff", hand_remain or -1))
+    -- (b) ...with a bounded arrival rate, so the position PID has the 10 m of
+    --     run-out it needs to arrest it (~2.0 m/s^2 of real braking here).
+    check("climb: hands over at a bounded rate (arresting distance fits)",
+        hand_v ~= nil and hand_v <= 6.5, string.format("v=%.3f", hand_v or -1))
+    -- (c) THE TAIL IS THE COMPLAINT: the last 20 blocks used to cost 6.55 s.
+    check("climb: the last 20 blocks are no longer a crawl (< 3.0 s)",
+        tail20 > 0 and tail20 < 3.0, string.format("tail20=%.2fs", tail20))
+    check("climb: the last 10 blocks are no longer a crawl (< 1.0 s)",
+        tail10 > 0 and tail10 < 1.0, string.format("tail10=%.2fs", tail10))
+    -- (d) THE HEADLINE REQUIREMENT, at the tolerance the shipped code has
+    --     always used. Validating the height early on its own made this WORSE
+    --     (2.00 -> 3.47 blocks) because the collective changed hands at 5 m/s;
+    --     keeping the climb's brake running through the rotation (i) recovered
+    --     it and came out slightly ahead of HEAD: measured peak 201.62 here vs
+    --     202.00 at HEAD. So this asserts the real contract rather than a
+    --     number picked to fit.
     check("climb: never sails over the goal (+2 m)",
         peak <= TARGET + 2.0, string.format("peak=%.2f", peak))
-    -- No per-tick step change anywhere near a 0 <-> 15 slam. The attack
-    -- limiter allows 20/s * 0.05 = 1.0 prop per tick; allow a little slack for
-    -- the hmax clamp but nothing like a full-scale slam.
+    -- (i) The mechanism that protects (d): the braked arrival is still being
+    --     flown by the climb law while the turn rotates. Without this the tail
+    --     gets fast again but the ship sails over the goal.
+    check("climb: the brake keeps flying through the rotation",
+        saw_brake_in_turn, "climb law was dropped at the phase change")
+    -- (e) No per-tick step change anywhere near a 0 <-> 15 slam. The attack
+    --     limiter allows 20/s * 0.05 = 1.0 prop per tick; allow a little slack
+    --     for the hmax clamp but nothing like a full-scale slam.
     check("climb: collective does not slam (max step <= 1.2 prop/tick)",
         max_dcmd <= 1.2, string.format("max step=%.3f", max_dcmd))
-    -- Arrives with the vertical motion already killed, which is what stops the
-    -- momentum carrying it through the goal into the turn.
-    check("climb: arrives with ~zero vertical speed",
-        arrive_v ~= nil and arrive_v <= 1.0, string.format("v=%.3f", tostring(arrive_v)))
+    -- (f) The last blocks are closed by the position PID during the turn, so
+    --     the ship must still END UP on the requested altitude. This is the
+    --     old "reaches the requested altitude" check, measured over the window
+    --     where the convergence actually happens rather than at the instant of
+    --     handoff (where the ship is deliberately still 10 m short).
+    check("climb: converges onto the target during the rotation",
+        math.abs(env.plant.alt - TARGET) <= 4.0,
+        string.format("alt=%.2f target=%d", env.plant.alt, TARGET))
     -- Transit is a steady climb, not a surge-and-coast.
     local mean_rate = (rate_n > 0) and (rate_sum / rate_n) or 0
     check("climb: transit rate is steady and positive (linear gain)",
         mean_rate > 1.0 and mean_rate < 9.0, string.format("mean v=%.2f", mean_rate))
-    print(string.format("climb: peak=%.2f held=%.2f arrive_v=%.3f max_step=%.3f mean_v=%.2f",
-        peak, env.plant.alt, arrive_v or -1, max_dcmd, mean_rate))
+    -- (h) PRE-EXISTING, not fixed here, but pinned so it cannot get worse.
+    --     Flight:setMode resets every PID and re-targets altitude to the
+    --     current value, and the two vertical laws disagree about tilt: hover
+    --     divides its demand by mean_tilt_lift (cos 25 deg = 0.906) while
+    --     cruise zeroes the tilt and uses 1. The HOVER->CRUISE switch inside
+    --     the turn step is therefore a single-tick step in mean thrust. It is
+    --     identical at the previous commit (measured 3.588 there, 3.572
+    --     here), so this change did not introduce it -- the OLD version of
+    --     this test simply broke out of its loop the instant the climb handed
+    --     over to the turn and never ran as far as the mode change. The old
+    --     "max step <= 1.2" pass was partly luck of where it stopped.
+    --     Asserted against the measured pre-existing baseline, not against an
+    --     aspiration, so this test states what is true rather than what would
+    --     be nice.
+    check("turn: HOVER->CRUISE step is not worse than the known baseline",
+        max_dcmd_turn <= 3.7, string.format("max turn step=%.3f (baseline 3.59)", max_dcmd_turn))
+    print(string.format("climb: peak=%.2f held=%.2f hand_remain=%.2f hand_v=%.3f tail20=%.2f tail10=%.2f max_step=%.3f turn_step=%.3f mean_v=%.2f",
+        peak, env.plant.alt, hand_remain or -1, hand_v or -1, tail20, tail10, max_dcmd, max_dcmd_turn, mean_rate))
 end
 
 -- 10. THE TURN -> CRUISE HANDOFF MUST NOT SPIN THE SHIP.

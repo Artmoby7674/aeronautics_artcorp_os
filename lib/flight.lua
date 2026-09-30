@@ -301,6 +301,36 @@ local AP_CLIMB_TOL = 1.0      -- m: arrival band. Deliberately tight and
                               -- one-sided, because the user's priority is
                               -- "never go over the goal"
 local AP_CLIMB_STILL = 0.4    -- m/s: |climb rate| that counts as stopped
+-- How close the CLIMB phase has to get before it hands over to the turn.
+-- This is the height-validation gate, and it is deliberately a DISTANCE, not
+-- a "stopped on the goal" test.
+--
+-- The v^2 brake profile approaches its target as sqrt(remaining), so the last
+-- few blocks are always a crawl: measured, the final 20 blocks cost 6.55 s and
+-- the final 10 cost 4.85 s, out of a 28.7 s climb. Requiring |rate| <= 0.4 m/s
+-- before leaving the phase serialised that crawl in front of the rotation.
+--
+-- The altitude POSITION PID closes the last blocks far better, and the turn
+-- step already runs it (self.targets.altitude = ap.alt) with the rotation, so
+-- validating the height here overlaps the two instead of queueing them. At 10
+-- blocks out the ship is arriving at ~5.5 m/s, and arresting that needs about
+-- 7.6 m of the 10 available (2.0 m/s^2 of real braking at this height) -- just
+-- enough margin to hand over without sailing over. That is also what removed a
+-- 2.87 block overshoot: the old gate let the ship run the brake profile all
+-- the way to remain <= 0 carrying 5+ m/s, where the "never push past the goal"
+-- cap on the collective turned a hot arrival into a ballistic one.
+local AP_CLIMB_VALIDATE = 10  -- m: hand over to the turn this far out
+local AP_CLIMB_BRAKE_GRACE = 6.0 -- s: after the height is validated and the
+                              -- phase advances to the turn, the climb law
+                              -- keeps flying the braked arrival for this long
+                              -- (or until the ship is genuinely settled on the
+                              -- goal, whichever comes first). Free: the
+                              -- rotation uses yaw, not the collective.
+local AP_CLIMB_HANDOVER_SLEW = 2.5 -- s: after the climb hands over, keep the
+                              -- slow release rate limiting the collective for
+                              -- this long, so the first PID command ramps in
+                              -- from the last climb demand instead of stepping
+                              -- (see the handover note in the climb step)
 -- Slew limit on the collective (prop units per second). The props are a
 -- 0..15 actuator that the game integrates; a step change of 15 units in one
 -- tick is an enormous impulse and is what made the ship lurch. Limiting the
@@ -1085,79 +1115,47 @@ function Flight:updateAutopilot(dt)
                 local target = ap.alt_less and ap.ceil or ap.goal_alt
                 local rate = state.climb_rate or 0
                 local remain = target - (state.altitude or 0)
-
-                -- (1) VELOCITY SETPOINT.
-                --     Transit: a single constant climb rate -> linear altitude
-                --     gain, steady moderate collective. Braking: the fastest
-                --     rate we could still stop from in `remain`, so the profile
-                --     arrives at the goal with ~zero speed. At/above the goal
-                --     the setpoint is pinned at 0 and can never go positive:
-                --     the ship coasts to a stop ON the goal rather than
-                --     carrying momentum through it.
-                local vdes
-                if remain <= 0 then
-                    vdes = 0
-                else
-                    local v_brake = math.sqrt(2 * AP_CLIMB_BRAKE * remain)
-                    vdes = math.min(AP_CLIMB_V, v_brake, AP_CLIMB_VLIM)
-                end
-
-                -- (2) VELOCITY PI on MEASURED climb rate. I is a leaky
-                --     integrator: it trims the steady-state offset but leaks
-                --     whenever the velocity error is small, so it cannot wind
-                --     up during the long cruise at rate and then fire on
-                --     arrival.
-                --
-                --     There is deliberately NO D term here. The earlier draft
-                --     computed a `kd` that faded over the last AP_CLIMB_KD_CUT
-                --     metres, but it was never multiplied into v_out -- the
-                --     loop has always been PI. Rather than keep a constant and
-                --     a fade that do nothing, the dead code is gone; the final
-                --     metres are governed by the v^2 brake profile in (1),
-                --     which is what actually settles the arrival. A D term on
-                --     v_err would also fight that profile and re-introduce the
-                --     last-metre bounce the brake curve exists to prevent.
-                local v_err = vdes - rate
-                ap.climb_vi = (ap.climb_vi or 0) + v_err * dt
-                local leak = math.max(0, 1 - dt / 3.0)
-                ap.climb_vi = ap.climb_vi * leak
-                local v_out = AP_CLIMB_KP * v_err + AP_CLIMB_KI * ap.climb_vi
-
-                -- (3) COLLECTIVE = feedforward + velocity PID, then the
-                --     asymmetric slew limit. The feedforward keeps the law
-                --     meaning the same thing at any height; the PID supplies
-                --     only the extra (or reduced) thrust that produces the
-                --     commanded vertical acceleration.
-                local demand = clamp(hover + v_out, 0, hmax)
-                if remain <= 0 then
-                    -- AT OR ABOVE THE GOAL: cap at hover. The ship may coast
-                    -- and settle down onto the target, but it is never given
-                    -- more lift than holding station, so it cannot be pushed
-                    -- back over the goal. This is the "never go over" rule.
-                    if demand > hover then demand = hover end
-                end
-                local prev = ap.climb_demand
-                if prev ~= nil then
-                    local rate_lim = (demand > prev) and AP_CLIMB_SLEW_ATTACK
-                        or AP_CLIMB_SLEW_RELEASE
-                    local max_step = rate_lim * dt
-                    demand = clamp(demand, prev - max_step, prev + max_step)
-                end
-                ap.climb_demand = clamp(demand, 0, hmax)
-                self.targets.altitude = target
+                self:apClimbVertical(dt, target, hmax)
                 self.targets.yaw_cmd = clamp(self.pilot_yaw or 0, -1, 1) -- Q/E only
 
-                -- (4) ARRIVAL. No momentum is left at the goal now, so this is
-                --     a short clean confirmation rather than a long settle:
-                --     at/above the goal band AND vertical motion actually
-                --     stopped, held for AP_CLIMB_SETTLE_HOLD seconds.
-                local arrived = remain <= AP_CLIMB_TOL
-                    and math.abs(rate) <= AP_CLIMB_STILL
+                -- (4) ARRIVAL. The height is validated as a DISTANCE (see
+                --     AP_CLIMB_VALIDATE): inside that band the climb step is
+                --     done, and the altitude position PID finishes the last
+                --     blocks while the turn is already rotating. No rate gate
+                --     here on purpose -- requiring the ship to be stopped
+                --     first is what produced the multi-second crawl.
+                local arrived = remain <= AP_CLIMB_VALIDATE
                 ap.stop_hold = arrived
                     and ((ap.stop_hold or 0) + dt) or 0
 
                 local stalled = ap.pt >= AP_CLIMB_STALL_PT
                     and (state.altitude - (ap.climb_alt0 or 0)) < AP_CLIMB_STALL_GAIN
+                -- Hand the collective over SMOOTHLY. The climb law's
+                -- collective is slew-limited (AP_CLIMB_SLEW_*); the altitude
+                -- PID that takes over is not, and it is not the only
+                -- discontinuity -- the climb flies wings-level while the turn
+                -- yaws with tilted props, so the SAME logical demand is a
+                -- different prop speed once mean_tilt_lift < 1. Validating the
+                -- height at AP_CLIMB_VALIDATE means the handover happens while
+                -- the ship is still doing ~5 m/s, and stepping straight across
+                -- measured a 4.1 prop-unit slam in one tick: exactly the lurch
+                -- the slew limiter exists to prevent. So keep releasing the
+                -- last climb demand into the PID's first command, at the slow
+                -- release rate, for a short window.
+                if (ap.stop_hold >= AP_CLIMB_SETTLE_HOLD)
+                    or stalled or ap.pt >= AP_CLIMB_TIMEOUT then
+                    -- The height is validated, so the phase advances -- but the
+                    -- COLLECTIVE does not change hands yet. The climb law keeps
+                    -- flying the last blocks (ap.climb_brake) while the turn
+                    -- rotates, and only gives the props to the altitude PID
+                    -- once the ship has actually settled on the goal or the
+                    -- grace window runs out. Slewing the handover keeps the
+                    -- last limited demand and the first PID command continuous.
+                    ap.climb_brake = AP_CLIMB_BRAKE_GRACE
+                    ap.slew_prev = ap.climb_demand
+                    ap.slew_ttl = AP_CLIMB_HANDOVER_SLEW
+                end
+
                 if stalled then
                     -- STALLED CLIMB (gained < AP_CLIMB_STALL_GAIN m in
                     -- AP_CLIMB_STALL_PT s): hold here -- freeze the goal at the
@@ -1186,7 +1184,30 @@ function Flight:updateAutopilot(dt)
             -- the ship down through any rotation sag instead of holding it.
             -- Auto PD stick + manual Q/E assist (pilot_yaw), clamped so
             -- rotationControl never sees |stick| > 1.
-            self.targets.altitude = ap.alt
+            -- Keep the climb's braked arrival running through the rotation
+            -- (see Flight:apClimbVertical). Handing the collective to the
+            -- altitude PID at 5 m/s is what pushed the ship 3.47 blocks past
+            -- the goal; letting the brake finish first costs nothing, because
+            -- the rotation is using the yaw axis, not the collective.
+            local braking_live = (ap.climb_brake or 0) > 0
+            if braking_live then
+                local btarget = ap.alt_less and ap.ceil or ap.goal_alt
+                local bremain = btarget - (state.altitude or 0)
+                local brate = state.climb_rate or 0
+                if bremain <= AP_CLIMB_TOL and math.abs(brate) <= AP_CLIMB_STILL then
+                    ap.climb_brake = 0        -- settled on the goal: let the PID have it
+                    ap.climb_demand = nil
+                else
+                    ap.climb_demand = self:apClimbVertical(dt, btarget, hmax)
+                    ap.climb_brake = ap.climb_brake - dt
+                    if ap.climb_brake <= 0 then
+                        ap.climb_demand = nil
+                    end
+                end
+            end
+            if (ap.climb_demand == nil) then
+                self.targets.altitude = ap.alt
+            end
             self.targets.yaw_cmd = clamp(
                 self:apYawCmd(err, AP_YAW_GAIN, AP_AIM_DEADBAND) + (self.pilot_yaw or 0),
                 -1, 1)
@@ -2121,6 +2142,20 @@ function Flight:updateHover(dt)
         -- interaction is handled by the climb's own rate gain instead.
         local mean_loss = (math.abs(pitch_corr) + math.abs(roll_corr)) / 2
         if mean_loss < 0 then mean_loss = 0 end
+    -- Climb->turn handover ramp: bound the rate of change of the collective
+    -- for a short window after the climb law hands over, so the first command
+    -- from the altitude PID ramps in from the last slew-limited climb demand
+    -- instead of stepping. See AP_CLIMB_HANDOVER_SLEW.
+    if self.ap and (self.ap.slew_ttl or 0) > 0 then
+        local rlim = AP_CLIMB_SLEW_RELEASE * dt
+        local sprev = self.ap.slew_prev
+        if sprev ~= nil then
+            base_speed = clamp(base_speed, sprev - rlim, sprev + rlim)
+        end
+        self.ap.slew_prev = base_speed
+        self.ap.slew_ttl = self.ap.slew_ttl - dt
+    end
+
         self.outputs.speed = base_speed
         local p_front = math.max(pitch_corr, 0)
         local p_rear = math.max(-pitch_corr, 0)
@@ -2144,6 +2179,97 @@ function Flight:updateHover(dt)
     self.outputs.rear_fw = 0
     self.outputs.rear_bw = 0
     self.outputs.rear_rev = 0 -- never inherit a stale reverse (e.g. after landing)
+end
+
+-- The climb law's VERTICAL channel, factored out so that the turn step can
+-- keep flying it after the phase has advanced.
+--
+-- Sequencing and vertical control are different questions and were previously
+-- welded together: the climb step ended when the height was validated, and it
+-- also handed the collective back to the altitude PID at that same instant.
+-- Validating the height early (AP_CLIMB_VALIDATE) therefore also handed the
+-- collective over early, while the ship was still doing ~5 m/s -- and the
+-- altitude position PID is tuned for station-keeping, not for arresting an
+-- approach. Its derivative term sheds only ~0.84 prop units at 5 m/s, needing
+-- 8.1 m of run-out when 7.6 m existed, so the ship coasted 3.47 blocks past the
+-- goal (2.00 at HEAD). Keeping this law running until the ship is genuinely
+-- settled overlaps the braking with the rotation instead of queueing it, which
+-- is the whole point of validating the height early, and preserves the braked
+-- arrival -- and the "never sail over" property with it.
+--
+-- `target` is the altitude being chased; sets ap.climb_demand and
+-- self.targets.altitude, and returns the commanded collective.
+function Flight:apClimbVertical(dt, target, hmax)
+    local ap = self.ap
+    local state = self.state
+    local limits = self.config.limits or {}
+    local hover = hoverFF(limits, state)
+    local rate = state.climb_rate or 0
+    local remain = target - (state.altitude or 0)
+
+    -- (1) VELOCITY SETPOINT.
+    --     Transit: a single constant climb rate -> linear altitude
+    --     gain, steady moderate collective. Braking: the fastest
+    --     rate we could still stop from in `remain`, so the profile
+    --     arrives at the goal with ~zero speed. At/above the goal
+    --     the setpoint is pinned at 0 and can never go positive:
+    --     the ship coasts to a stop ON the goal rather than
+    --     carrying momentum through it.
+    local vdes
+    if remain <= 0 then
+        vdes = 0
+    else
+        local v_brake = math.sqrt(2 * AP_CLIMB_BRAKE * remain)
+        vdes = math.min(AP_CLIMB_V, v_brake, AP_CLIMB_VLIM)
+    end
+
+    -- (2) VELOCITY PI on MEASURED climb rate. I is a leaky
+    --     integrator: it trims the steady-state offset but leaks
+    --     whenever the velocity error is small, so it cannot wind
+    --     up during the long cruise at rate and then fire on
+    --     arrival.
+    --
+    --     There is deliberately NO D term here. The earlier draft
+    --     computed a `kd` that faded over the last AP_CLIMB_KD_CUT
+    --     metres, but it was never multiplied into v_out -- the
+    --     loop has always been PI. Rather than keep a constant and
+    --     a fade that do nothing, the dead code is gone; the final
+    --     metres are governed by the v^2 brake profile in (1),
+    --     which is what actually settles the arrival. A D term on
+    --     v_err would also fight that profile and re-introduce the
+    --     last-metre bounce the brake curve exists to prevent.
+    local v_err = vdes - rate
+    ap.climb_vi = (ap.climb_vi or 0) + v_err * dt
+    local leak = math.max(0, 1 - dt / 3.0)
+    ap.climb_vi = ap.climb_vi * leak
+    local v_out = AP_CLIMB_KP * v_err + AP_CLIMB_KI * ap.climb_vi
+
+    -- (3) COLLECTIVE = feedforward + velocity PID, then the
+    --     asymmetric slew limit. The feedforward keeps the law
+    --     meaning the same thing at any height; the PID supplies
+    --     only the extra (or reduced) thrust that produces the
+    --     commanded vertical acceleration.
+    local demand = clamp(hover + v_out, 0, hmax)
+    if remain <= 0 then
+        -- AT OR ABOVE THE GOAL: cap at hover. The ship may coast
+        -- and settle down onto the target, but it is never given
+        -- more lift than holding station, so it cannot be pushed
+        -- back over the goal. This is the "never go over" rule.
+        if demand > hover then demand = hover end
+    end
+    local prev = ap.climb_demand
+    if prev ~= nil then
+        local rate_lim = (demand > prev) and AP_CLIMB_SLEW_ATTACK
+            or AP_CLIMB_SLEW_RELEASE
+        local max_step = rate_lim * dt
+        demand = clamp(demand, prev - max_step, prev + max_step)
+    end
+    ap.climb_demand = clamp(demand, 0, hmax)
+    self.targets.altitude = target
+    self.targets.yaw_cmd = clamp(self.pilot_yaw or 0, -1, 1) -- Q/E only
+
+    ap.climb_demand = clamp(demand, 0, hmax)
+    return ap.climb_demand
 end
 
 function Flight:updateCruise(dt)
@@ -2181,6 +2307,20 @@ function Flight:updateCruise(dt)
 
     if not flying then
         base_speed = 0
+    end
+
+    -- Climb->turn handover ramp: bound the rate of change of the collective
+    -- for a short window after the climb law hands over, so the first command
+    -- from the altitude PID ramps in from the last slew-limited climb demand
+    -- instead of stepping. See AP_CLIMB_HANDOVER_SLEW.
+    if self.ap and (self.ap.slew_ttl or 0) > 0 then
+        local rlim = AP_CLIMB_SLEW_RELEASE * dt
+        local sprev = self.ap.slew_prev
+        if sprev ~= nil then
+            base_speed = clamp(base_speed, sprev - rlim, sprev + rlim)
+        end
+        self.ap.slew_prev = base_speed
+        self.ap.slew_ttl = self.ap.slew_ttl - dt
     end
 
     self:setUniformSpeed(base_speed)
