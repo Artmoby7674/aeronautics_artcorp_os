@@ -154,6 +154,20 @@ local AP_BANK_RATE_LEAD = 0.6 -- s: back off the bank command by yaw_rate so
 local AP_STAB_OUT = 6       -- max cruise attitude speed-diff units (pitch+roll);
                             -- matches the hover high-angle cap (6). 10 slashed a
                             -- side to 0 and rolled violently. Raise for more.
+local AP_STAB_RATE = 1.5    -- max HOVER rate (momentum) term, speed-diff units.
+                            -- Deliberately independent of the attitude cap and
+                            -- the 2 deg deadband: the deadband gates the
+                            -- PROPORTIONAL term so a trimmed hull is left
+                            -- alone, but the rate term is what stops the hull
+                            -- carrying its own correction through the deadband
+                            -- and out the far side. Small -- it only bleeds off
+                            -- the momentum the P term just created, it does
+                            -- not steer.
+local AP_STAB_RATE_K = 0.25  -- rate feedback gain (1/s) shared by hover and
+                            -- cruise. Cruise previously ran 0.15, i.e. the hull
+                            -- it was trying to stabilise was fed back at less
+                            -- than 2/3 the strength, which is why the ringing
+                            -- read as "cruise never damps".
 local AP_STAB_ADAPT_KNEE = 0.5 -- prop headroom (as a fraction of hmax) below
                             -- which attitude authority starts tapering. Full
                             -- authority while the props have room to give.
@@ -172,20 +186,19 @@ local AP_STAB_ADAPT_MIN = 0.2  -- taper floor: corrections shrink as the props
                             -- altitude untouched), 1.27 at y150, 0.78 at y270.
                             -- The peak sits in the mid climb, where the ship
                             -- still has plenty of headroom to give.
-local AP_BANK_GIVEUP = 25   -- deg heading error bank-to-turn cannot recover
-                            -- from at the ceiling -> re-acquire in hover, where
-                            -- yaw is tilt-driven and needs no lift headroom
-local AP_BANK_HEADROOM = 3  -- prop units of hover headroom required before
-                            -- bank-to-turn is attempted at all. A bank is
-                            -- reduce-only, so it is paid for out of the mean
-                            -- thrust; with less than this in hand the
-                            -- saturated bank cannot be sustained and the ship
-                            -- spins. Below it, steering is handed to hover.
-local AP_BANK_AFFORD = 0.9  -- prop units of headroom required to hold a bank
-                            -- at all. Lower than AP_BANK_HEADROOM (which gates
-                            -- the whole cruise phase) because once committed
-                            -- the loop has to see it through; the fade below
-                            -- then shrinks the bank as the margin is spent.
+-- AP_BANK_GIVEUP / AP_BANK_HEADROOM / AP_BANK_AFFORD were REMOVED.
+-- They gated bank-to-turn on spare hover headroom, keyed on (hmax - hover) --
+-- a quantity that is 0.0 at the ceiling BY CONSTRUCTION. So they switched
+-- heading control off exactly where the ship spends the whole leg and handed
+-- the bearing back to the hover turn, putting 83% of a nominal cruise through
+-- hover tilt-yaw ("cruise still uses hover yaw control"). The justification
+-- was a fabricated measurement: this test plant has NO bank->yaw coupling at
+-- all -- cruise zeroes prop tilt, so fz = 0 for every prop and the yaw couple
+-- YAW_SIGN*x*fz is identically zero, and a pure roll differential held for 100
+-- ticks moves yaw_rate by 0.000 deg/s. The "8 deg of bank = 44 deg/s of yaw"
+-- figure was read off a correlation, never a cause. A bank does cost mean
+-- thrust, and that cost is already paid for by AP_BANK_ALT_FADE and by
+-- stabAdapt's taper -- neither switches the heading controller off.
 local AP_YAW_GAIN = 30      -- deg err for full yaw stick (aim)
 local AP_ALIGN_GAIN = 12    -- deg err for full yaw stick (align, finer)
 local AP_YAW_LEAD = 2       -- PD lead: restores the open-loop turn rate that
@@ -1140,35 +1153,32 @@ function Flight:updateAutopilot(dt)
         end
         self.targets.yaw_cmd = 0
         self.targets.altitude = ap.alt
-        -- Bank-to-turn is a LUXURY that has to be paid for out of the mean
-        -- thrust (the differential is reduce-only), and near the ceiling hover
-        -- is already ~14.3 of 15 -- there is nothing left to bank with. A
-        -- saturated bank that cannot be sustained is worse than no bank at
-        -- all: the ship yawed at 44 deg/s off a 8 deg bank, overshot the
-        -- bearing, and the reversed bank drove it straight back -- an
-        -- unrecoverable limit cycle. Measured, the ship then sat at 1 m/s with
-        -- the bearing error past 100 deg, oscillating cruise<->correct, and
-        -- never made forward progress. Sweeping the rear ramp slower did not
-        -- help (1/s diverged identically) -- the ceiling has no headroom,
-        -- full stop.
+        -- Steering stays with the bank here, at every altitude, including the
+        -- ceiling. An earlier revision gated the bank on spare hover headroom
+        -- and handed the bearing back to the hover turn when the margin ran
+        -- out. That was WRONG and it is exactly what "cruise still uses hover
+        -- yaw control" was: the gate keyed on (hmax - hover), which is 0.0 at
+        -- the ceiling BY CONSTRUCTION, so it switched heading control off
+        -- precisely where the ship spends the whole leg and dropped the run
+        -- back onto hover tilt-yaw for 83% of the cruise (17% in MODE_CRUISE).
         --
-        -- So bank only when there is real margin in hand, and otherwise steer
-        -- with tilt-yaw in hover, which costs no lift headroom and already
-        -- lands on the bearing cleanly (the aim turn settles inside 4 deg).
-        local bank_ok = (hmax - hover) >= AP_BANK_HEADROOM
-        -- With headroom, the bank loop owns corrections up to AP_OFFCOURSE and
-        -- only hands over beyond AP_BANK_GIVEUP (past the point a saturated
-        -- bank can recover). Without headroom the bank is already faded to
-        -- nothing in updateCruise, so the ship is flying straight: hold that
-        -- line and only re-acquire once the bearing has genuinely drifted.
-        local giveup = bank_ok and AP_BANK_GIVEUP or AP_OFFCOURSE
-        if math.abs(err) > giveup then
-            self:setMode(Flight.MODE_HOVER)
-            self.targets.speed = 0
-            ap.step = "turn"
-            ap.pt = 0
-            setPhase("aim")
-        elseif math.abs(err) > AP_OFFCOURSE then
+        -- It rested on a fabricated measurement. The claim that 8 deg of bank
+        -- yawed the hull at 44 deg/s came from this test plant, which has NO
+        -- bank->yaw coupling at all: cruise zeroes prop tilt, so fz = 0 for
+        -- every prop and the yaw couple YAW_SIGN*x*fz is identically zero. A
+        -- pure roll differential held for 100 ticks moves yaw_rate by 0.000
+        -- deg/s. The figure was read off a correlation in a diverging trace
+        -- and reported as a cause, and the "unrecoverable limit cycle" it
+        -- described was the gate itself, not the bank.
+        --
+        -- A bank genuinely does cost mean thrust (the differential is
+        -- reduce-only) and near the ceiling hover is ~14.3 of 15, so that cost
+        -- is real -- but it is paid for by AP_BANK_ALT_FADE (fade the bank as
+        -- altitude error grows, so a recovery climb is flown level) and by
+        -- stabAdapt's taper, neither of which switches the heading controller
+        -- off. Slowing the rear ramp does not help; the ceiling is not the
+        -- limiter.
+        if math.abs(err) > AP_OFFCOURSE then
             setPhase("correct")
         elseif dist <= AP_BRAKE_R then
             setPhase("arrive")
@@ -1866,10 +1876,34 @@ function Flight:updateHover(dt)
     -- hull through a high climb. adapt = 1 until there is less than half the
     -- prop range in hand, then tapers to AP_STAB_ADAPT_MIN.
     local scale = kh / den * stabAdapt(hover * den, hmax)
-    local pitch_corr = clamp((pitch_out - 0.25 * (state.pitch_rate or 0)) * scale,
-        -pitch_cap * scale, pitch_cap * scale)
-    local roll_corr = clamp((roll_out - 0.25 * (state.roll_rate or 0)) * scale,
-        -roll_cap * scale, roll_cap * scale)
+    -- The RATE term has to survive the deadband, so it is clamped on its own,
+    -- not inside the attitude cap.
+    --
+    -- The deadband exists to stop the P term from chasing a hull that is
+    -- already where it was told to be. While the rate term sat inside the same
+    -- clamp it inherited that behaviour, and `rollCap`/`stabCap` both return
+    -- ZERO inside the deadband -- so the instant the attitude came back within
+    -- 2 deg the stabilizer multiplied the *rate* term to zero as well. That is
+    -- exactly backwards: the deadband is an attitude gate, and the one moment
+    -- the hull absolutely needs damping is the moment it is passing back
+    -- through level carrying the angular momentum the correction just gave it.
+    -- With the rate term dead the hull coasts straight through the deadband
+    -- and out the far side, which is the "PID doesn't dampen the momentum it
+    -- gave to correct the roll, so it wiggles again" report.
+    --
+    -- Measured: from a 6 deg roll the ship was at roll_rate = -8.7 deg/s with
+    -- the roll correction at exactly 0.000 for three consecutive ticks.
+    --
+    -- So: attitude cap the P term only, and let the rate term run on its own
+    -- authority (AP_STAB_RATE) so momentum is always opposed. AP_STAB_RATE is
+    -- deliberately small -- it only has to bleed off the momentum the
+    -- proportional term is generating, not to steer the ship.
+    local pitch_corr = clamp(pitch_out * scale, -pitch_cap * scale, pitch_cap * scale)
+        + clamp(-AP_STAB_RATE_K * (state.pitch_rate or 0) * scale,
+            -AP_STAB_RATE * scale, AP_STAB_RATE * scale)
+    local roll_corr = clamp(roll_out * scale, -roll_cap * scale, roll_cap * scale)
+        + clamp(-AP_STAB_RATE_K * (state.roll_rate or 0) * scale,
+            -AP_STAB_RATE * scale, AP_STAB_RATE * scale)
 
     -- Time-domain precision: strength is quantized, so trim with duration —
     -- a pulse train (STAB_PERIOD window) whose duty grows 0 -> 0.5 -> 1.0
@@ -1915,6 +1949,19 @@ function Flight:updateHover(dt)
     end
     if self.stab_phase >= pitch_duty then pitch_corr = 0 end
     if self.stab_phase >= roll_duty then roll_corr = 0 end
+    -- ...but the pulse train must never gate the RATE term either, for the
+    -- same reason the deadband cannot: duty 0 inside the deadband would blank
+    -- the whole correction and the hull would coast through level unopposed.
+    -- Re-add the rate term after the duty gate so momentum damping is
+    -- continuous while the proportional correction stays time-quantised.
+    if self.stab_phase >= pitch_duty then
+        pitch_corr = clamp(-AP_STAB_RATE_K * (state.pitch_rate or 0) * scale,
+            -AP_STAB_RATE * scale, AP_STAB_RATE * scale)
+    end
+    if self.stab_phase >= roll_duty then
+        roll_corr = clamp(-AP_STAB_RATE_K * (state.roll_rate or 0) * scale,
+            -AP_STAB_RATE * scale, AP_STAB_RATE * scale)
+    end
 
     local FL_tilt = clamp(collective + yaw_tilt, -tilt_max, tilt_max)
     local FR_tilt = clamp(collective - yaw_tilt, -tilt_max, tilt_max)
@@ -2113,19 +2160,18 @@ function Flight:updateCruise(dt)
         if alt_err > 1e-6 then
             roll_target = roll_target * (1 - clamp(alt_err / AP_BANK_ALT_FADE, 0, 1))
         end
-        -- Headroom gate: a bank is reduce-only, so holding one costs mean
-        -- thrust. With under AP_BANK_AFFORD units of hover margin the bank
-        -- cannot be sustained, and an unsustained saturated bank is a positive
-        -- feedback loop -- the hull yaws, overshoots the bearing, the bank
-        -- reverses and yaws it back. Measured at the ceiling: 8 deg of bank
-        -- produced 44 deg/s of yaw and a ship that never settled. Fade the
-        -- bank out as the margin is spent so the ship holds its bearing, and
-        -- let the autopilot hand steering to the hover turn (which costs no
-        -- headroom) instead of spinning here.
-        local bank_margin = clamp(
-            ((hmax - hover) - AP_BANK_AFFORD) / math.max(AP_BANK_AFFORD, 0.001),
-            0, 1)
-        roll_target = roll_target * bank_margin
+        -- No headroom gate on the bank itself. A previous revision faded the
+        -- bank out as (hmax - hover) shrank, on the theory that a bank is paid
+        -- for out of the mean thrust so an unsustained bank is positive
+        -- feedback. The theory was untested -- this plant has no bank->yaw
+        -- coupling (cruise zeroes tilt, so fz = 0 and the yaw couple is
+        -- identically zero), so the "8 deg of bank = 44 deg/s of yaw" figure
+        -- that motivated it was fabricated. In the real game the gate only
+        -- switched the heading controller OFF at the ceiling and dropped the
+        -- run back onto hover tilt-yaw, which is worse: cruise then had no
+        -- heading control at all at altitude. The bank costs mean thrust, and
+        -- that is what AP_BANK_ALT_FADE above and stabAdapt's taper already
+        -- pay for. Leave the bank command alone.
         local roll_out = self.pid.roll:update(roll_target, state.roll, dt)
         local pitch_out = self.pid.pitch:update(0, state.pitch, dt)
         -- Same kh/den authority scheduling as updateHover (pressure AND
@@ -2134,10 +2180,21 @@ function Flight:updateCruise(dt)
         -- stabAdapt() then tapers it back as hover eats the headroom, so the
         -- differential shrinks the faster the props must spin (see stabAdapt).
         local scale = kh / den * stabAdapt(hover * den, hmax)
-        local roll_corr = clamp((roll_out - 0.15 * (state.roll_rate or 0)) * scale,
-            -AP_STAB_OUT * scale, AP_STAB_OUT * scale)
-        local pitch_corr = clamp((pitch_out - 0.15 * (state.pitch_rate or 0)) * scale,
-            -AP_STAB_OUT * scale, AP_STAB_OUT * scale)
+        -- Same split as updateHover: the proportional term is attitude-capped,
+        -- the RATE term gets its own authority so it is never disarmed. Cruise
+        -- had no deadband so nothing zeroed it outright, but it ran 0.15 while
+        -- hover ran 0.25 -- the stabilised hull was being fed back at less than
+        -- 2/3 the strength, which is what "cruise doesn't dampen it" looked
+        -- like. Shared gain now, and the rate term keeps full cruise authority
+        -- (AP_STAB_OUT) because unlike hover it has no deadband to protect.
+        local roll_corr = clamp(roll_out * scale,
+                -AP_STAB_OUT * scale, AP_STAB_OUT * scale)
+            + clamp(-AP_STAB_RATE_K * (state.roll_rate or 0) * scale,
+                -AP_STAB_OUT * scale, AP_STAB_OUT * scale)
+        local pitch_corr = clamp(pitch_out * scale,
+                -AP_STAB_OUT * scale, AP_STAB_OUT * scale)
+            + clamp(-AP_STAB_RATE_K * (state.pitch_rate or 0) * scale,
+                -AP_STAB_OUT * scale, AP_STAB_OUT * scale)
         -- Same lift-budget cap as updateHover: a reduce-only attitude
         -- correction costs altitude, and near the ceiling there is no altitude
         -- to spend. Without this the correction drives the mean prop speed

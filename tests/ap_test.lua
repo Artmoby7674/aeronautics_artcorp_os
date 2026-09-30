@@ -260,6 +260,20 @@ local function makeEnv(opts)
         state.speed = math.sqrt(plant.vx * plant.vx + plant.vz * plant.vz)
         state.forward.x = math.sin(math.rad(plant.yaw))
         state.forward.z = math.cos(math.rad(plant.yaw))
+        -- Ship local X = LONGITUDINAL: av.x = roll rate, av.z = pitch rate, and
+        -- pitch+ = nose down = NEGATIVE Z rotation (see Flight:updateState).
+        --
+        -- These must be published. Flight:updateState() RECOMPUTES
+        -- state.roll_rate / state.pitch_rate from angularVelocity and throws
+        -- away whatever the harness set directly on `state`, so a harness that
+        -- only fills angularVelocity.y silently feeds the whole stabiliser a
+        -- roll_rate and pitch_rate of exactly 0 -- i.e. the rate (momentum)
+        -- term is multiplied by zero every tick and never once contributes.
+        -- That is precisely the bug the suite was blind to: the ship rang in
+        -- game while all 86 checks passed, because here the D term could not
+        -- possibly do anything.
+        state.angularVelocity.x = plant.roll_rate * math.pi / 180
+        state.angularVelocity.z = -plant.pitch_rate * math.pi / 180
         state.angularVelocity.y = plant.yaw_rate * math.pi / 180
         return plant.cmd
     end
@@ -822,6 +836,119 @@ do
         high >= low * 0.25, string.format("low=%.3f high=%.3f", low, high))
     print(string.format("taper: low_alt_diff=%.3f high_alt_diff=%.3f ratio=%.2f",
         low, high, (low > 0) and (high / low) or 0))
+end
+
+-- 12. CRUISE MUST ACTUALLY CRUISE.
+-- A bank is how cruise steers: updateCruise drives the roll PID to a nonzero
+-- setpoint, and rotationControl() (hover tilt-yaw) is only ever called from
+-- updateHover. So "cruise is using hover yaw" can only mean the ship is not
+-- actually in MODE_CRUISE.
+--
+-- A revision gated the bank on available headroom, keyed on (hmax - hover) --
+-- which is 0.0 at the ceiling BY CONSTRUCTION. So it switched heading control
+-- off exactly where the ship spends the whole leg and handed the bearing back
+-- to the hover turn: 17% of the leg in cruise, 83% in hover. The theory behind
+-- it ("an unsustained bank is positive feedback") was untested, and this plant
+-- cannot test it -- cruise zeroes prop tilt, so fz = 0 for every prop and the
+-- yaw couple YAW_SIGN*x*fz is identically zero. A pure roll differential held
+-- for 100 ticks moves yaw_rate by 0.000 deg/s: there is no bank->yaw coupling
+-- here at all, so the "8 deg of bank = 44 deg/s of yaw" figure that motivated
+-- the gate was fabricated.
+do
+    local env = makeEnv({ alt0 = 60 })
+    local f = env.flight
+    f:startAutopilot{ name = "CRUISE", x = 2000, z = 0, heading = 90, alt = 270 }
+    local cruise, total = 0, 0
+    for _ = 1, 4000 do
+        env.step()
+        if f.ap then
+            total = total + 1
+            if f.mode == "CRUISE" then cruise = cruise + 1 end
+        end
+    end
+    local pct = (total > 0) and (100 * cruise / total) or 0
+    check("cruise: stays in MODE_CRUISE for the bulk of the leg (>=70%)",
+        pct >= 70, string.format("in-cruise=%.1f%%", pct))
+    print(string.format("cruise: in-cruise=%.1f%% of leg", pct))
+end
+
+-- 13. RATE FEEDBACK MUST BE LIVE, AND MUST DAMP THE MOMENTUM.
+-- Three separate things have to hold, and each one broke silently:
+--
+--  a) the HARNESS has to publish roll rate. Flight:updateState() recomputes
+--     state.roll_rate from ship angular velocity and discards whatever the
+--     harness set on `state` directly. Filling only angularVelocity.y (yaw)
+--     left x at 0, so the rate term was multiplied by zero on every tick of
+--     every test -- it could not do anything, ever.
+--  b) the DEADBAND must not disarm the rate term. rollCap/stabCap return 0
+--     inside the 2 deg band, and the rate term used to live inside that clamp.
+--     The deadband is an attitude gate; the one moment a hull needs damping is
+--     the moment it passes back through level carrying the momentum its own
+--     correction just gave it.
+--  c) the DUTY GATE must not disarm it either (same argument, manual flight).
+do
+    local env = makeEnv({ alt0 = 270 })
+    local f = env.flight
+    f:setMode(f.MODE_HOVER)
+    f.targets.altitude = 270
+    for _ = 1, 400 do env.step() end
+
+    -- NB: env.step() runs flight:update() FIRST and only publishes the plant
+    -- state at the end, so a disturbance written into the plant is not visible
+    -- to the controller until the NEXT step. Two steps per probe, or every
+    -- reading below is a tick stale and measures nothing.
+    env.plant.roll_rate = -6.0
+    env.step(); env.step()
+    check("damping: ship roll rate actually reaches the stabiliser",
+        math.abs(f.state.roll_rate or 0) > 1.0,
+        string.format("state.roll_rate=%.2f (plant -6.00)", f.state.roll_rate or 0))
+
+    -- THE REGRESSION, aimed straight at it: a hull sitting INSIDE the 2 deg
+    -- attitude deadband but still rotating fast. rollCap() returns 0 there and
+    -- the duty schedule returns 0 there, so a rate term living inside either
+    -- one is multiplied by zero and the hull coasts straight through level
+    -- carrying the momentum its own correction just gave it -- the "PID does
+    -- not dampen the momentum it gave to correct the roll, so it wiggles
+    -- again" report. A PROPORTIONAL term is correct to be silent here; a RATE
+    -- term is not, and the two have to be separable to tell them apart.
+    local inband = 0
+    for _, rr in ipairs({ -3.0, -6.0, -9.0 }) do
+        env.plant.roll = 1.0        -- inside the deadband
+        env.plant.roll_rate = rr
+        env.step()                  -- publish
+        env.step()                  -- controller acts on it
+        local diff = math.abs((f.outputs.RL_speed or 0) - (f.outputs.RR_speed or 0))
+        if diff > 0.05 then inband = inband + 1 end
+        env.plant.roll_rate = 0
+        for _ = 1, 40 do env.step() end   -- settle back before the next probe
+    end
+    check("damping: rate term still acts INSIDE the attitude deadband",
+        inband == 3,
+        string.format("%d/3 in-band rotations opposed (0 => rate term is dead)", inband))
+
+    -- ...and the whole disturbance must bleed off monotonically. A correction
+    -- that keeps reversing sign is the ring the pilot is complaining about.
+    env.plant.roll = 6.0
+    local unopposed, reversals, t, settle, prev = 0, 0, 0, nil, 6
+    for _ = 1, 400 do
+        env.step()
+        t = t + 0.05
+        local r, rr = env.plant.roll, env.plant.roll_rate
+        local diff = math.abs((f.outputs.RL_speed or 0) - (f.outputs.RR_speed or 0))
+        if math.abs(rr) > 3 and diff < 0.01 then unopposed = unopposed + 1 end
+        if prev > 0.5 and r < -0.5 then reversals = reversals + 1 end
+        prev = r
+        if not settle and math.abs(r) < 0.5 and math.abs(rr) < 1 then settle = t end
+    end
+    check("damping: never coasts through the deadband unopposed",
+        unopposed == 0, string.format("unopposed_ticks=%d", unopposed))
+    check("damping: roll disturbance does not ring (reversals <= 1)",
+        reversals <= 1, string.format("reversals=%d", reversals))
+    check("damping: roll disturbance settles",
+        settle ~= nil,
+        string.format("settle=%s", settle and string.format("%.2fs", settle) or "never"))
+    print(string.format("damping: inband=%d/3 unopposed=%d reversals=%d settle=%s",
+        inband, unopposed, reversals, settle and string.format("%.2fs", settle) or "never"))
 end
 
 print(string.format("ap_test: %d passed, %d failed", passed, failed))
