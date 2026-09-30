@@ -7,7 +7,7 @@
 -- Pinned ref (commit SHA on origin/master). NEVER install from "master":
 -- a moving branch silently changes what ships get, and a half-updated
 -- install is a broken ship. Bump REF deliberately when releasing.
-local REF = "166f7d4ce31b4eb07214b8e8701411e4fef465e1"
+local REF = "bbb5123ec3a60dca00046761adf0dcd5b146afdd"
 local BASE_URL = "https://raw.githubusercontent.com/Artmoby7674/aeronautics_artcorp_os/" .. REF
 
 local files = {
