@@ -52,6 +52,10 @@ local TABS = {
     { id = "nav",     label = "NAV" },
     { id = "alarms",  label = "ALARMS" },
     { id = "actions", label = "ACTIONS" },
+    -- Autopilot screen. Present at all times so the strip does not reflow
+    -- (and shuffle the tabs out from under a finger) the moment the autopilot
+    -- engages; HUD.render() switches to it on its own when that happens.
+    { id = "ap",      label = "A/P" },
 }
 
 local active_tab = "flight"
@@ -89,9 +93,18 @@ local function applyLayout()
     L.strip_x = W - L.border - L.strip_w
     L.content_x = L.border + 4
     L.content_w = L.strip_x - L.content_x - 4
-    L.tab_h = 24
     L.tab_gap = 5
     L.tab_y0 = L.body_y + 4
+    -- Tab height is DERIVED from how many tabs there are, not fixed. The strip
+    -- is 186 px tall on the 348x216 design canvas and 6 fixed 24 px tabs were
+    -- chosen to fill it; a 7th (the autopilot screen) overflows the bottom of
+    -- the monitor at that size. Sizing from the count keeps the full-height
+    -- look while there is room and shrinks to fit when there is not, instead of
+    -- either clipping the last tab or hardcoding a second geometry.
+    local avail = L.body_h - 2 - (L.tab_y0 - L.body_y)
+    local n = #TABS
+    L.tab_h = math.floor((avail - (n - 1) * L.tab_gap) / n)
+    L.tab_h = math.max(14, math.min(24, L.tab_h))
 
     -- shutdown circle: top-left of header
     local d = 12
@@ -403,12 +416,15 @@ local function drawAlarmsStatic()
 end
 
 -- ACTIONS tab: touch buttons replacing M/L/G/X/R/T/N keys
+-- NOTE: CANCEL A/P used to live here. It moved to the A/P tab, which opens
+-- itself when the autopilot engages -- so the control is on the screen that
+-- is already showing you the run, instead of a second tab you have to go and
+-- find while the ship is flying itself.
 local ACTION_BTNS = {
     { id = "land",  label = "AUTO-LAND", feat = "auto_land" },
     { id = "gear",  label = "GEAR",      feat = "gear" },
     { id = "estop", label = "E-STOP" },
     { id = "autopilot", label = "AUTOPILOT" },
-    { id = "apcancel",  label = "CANCEL A/P" },
 }
 
 local function actionBtnRect(i)
@@ -435,6 +451,196 @@ local function navBtnRect(i)
     local x = L.content_x + L.content_w - (2 * bw + gap) + col * (bw + gap)
     local y = L.body_y + 14 + row * (bh + gap)
     return x, y, bw, bh
+end
+
+-- ============================================================
+-- A/P tab: the autopilot run screen.
+-- ============================================================
+-- The five numbered boxes are the point of this screen. The sequence is
+-- climb -> rotate onto the bearing -> fast travel -> rotate onto the stored
+-- heading -> land, and "which of those is it stuck in" is the first question
+-- when a run misbehaves, so it is answered with a glanceable number in the
+-- top-left rather than a word that has to be read.
+--
+-- Map is by (phase, step): "aim" covers TWO legs -- the climb always runs
+-- first, then the turn -- so phase alone cannot tell them apart.
+local AP_PHASES = {
+    { n = 1, name = "CLIMB",  long = "CLIMB TO ALT" },
+    { n = 2, name = "ROT",    long = "ROTATE" },
+    { n = 3, name = "TRAVEL", long = "FAST TRAVEL" },
+    { n = 4, name = "ALIGN",  long = "ROTATE" },
+    { n = 5, name = "LAND",   long = "LANDING" },
+}
+
+local function apPhaseIndex(ph, step)
+    if ph == "aim" then
+        return (step == "climb") and 1 or 2
+    elseif ph == "cruise" or ph == "correct" or ph == "arrive" then
+        return 3
+    elseif ph == "align" then
+        return 4
+    elseif ph == "land" then
+        return 5
+    end
+    return nil
+end
+
+-- Phase boxes: 5 cells across the top-left, each holding its number.
+-- The active one is filled and its number inverted, so the number is readable
+-- at a glance and unambiguous even in dim light or on a glare-lit panel.
+local AP_CELL_W, AP_CELL_H, AP_CELL_GAP = 20, 22, 4
+
+local function apPhaseRect(i)
+    return L.content_x + (i - 1) * (AP_CELL_W + AP_CELL_GAP),
+        L.body_y + 14, AP_CELL_W, AP_CELL_H
+end
+
+-- CANCEL lives at the bottom of this screen: it is the one thing you want to
+-- hit without aiming, and it used to be a half-width button two tabs away.
+-- Bottom-anchored to the content area, so it cannot drift off the bottom.
+local function apCancelRect()
+    local w = math.min(150, L.content_w - 8)
+    return L.content_x, L.body_y + L.body_h - 26, w, 22
+end
+
+-- Left/right half of the data block; label left, value right-aligned.
+local AP_COL_GAP = 6
+local function apCol(i) -- 1 = left, 2 = right
+    local w = math.floor((L.content_w - AP_COL_GAP) / 2)
+    return L.content_x + (i - 1) * (w + AP_COL_GAP), w
+end
+
+local function drawButton(bx, by, bw, bh, txt, bg, fg)
+    Gfx.fillRect(bx, by, bw, bh, bg)
+    Gfx.fillRect(bx, by, bw, 1, C.border)
+    Gfx.fillRect(bx, by + bh - 1, bw, 1, C.border)
+    Gfx.fillRect(bx, by, 1, bh, C.border)
+    Gfx.fillRect(bx + bw - 1, by, 1, bh, C.border)
+    local tw = Font.textWidth(txt)
+    Gfx.text(bx + math.floor((bw - tw) / 2),
+        by + math.floor((bh - Font.height) / 2), txt, fg)
+end
+
+local function drawApStatic()
+    local x = L.content_x
+    local y = L.body_y + 2
+    label(x, y, "AUTOPILOT")
+    Gfx.fillRect(x, y + 8, L.content_w, 2, C.panel)
+
+    -- phase boxes: outline + number, drawn once. The active highlight is
+    -- dynamic, so it overdraws this and redraws the number with it.
+    for i = 1, 5 do
+        local bx, by, bw, bh = apPhaseRect(i)
+        Gfx.fillRect(bx, by, bw, bh, C.bg)
+        Gfx.fillRect(bx, by, bw, 1, C.border)
+        Gfx.fillRect(bx, by + bh - 1, bw, 1, C.border)
+        Gfx.fillRect(bx, by, 1, bh, C.border)
+        Gfx.fillRect(bx + bw - 1, by, 1, bh, C.border)
+        local n = tostring(i)
+        Gfx.text(bx + math.floor((bw - Font.textWidth(n)) / 2),
+            by + math.floor((bh - Font.height) / 2), n, C.dim)
+    end
+
+    label(x, L.body_y + 42, "TO WAYPOINT")
+    label(x, L.body_y + 60, "TRIP DONE")
+    Gfx.fillRect(x, L.body_y + 74, L.content_w, 2, C.panel)
+
+    -- two columns of flight state
+    local rows = { { "MODE", "ALT ERR" }, { "CLIMB", "BEARING ERR" },
+                   { "HEADING", "GROUND SPD" }, { "ALT NOW/TGT", "ETA" } }
+    for i, names in ipairs(rows) do
+        local ry = L.body_y + 96 + (i - 1) * 18
+        for c = 1, 2 do
+            local cx = apCol(c)
+            label(cx, ry, names[c])
+        end
+    end
+end
+
+local function drawApDynamic(s)
+    local x, w = L.content_x, L.content_w
+    local ap = s.ap
+    local cx1, cw1 = apCol(1)
+    local cx2, cw2 = apCol(2)
+    local bx, by, bw, bh = apCancelRect()
+
+    if not ap then
+        slotText(x, L.body_y + 14, w, "AUTOPILOT NOT RUNNING", C.dim, "left")
+        slotText(x, L.body_y + 42, w, "START IT FROM THE ACTIONS TAB", C.dim, "left")
+        drawButton(bx, by, bw, bh, "CANCEL A/P", C.bar_bg, C.dim)
+        return
+    end
+
+    -- which waypoint: "distance to WP" is only useful next to WHICH waypoint,
+    -- and the name is short enough to sit on the title row.
+    slotText(x, L.body_y + 2, w, tostring(ap.name or ""), C.text, "right")
+
+    -- phase highlight
+    local idx = apPhaseIndex(ap.phase, ap.step)
+    for i = 1, 5 do
+        local px, py, pw, ph = apPhaseRect(i)
+        if i == idx then
+            Gfx.fillRect(px + 1, py + 1, pw - 2, ph - 2, C.good)
+            local n = tostring(i)
+            Gfx.text(px + math.floor((pw - Font.textWidth(n)) / 2),
+                py + math.floor((ph - Font.height) / 2), n, 0)
+        end
+    end
+    -- spelled out beside the boxes, so a glance gives both the number (for
+    -- bug reports) and the meaning (for the person flying). The slot is
+    -- bounded to the space LEFT of the tab strip -- slotText fills its whole
+    -- width, so handing it L.content_w here would paint over the tabs.
+    local capx = x + 5 * (AP_CELL_W + AP_CELL_GAP) + 4
+    local capw = math.max(0, (x + w) - capx)
+    slotText(capx, L.body_y + 20, capw, idx and AP_PHASES[idx].long or "?",
+        idx and C.accent or C.dim, "left")
+    if ap.paused then
+        slotText(capx, L.body_y + 30, capw, "PAUSED", C.warn, "left")
+    end
+
+    -- distance + trip percentage: the two numbers that answer "how far now,
+    -- and how much is left"
+    local d = tonumber(ap.dist) or 0
+    slotText(x, L.body_y + 42, w, string.format("%.0f M", d), C.accent, "right")
+    local pct = (tonumber(ap.progress) or 0) * 100
+    slotText(x, L.body_y + 60, w, string.format("%.0f%%", pct), C.accent, "right")
+    Gfx.fillRect(x, L.body_y + 72, w, 8, C.bar_bg)
+    local fillw = math.floor(w * clamp(pct / 100, 0, 1) + 0.5)
+    if fillw > 0 then Gfx.fillRect(x, L.body_y + 72, fillw, 8, C.good) end
+
+    -- flight state, chosen to match what has actually gone wrong before:
+    -- altitude error + climb rate (the climb oscillation), bearing error (the
+    -- bank not tracking the bearing), and the mode (cruise quietly turning
+    -- into hover, which is a one-glance diagnosis).
+    -- Show the PLAN, not the vertical law's command. During the ceiling
+    -- discovery climb the law is deliberately commanding the 450 m guard so
+    -- the ship can find out how high it can really go; that number is an
+    -- implementation detail and reading it back as "target altitude" is the
+    -- y450 readout that used to alarm the pilot. ap.goal_alt is the altitude
+    -- the run actually intends to cruise at.
+    local tgt_alt = (ap and tonumber(ap.goal_alt)) or s.target_altitude or 0
+    local alt_err = (s.altitude or 0) - tgt_alt
+    local berr = tonumber(ap.err) or 0
+    local eta = ap.eta
+    slotText(cx1, L.body_y + 96, cw1, tostring(s.mode or "-"):upper(), C.text, "right")
+    slotText(cx2, L.body_y + 96, cw2, string.format("%+.0f", alt_err),
+        math.abs(alt_err) > 10 and C.bad or C.good, "right")
+    slotText(cx1, L.body_y + 114, cw1,
+        string.format("%+.1f M/S", s.climb_rate or 0), C.text, "right")
+    slotText(cx2, L.body_y + 114, cw2, string.format("%+.1f", berr),
+        math.abs(berr) < 5 and C.good or (math.abs(berr) < 15 and C.warn or C.bad),
+        "right")
+    slotText(cx1, L.body_y + 132, cw1, string.format("%.1f", s.yaw or 0), C.text, "right")
+    slotText(cx2, L.body_y + 132, cw2,
+        string.format("%.1f M/S", s.speed or 0), C.text, "right")
+    slotText(cx1, L.body_y + 150, cw1,
+        string.format("%.0f/%.0f", s.altitude or 0, tgt_alt),
+        C.text, "right")
+    slotText(cx2, L.body_y + 150, cw2,
+        (eta and eta >= 0) and string.format("%.0f S", eta) or "--", C.text, "right")
+
+    -- cancel: the one live control during a run, so it stays enabled
+    drawButton(bx, by, bw, bh, "CANCEL A/P", C.good, 15)
 end
 
 local function drawActionsStatic()
@@ -465,14 +671,6 @@ local function drawActionsDynamic(s)
         elseif btn.id == "autopilot" and s.ap then
             bg = C.good
             fg = 15
-        elseif btn.id == "apcancel" then
-            if s.ap then
-                bg = C.good -- light green: the one live control during autopilot
-                fg = 15
-            else
-                bg = C.bar_bg
-                fg = C.dim
-            end
         end
         Gfx.fillRect(bx, by, bw, bh, bg)
         Gfx.fillRect(bx, by, bw, 1, C.border)
@@ -627,6 +825,8 @@ local function drawContentStatic()
         drawAlarmsStatic()
     elseif active_tab == "actions" then
         drawActionsStatic()
+    elseif active_tab == "ap" then
+        drawApStatic()
     end
 end
 
@@ -910,6 +1110,8 @@ local function drawDynamic(s, status_msg)
         drawAlarmsDynamic(s, status_msg)
     elseif active_tab == "actions" then
         drawActionsDynamic(s)
+    elseif active_tab == "ap" then
+        drawApDynamic(s)
     end
 
     -- Waypoint window: full-monitor modal over everything (the unflip
@@ -986,6 +1188,18 @@ function HUD.render(mon, status, config, status_msg)
         ap_shown = (status.ap ~= nil)
         chrome_dirty = true
         content_dirty = true
+        -- Follow the run: opening on the A/P screen when the autopilot starts
+        -- is the whole point of it (distance, progress, phase, cancel). On the
+        -- way OUT, only reclaim the screen if the pilot never left it -- if
+        -- they switched to FLIGHT or NAV to watch something else, yanking them
+        -- back to A/P on arrival would be the UI fighting the operator.
+        if ap_shown then
+            if active_tab ~= "ap" then
+                active_tab = "ap"
+            end
+        elseif active_tab == "ap" then
+            active_tab = "flight"
+        end
     end
     -- Modal closed: it painted over the static chrome/content, which only
     -- redraw on dirty flags - force a full redraw so everything comes back
@@ -1206,6 +1420,16 @@ local function hitTest(x, y)
             if inRect(bx, by, bw, bh, x, y) then
                 return "nav:" .. btn.id
             end
+        end
+    end
+
+    -- A/P tab: the cancel button. Reported as an "act:" action so os_main's
+    -- existing apcancel path (and its "AUTOPILOT CANCELLED" status line)
+    -- handles it unchanged.
+    if active_tab == "ap" then
+        local cx, cy, cw, ch = apCancelRect()
+        if inRect(cx, cy, cw, ch, x, y) then
+            return "act:apcancel"
         end
     end
 

@@ -3,4 +3,5 @@
 dofile("tests/pid_test.lua")
 dofile("tests/vertical_test.lua")
 dofile("tests/ap_test.lua")
+dofile("tests/hud_test.lua")
 print("ALL TESTS PASSED")

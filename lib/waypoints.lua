@@ -1,7 +1,7 @@
 -- Waypoint storage: config/wp_<slot>.lua next to the config it belongs to.
 -- Entries: { name = "...", x = <number>, z = <number>, heading = <deg>,
 --           alt = <number|nil> }. alt is optional: when omitted, the autopilot
--- climbs to the operating ceiling (y280 floor, then as high as the lift props
+-- climbs to the operating ceiling (y250 minimum flight height, then as high as the lift props
 -- stay above 13) and cruises the whole leg there. Give alt to pin an exact
 -- height instead -- an explicit value is honoured and is not treated as a
 -- ceiling request.

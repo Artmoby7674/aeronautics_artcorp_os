@@ -334,7 +334,8 @@ local AP_CLIMB_TIMEOUT = 180   -- s: dedicated climb-phase failsafe. The generic
 -- re-tuned, and other people's servers have different build limits. A hardcoded
 -- number is wrong on all three counts.
 --
--- So the ship finds its own ceiling. y280 is a FLOOR, not a ceiling: cruise
+-- So the ship finds its own ceiling. y250 is the MINIMUM FLIGHT HEIGHT, not a
+-- ceiling: the plan starts there and only ever rises to a measured ceiling.
 -- travel never happens below it, but it is not the stopping point either.
 -- Above the floor the ship watches the one number that reveals the ceiling --
 -- the prop speed the hover feedforward needs to hold station. While that is
@@ -343,19 +344,22 @@ local AP_CLIMB_TIMEOUT = 180   -- s: dedicated climb-phase failsafe. The generic
 -- ceiling. Those 2 units ARE the safety margin, which is why the target is
 -- the discovered altitude itself and not something below it.
 --
--- This is what makes one build work on any world. On a flat world the props
--- are already near max at y280, demand crosses 13 almost immediately, and the
+-- this is what makes one build work on any world. On a flat world the props
+-- are already near max at y250, demand crosses 13 almost immediately, and the
 -- ship cruises on its floor. Where the player has terrain and builds high the
 -- air is denser up there, the props may still be turning at ~5 on reaching
--- y280, and the ship keeps going up -- potentially a very long way -- until
+-- y250, and the ship keeps going up -- potentially a very long way -- until
 -- the props come back down to 13.
-local AP_CEIL_FLOOR = 280  -- m: cruise never goes below this; climb here first
+local AP_CEIL_FLOOR = 250  -- m: minimum flight height. The plan for an alt-less
+                            -- waypoint starts here and rises only if the ship
+                            -- proves it has the thrust to get higher.
 local AP_CEIL_LIFT = 13    -- prop speed (of hover_max_speed) at which the climb
                             -- stops. 13 leaves 2 in hand: enough to level and
                             -- to absorb a gust without sinking.
-local AP_CEIL_HARD = 450   -- m: absolute guard. Physics should stop the probe
-                           -- long before this; it only catches a mis-tuned
-                            -- hover_throttle, never a real ship.
+local AP_CEIL_HARD = 450   -- m: absolute guard on the DISCOVERY CLIMB. It is
+                            -- what the ship climbs toward while it is still
+                            -- finding out where its ceiling is. It is never an
+                            -- altitude goal: see ceilingTarget() below.
 local AP_PHASE_TIMEOUT = 45 -- s failsafe per phase (no-drag ships coast forever)
 local AP_HOVER_RANGE = 500  -- m: inside this (at enable or ANY time later,
                             -- incl. mid-cruise) the trip runs on HOVER
@@ -567,21 +571,35 @@ function Flight:pollShift(shift_value)
     return toggled
 end
 
--- The altitude the ship should actually CRUISE at.
+-- The altitude the ship PLANS to cruise at, and the number shown as the goal.
 --
--- The probe stops the climb while 2 of 15 are still in hand, so the altitude
--- it discovers is already the safe one to fly at and no extra margin is owed
--- on top of it. The only floor applied here is AP_CEIL_FLOOR: an alt-less
--- waypoint cruises at the discovered ceiling, and never below y280.
+-- This used to fall back to AP_CEIL_HARD, which made the 450 m guard a real
+-- altitude goal: a waypoint with no `alt` was sent to y450 and the HUD showed
+-- y450, because "aim high and see where the props fall short" had leaked out
+-- of the probe and into the plan. On a world with thin air the props never do
+-- fall short, so that goal could also sit at 450 indefinitely.
+--
+-- The plan now starts at AP_CEIL_FLOOR -- the minimum flight height -- and is
+-- only ever RAISED by a ceiling the ship has actually measured. The discovery
+-- climb is a separate question, answered by ceilingSeek() below.
 function Flight:ceilingTarget()
     local learned = tonumber((self.config.limits or {}).ceiling)
     -- >= not >: a ceiling learned exactly ON the floor is a real answer. With
-    -- > it fell through to AP_CEIL_HARD and the ship re-probed to 450 forever.
+    -- > it would be discarded and the ship would re-probe every run.
     if learned and learned >= AP_CEIL_FLOOR then
         -- No margin to subtract: the probe already stopped 2 prop units short
         -- of max, so the discovered altitude is itself the safe one.
         return learned
     end
+    return AP_CEIL_FLOOR
+end
+
+-- What to climb TOWARD while the ceiling is still unknown. The hard guard is
+-- correct here and only here: it is a search bound, not a destination. Once
+-- the probe measures a real ceiling this stops being used.
+function Flight:ceilingSeek()
+    local learned = tonumber((self.config.limits or {}).ceiling)
+    if learned and learned >= AP_CEIL_FLOOR then return learned end
     return AP_CEIL_HARD
 end
 
@@ -768,9 +786,16 @@ function Flight:startAutopilot(wp)
 
     local limits = self.config.limits or {}
     local alt_now = self.state.altitude or 0
-    -- Operative ceiling for this run: a learned one if we have probed it,
-    -- otherwise the absolute guard so the climb may go find out.
+    -- Two different altitudes, deliberately:
+    --   ceiling -- the PLAN: the altitude we intend to cruise at. A learned
+    --               one if we have measured it, otherwise the minimum flight
+    --               height. This is what the HUD shows as the goal.
+    --   seek    -- the DISCOVERY CLIMB: what to climb toward while the real
+    --               ceiling is still unknown. The hard guard belongs here and
+    --               only here, so the probe has room to work without the
+    --               guard ever being displayed or held as a destination.
     local ceiling = self:ceilingTarget()
+    local seek = self:ceilingSeek()
     -- CLIMB TARGET. The goal used to ramp toward the AP *ceiling* on every
     -- trip, because the waypoint's own altitude was never read: a level
     -- waypoint still sent the ship climbing, froze the goal near the top of
@@ -783,9 +808,20 @@ function Flight:startAutopilot(wp)
     -- The learned ceiling is stable once probed, so re-running a route does
     -- not re-climb; only a genuinely higher ceiling (different props, higher
     -- build limit) moves the goal again.
+    --
+    -- alt_less records WHICH of those two we are doing, because only the
+    -- alt-less case may let the discovery raise the goal later; an explicit
+    -- waypoint altitude is honoured and never overridden.
     local goal_alt = tonumber(wp.alt)
-    if not goal_alt or goal_alt ~= goal_alt then goal_alt = ceiling end
-    goal_alt = clamp(goal_alt, 0, ceiling)
+    local alt_less = (not goal_alt) or goal_alt ~= goal_alt
+    if alt_less then
+        goal_alt = ceiling
+    else
+        -- An explicit altitude is the operator's decision, so it is guarded
+        -- against absurd values but NOT clamped down to the operating ceiling:
+        -- asking for y400 in a world that allows it must still mean y400.
+        goal_alt = clamp(goal_alt, 0, AP_CEIL_HARD)
+    end
 
     self.ap = {
         name = tostring(wp.name or "WP"),
@@ -809,7 +845,8 @@ function Flight:startAutopilot(wp)
         climb_alt0 = alt_now,      -- for the stall failsafe
         climb_vi = 0,              -- leaky integral of climb-rate error
         stop_hold = 0,    -- s the arrival condition has held continuously
-        ceil = ceiling,
+        ceil = seek,
+        alt_less = alt_less,
         hover_only = start_dist < AP_HOVER_RANGE, -- short hop: hover travel
     }
     if not self.heading_valid then self:captureHeading() end
@@ -995,13 +1032,27 @@ function Flight:updateAutopilot(dt)
         -- 285, and it re-derives itself for different props, a denser world,
         -- or a re-tuned engine.
         if self:ceilingProbe(state.altitude or 0, hmax) then
-            if not tonumber((limits or {}).ceiling) then
-                ap.ceil = AP_CEIL_HARD -- still searching: keep looking
-            end
+            -- Still has thrust in hand, so it is still climbing to find out
+            -- where the ceiling is. Keep seeking toward the hard guard: that is
+            -- the search, and the guard is never shown as the goal.
+            ap.ceil = self:ceilingSeek()
         else
+            -- Measured: this altitude IS the ceiling (2 prop units still in
+            -- hand, so no margin is subtracted). Adopt it as the operative
+            -- ceiling, and -- for an alt-less waypoint only -- as the plan, so
+            -- the ship cruises where it discovered it can fly. An explicit
+            -- waypoint altitude is the operator's decision and is left alone.
             ap.ceil = self:ceilingTarget()
-            ap.goal_alt = math.min(ap.goal_alt, ap.ceil)
-            if ap.alt and ap.alt > ap.ceil then ap.alt = ap.ceil end
+            if ap.alt_less then
+                ap.goal_alt = ap.ceil
+                if ap.alt and ap.alt > ap.ceil then ap.alt = ap.ceil end
+            elseif ap.goal_alt > ap.ceil then
+                -- An explicit altitude ABOVE what the ship can actually reach
+                -- (9999, or 400 in a thin world) converges on the measured
+                -- ceiling now that we know it. An explicit altitude at or
+                -- below it is untouched, so "land at y90" still means y90.
+                ap.goal_alt = ap.ceil
+            end
         end
 
         if ap.step ~= "turn" then
@@ -1020,7 +1071,18 @@ function Flight:updateAutopilot(dt)
             end
             if ap.step == "climb" then
                 -- === CLIMB: fixed target, constant-rate transit, braked arrival ===
-                local target = math.min(ap.goal_alt, ap.ceil)
+                -- Which altitude the climb is chasing depends on which of the
+                -- two questions this waypoint asked:
+                --   alt-less  -> chase ap.ceil, the DISCOVERY climb. While the
+                --                 ceiling is unknown that is the hard guard, so
+                --                 the ship keeps rising until the props come
+                --                 back down to 13; the moment a ceiling is
+                --                 measured, ap.ceil becomes it and the climb
+                --                 settles there. This is the only path on
+                --                 which the 450 guard is ever a target.
+                --   explicit  -> chase ap.goal_alt, the operator's altitude,
+                --                 untouched by any of the above.
+                local target = ap.alt_less and ap.ceil or ap.goal_alt
                 local rate = state.climb_rate or 0
                 local remain = target - (state.altitude or 0)
 
@@ -2437,11 +2499,31 @@ function Flight:getStatus()
         ap = self.ap and {
             name = self.ap.name,
             phase = self.ap.phase,
+            -- step matters as well as phase: "aim" covers TWO legs of the
+            -- sequence (climb, then turn) and the HUD's phase readout needs to
+            -- tell them apart.
+            step = self.ap.step,
             dist = self.ap.dist,
             progress = self.ap.progress,
             eta = self.ap.eta,
             speed = self.ap.speed,
             paused = self.ap.paused,
+            -- signed bearing error to the waypoint (deg). The HUD shows this
+            -- because a bank-to-turn loop that is not tracking the bearing is
+            -- the first thing worth looking at when a cruise leg misbehaves.
+            err = self.ap.err,
+            heading = self.ap.heading,
+            alt = self.ap.alt,
+            -- The PLAN: the altitude the run intends to cruise at. Exposed
+            -- because the vertical law's targets.altitude is fed from the climb
+            -- COMMAND, which for an alt-less waypoint is the discovery climb
+            -- toward the 450 m guard until a ceiling is measured. Showing that
+            -- to the pilot as "target altitude" is the y450 readout this
+            -- replaces; the HUD shows goal_alt instead.
+            goal_alt = self.ap.goal_alt,
+            -- The operative ceiling: the guard while still searching, the
+            -- measured altitude once known. Diagnostic only.
+            ceil = self.ap.ceil,
         } or nil,
         pid_gains = {
             altitude = self.pid.altitude:getGains(),

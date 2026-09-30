@@ -289,16 +289,25 @@ end
 
 -- --------------------------------------------------------------- tests
 -- 1. A WAYPOINT WITH NO ALTITUDE CLIMBS TO THE CEILING, and the ceiling is
---    DISCOVERED from the props rather than hardcoded. y280 is a FLOOR: the
---    climb continues past it for as long as the lift props are still turning
---    faster than 13, and stops when they reach 13.
+--    DISCOVERED from the props rather than hardcoded. y250 is the MINIMUM
+--    FLIGHT HEIGHT: it is where the plan starts, and the climb continues past
+--    it for as long as the lift props are still turning faster than 13,
+--    stopping when they reach 13.
 --
---    In THIS plant that is the floor, not something above it: the density
---    model puts the props at ~14.9 of 15 by y280, so they have already passed
---    13 and the climb stops on arrival at the floor. The "keep going because
---    the props are still at 5" half of the policy cannot show up here at all --
---    this pressure curve has no altitude above 280 where demand is that low --
---    so it is checked directly in test 7 against posed thrust instead.
+--    The plan and the discovery climb are deliberately different numbers. The
+--    PLAN (ap.goal_alt, the altitude shown as the goal) starts at the floor
+--    and is only ever raised by a ceiling the ship has measured. The
+--    DISCOVERY CLIMB (ap.ceil) starts at the 450 m hard guard so the probe
+--    has room to work, and is never displayed or held as a destination. The
+--    bug this replaced: the guard leaked into the plan, so an alt-less
+--    waypoint was sent to y450 and the HUD showed y450.
+--
+--    In THIS plant the discovery settles just above the floor: the density
+--    model already needs ~14.9 of 15 by y250, so the climb stops a few metres
+--    after the floor. The "keep going because the props are still at 5" half
+--    of the policy cannot show up here at all -- this pressure curve has no
+--    altitude above the floor where demand is that low -- so it is checked
+--    directly in test 7 against posed thrust instead.
 do
     local env = makeEnv({ alt0 = 60 })
     local f = env.flight
@@ -306,8 +315,14 @@ do
     check("level: startAutopilot accepts the trip", ok, ok and nil or "rejected")
     check("level: a waypoint with no alt asks to climb",
         f.ap.needs_climb == true, "needs_climb=" .. tostring(f.ap.needs_climb))
-    check("level: target starts above the 280 floor, not at the ceiling",
-        f.ap.goal_alt >= 280, f.ap.goal_alt)
+    -- The whole point of the plan/seek split: the GOAL is the floor, and the
+    -- 450 guard is nowhere near it.
+    check("level: goal starts at the 250 floor, not the 450 guard",
+        f.ap.goal_alt == 250, f.ap.goal_alt)
+    check("level: goal is never the hard guard",
+        f.ap.goal_alt < 450, f.ap.goal_alt)
+    check("level: the discovery climb is what seeks the guard",
+        f.ap.ceil == 450, f.ap.ceil)
 
     local peak, okAll, t = -1e9, true, 0
     for i = 1, 14000 do                     -- 700 s: the last stretch is slow
@@ -319,18 +334,64 @@ do
         if f.landed or f.shutdown_request then break end
     end
     check("level: altitude stays finite", okAll)
-    check("level: cleared the 280 floor",
-        peak >= 280, string.format("peak=%.1f", peak))
+    check("level: cleared the 250 floor",
+        peak >= 250, string.format("peak=%.1f", peak))
     -- The probe must stop on or just above the floor -- never below it, and
     -- never past the point where the props ran out.
     check("level: stopped on the ceiling it discovered",
-        peak >= 280 and peak < 300, string.format("peak=%.1f", peak))
+        peak >= 250 and peak < 300, string.format("peak=%.1f", peak))
     check("level: learned the ceiling for later runs",
-        (f.config.limits.ceiling or -1) >= 280
+        (f.config.limits.ceiling or -1) >= 250
             and (f.config.limits.ceiling or 1e9) < 300,
         "limits.ceiling=" .. tostring(f.config.limits.ceiling))
     print(string.format("level trip: peak=%.2f learned=%.1f t=%.0fs",
         peak, f.config.limits.ceiling or -1, t))
+end
+
+-- 1b. getStatus() EXPOSES EVERY FIELD THE A/P SCREEN READS.
+-- The HUD renders distance, progress, the phase/step pair, bearing error and
+-- the pause flag straight out of getStatus(). A field that is present on
+-- Flight.ap but missing here shows up in-game as a blank or "--" on a live
+-- screen, and no flight test would catch it.
+do
+    local env = makeEnv({ alt0 = 60 })
+    local f = env.flight
+    local s0 = f:getStatus()
+    check("getStatus: ap is nil when no run is active", s0.ap == nil, type(s0.ap))
+
+    local ok = f:startAutopilot{ name = "TELE", x = 900, z = 0, heading = 0, alt = 90 }
+    check("getStatus: waypoint accepted", ok, ok and nil or "rejected")
+
+    local seen_step, seen_phase, seen_eta, err_seen
+    for i = 1, 400 do
+        env.step()
+        local s = f:getStatus()
+        if s.ap then
+            local a = s.ap
+            if type(a.phase) ~= "string" then seen_phase = a.phase end
+            if type(a.step) ~= "string" and type(a.step) ~= "nil" then seen_step = a.step end
+            if a.eta ~= nil and type(a.eta) ~= "number" then seen_eta = a.eta end
+            if finite(a.dist) and finite(a.progress) and finite(a.err)
+               and finite(a.heading) and finite(a.alt) and finite(a.speed) then
+                err_seen = true
+            end
+            check("getStatus: phase is a string the HUD can map",
+                a.phase == "aim" or a.phase == "cruise" or a.phase == "correct"
+                or a.phase == "arrive" or a.phase == "align" or a.phase == "land",
+                tostring(a.phase))
+            check("getStatus: name is a string", type(a.name) == "string", type(a.name))
+            check("getStatus: progress is 0..1",
+                a.progress >= 0 and a.progress <= 1, a.progress)
+            check("getStatus: paused is a boolean", type(a.paused) == "boolean",
+                type(a.paused))
+            break
+        end
+    end
+    check("getStatus: ap exposes finite dist/progress/err/heading/alt/speed",
+        err_seen == true)
+    print(string.format("getStatus telemetry: phase=%s step=%s dist=%.1f progress=%.2f err=%.1f",
+        tostring(f.ap and f.ap.phase), tostring(f.ap and f.ap.step),
+        f.ap and f.ap.dist or -1, f.ap and f.ap.progress or -1, f.ap and f.ap.err or -1))
 end
 
 -- 2. EXPLICIT WAYPOINT ALTITUDE IS HONOURED AND NOT OVERSHOT.
@@ -360,6 +421,72 @@ do
     print(string.format("wp.alt trip: peak=%.2f held=%.2f", peak, settled_alt or -1))
 end
 
+-- 2b. THE 450 GUARD IS NEVER AN ALTITUDE GOAL.
+--
+--     Reported from the real ship: the autopilot set its altitude goal to
+--     y450 when climbing. Root cause: ceilingTarget() doubled as both "the
+--     altitude we plan to cruise at" and "what to climb toward while we are
+--     still finding out". With one number, "nothing learned yet" had to answer
+--     AP_CEIL_HARD so the probe had somewhere to go -- and that 450 was handed
+--     straight to the pilot as the goal. In a world with thin air the props
+--     never fall short, so it could also sit at 450 indefinitely.
+--
+--     These assert the split, and the two behaviours it has to keep straight:
+--     an alt-less waypoint may have its goal RAISED by a real measurement, and
+--     an explicit altitude may never be raised by anything.
+do
+    local env = makeEnv({ alt0 = 60 })
+    local f = env.flight
+
+    -- (a) fresh world: plan is the floor, only the seek touches the guard.
+    f.config.limits.ceiling = nil
+    f:startAutopilot{ name = "A", x = 800, z = 0, heading = 0 }
+    check("guard: an alt-less goal starts at the 250 floor",
+        f.ap.goal_alt == 250, f.ap.goal_alt)
+    check("guard: an alt-less goal is never the 450 guard",
+        f.ap.goal_alt ~= 450, f.ap.goal_alt)
+    check("guard: the discovery climb is the one that uses the guard",
+        f.ap.ceil == 450, f.ap.ceil)
+    check("guard: the trip is flagged alt-less so the probe may steer it",
+        f.ap.alt_less == true, tostring(f.ap.alt_less))
+
+    -- (b) a HIGH learned ceiling may raise an alt-less goal -- this is the
+    --     thin-air world the operator described: keep climbing until the props
+    --     come back to 13, then cruise there.
+    f.ap = nil
+    f.config.limits.ceiling = 6000
+    f:startAutopilot{ name = "B", x = 800, z = 0, heading = 0 }
+    check("guard: a measured ceiling raises an alt-less goal",
+        f.ap.goal_alt == 6000, f.ap.goal_alt)
+
+    -- (c) an EXPLICIT altitude is the operator's decision and is never raised
+    --     by a high ceiling. This is the branch most likely to regress: the
+    --     probe runs on every phase of every run, including this one.
+    f.ap = nil
+    f:startAutopilot{ name = "C", x = 800, z = 0, heading = 0, alt = 90 }
+    check("guard: an explicit altitude is not raised to the ceiling",
+        f.ap.goal_alt == 90, f.ap.goal_alt)
+    check("guard: an explicit waypoint is not flagged alt-less",
+        f.ap.alt_less == false, tostring(f.ap.alt_less))
+    for _ = 1, 400 do env.step() end
+    check("guard: an explicit altitude survives the probe running",
+        f.ap and f.ap.goal_alt == 90, f.ap and f.ap.goal_alt or "landed")
+
+    -- (d) an explicit altitude ABOVE what the ship can reach converges DOWN
+    --     onto the measured ceiling rather than sitting at the guard.
+    f.ap = nil
+    f.config.limits.ceiling = 256
+    f:startAutopilot{ name = "D", x = 800, z = 0, heading = 0, alt = 9999 }
+    check("guard: an unreachable explicit altitude clamps to the guard",
+        f.ap.goal_alt == 450, f.ap.goal_alt)
+    for _ = 1, 600 do env.step() end
+    check("guard: then converges onto the measured ceiling, not the guard",
+        f.ap and f.ap.goal_alt ~= 450 and f.ap.goal_alt <= 300,
+        f.ap and f.ap.goal_alt or "landed")
+
+    f.config.limits.ceiling = nil
+end
+
 -- 3. CEILING IS RESPECTED as a hard clamp on the climb target.
 do
     local env = makeEnv({ alt0 = 100 })
@@ -377,23 +504,22 @@ do
     -- ceiling, and the probe stops it there.
     check("ceiling: never exceeds the physical ceiling",
         env.plant.alt <= 300, string.format("alt=%.1f", env.plant.alt))
-    -- The old code hard-capped the goal at 285, so "beat 285" used to be the
-    -- proxy for "this is discovered, not hardcoded". Assert the thing itself
-    -- instead: a ceiling was LEARNED, and it is above that old constant. That
-    -- is strictly stronger than the proxy and cannot rot when the margin below
-    -- the ceiling changes.
+    -- An explicit altitude far above anything reachable must converge on the
+    -- MEASURED ceiling once the probe has found it, not stay pinned at the
+    -- 450 guard.
     local learned = tonumber((f.config.limits or {}).ceiling)
-    check("ceiling: discovered a ceiling, not the old hardcoded 285",
-        learned ~= nil and learned >= 280 and learned <= 300,
+    check("ceiling: discovered a ceiling, not a hardcoded constant",
+        learned ~= nil and learned >= 250 and learned <= 300,
         string.format("learned=%s", tostring(learned)))
-    -- The commanded cruise target must sit on or above the 280 floor. What the
-    -- ship then ACHIEVES is physics: by y280 this plant needs ~14.9 of 15 just
-    -- to hold, so it hunts a little under the target rather than sitting on
-    -- it, and the tolerance below reflects that thin margin rather than
-    -- hiding it.
+    -- The commanded cruise target must sit on or above the 250 floor and below
+    -- the guard. What the ship then ACHIEVES is physics: by the floor this
+    -- plant needs ~14.9 of 15 just to hold, so it hunts a little under the
+    -- target rather than sitting on it, and the tolerance below reflects that
+    -- thin margin rather than hiding it.
     local target = f.ap and (f.ap.goal_alt or -1) or -1
-    check("ceiling: cruise target is on or above the 280 floor",
-        target >= 280 and target <= 300, string.format("target=%.1f", target))
+    check("ceiling: cruise target is the measured ceiling, not the guard",
+        target >= 250 and target <= 300 and target < 450,
+        string.format("target=%.1f", target))
     check("ceiling: held the discovered ceiling",
         math.abs(env.plant.alt - target) <= 8,
         string.format("alt=%.1f target=%.1f", env.plant.alt, target))
@@ -433,7 +559,7 @@ do
             -- Once it has reached the ceiling, judge the HOLD, not the climb.
             -- An alt-less waypoint means "cruise at the operating ceiling",
             -- so the altitude to hold is discovered, not 60.
-            if env.plant.alt >= 280 then
+            if env.plant.alt >= 250 then
                 hold_min, hold_max = math.min(hold_min, env.plant.alt),
                     math.max(hold_max, env.plant.alt)
             end
@@ -453,10 +579,10 @@ do
         string.format("maxdist=%.0f", maxd))
     -- vertical channel: this IS trustworthy, so assert it hard
     check("trip: an alt-less waypoint climbs to the operating ceiling",
-        altmax >= 280 and altmax <= 300,
+        altmax >= 250 and altmax <= 300,
         string.format("peak alt %.1f", altmax))
     check("trip: held the ceiling in transit (no sag, no runaway)",
-        hold_max > 0 and hold_min >= 280 and hold_max <= 300,
+        hold_max > 0 and hold_min >= 250 and hold_max <= 300,
         string.format("hold %.1f..%.1f", hold_min, hold_max))
     check("trip: completed and landed at the waypoint", landed,
         "did not reach a terminal state")
@@ -550,7 +676,7 @@ end
 --    lift-prop-speed) pair can be reproduced by solving for the throttle.
 --    This is the case that matters on a world where the player has terrain and
 --    builds high -- denser air up there, props still turning at 5 on reaching
---    y280, and the ship has to keep going.
+--    y250, and the ship has to keep going.
 do
     local env = makeEnv({ alt0 = 100 })
     local f = env.flight
@@ -563,15 +689,15 @@ do
     end
 
     check("policy: below the floor it just climbs",
-        probeAt(279, 5) == true)
-    check("policy: y280 is a floor, not a ceiling (props at 5 -> keep going)",
-        probeAt(280, 5) == true)
+        probeAt(249, 5) == true)
+    check("policy: y250 is a floor, not a ceiling (props at 5 -> keep going)",
+        probeAt(250, 5) == true)
     check("policy: props at 12.9 still count as room to climb",
-        probeAt(280, 12.99) == true)
+        probeAt(250, 12.99) == true)
     check("policy: props at 13 stop the climb",
-        probeAt(280, 13) == false)
+        probeAt(250, 13) == false)
     check("policy: recorded the floor as this world's ceiling",
-        math.abs((lim.ceiling or -1) - 280) < 1e-6,
+        math.abs((lim.ceiling or -1) - 250) < 1e-6,
         string.format("ceiling=%s", tostring(lim.ceiling)))
 
     -- a fresh world, this time one that goes up for a very long way
@@ -586,12 +712,22 @@ do
     check("policy: cruises at the altitude it discovered",
         math.abs(f:ceilingTarget() - 6000) < 1e-6, f:ceilingTarget())
 
+    -- The plan/seek split. This is the bug the whole change exists to fix:
+    -- with one number for both jobs, "nothing learned yet" had to answer 450
+    -- (so the probe had somewhere to go) and that 450 became the altitude
+    -- GOAL the pilot saw. Two numbers keep each answer honest.
     lim.ceiling = nil
-    check("policy: nothing learned yet -> hard guard, so it probes",
-        f:ceilingTarget() == 450, f:ceilingTarget())
-    lim.ceiling = 280
+    check("policy: nothing learned yet -> the PLAN is the minimum flight height",
+        f:ceilingTarget() == 250, f:ceilingTarget())
+    check("policy: nothing learned yet -> the SEEK is the hard guard",
+        f:ceilingSeek() == 450, f:ceilingSeek())
+    check("policy: the plan is never the hard guard",
+        f:ceilingTarget() ~= f:ceilingSeek(), f:ceilingTarget())
+    lim.ceiling = 250
     check("policy: a ceiling exactly on the floor is honoured",
-        f:ceilingTarget() == 280, f:ceilingTarget())
+        f:ceilingTarget() == 250, f:ceilingTarget())
+    check("policy: a learned ceiling is also the seek target",
+        f:ceilingSeek() == 250, f:ceilingSeek())
     lim.hover_throttle = HOVER_T
 end
 
