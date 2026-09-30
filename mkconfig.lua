@@ -3,7 +3,11 @@
 -- Wiring (which modem has which relay) is still done by `startup`.
 
 local DEFAULT_LIMITS = {
-    max_speed = 80, max_altitude = 320, min_altitude = 0,
+    -- max_altitude is an operator safety cap, NOT the flight ceiling. The real
+    -- ceiling depends on hover_throttle, hover_max_speed and how dense the
+    -- world's air is at altitude, so the autopilot discovers it at runtime:
+    -- climb past the 280 floor until the lift props are down to 13.
+    max_speed = 80, max_altitude = 450, min_altitude = 0,  -- operator safety cap only; the flight ceiling is discovered at runtime
     max_tilt = 15, max_climb_rate = 10, max_descent_rate = 5,
     hover_speed = 2, tilt_max = 12, hover_min_speed = 0, hover_max_speed = 15,
     hover_throttle = 6,
@@ -19,7 +23,6 @@ local DEFAULT_PID = {
     pitch    = { kp = 2.0, ki = 0.0, kd = 1.0, integral_limit = 5, output_limit = 6 },
     roll     = { kp = 2.0, ki = 0.0, kd = 1.0, integral_limit = 5, output_limit = 6 },
     yaw      = { kp = 2.2, ki = 0.0, kd = 1.4, integral_limit = 5, output_limit = 15 },
-    speed    = { kp = 0.15, ki = 0.04, kd = 0.0, integral_limit = 40, output_limit = 15 },
 }
 
 local function title(s)
@@ -94,7 +97,6 @@ local feats = {
     gear = askYN("Landing gear", true),
     auto_land = askYN("Auto-landing (L key)", true),
     cruise_mode = askYN("Cruise mode (hover <-> cruise)", true),
-    auto_tune = askYN("Altitude PID auto-tune", true),
     engine_auto_start = askYN("Engine auto-start on boot", false),
     clutch = askYN("Clutch (paired with engine relay)", false),
     fuel_level = askYN("Fuel gauge (reserved, leave off)", false),
@@ -217,7 +219,7 @@ w("")
 w("    computer_offset = { x = " .. offset.x .. ", y = " .. offset.y .. ", z = " .. offset.z .. " },")
 w("")
 w("    features = {")
-    for _, k in ipairs({ "hud", "gear", "auto_land", "cruise_mode", "auto_tune",
+    for _, k in ipairs({ "hud", "gear", "auto_land", "cruise_mode",
         "engine_auto_start", "clutch", "fuel_level", "rear_reverse" }) do
         w("        " .. k .. " = " .. tostring(feats[k]) .. ",")
     end
@@ -291,7 +293,7 @@ w("    limits = {")
 w("    },")
 w("")
 w("    pid = {")
-    for _, k in ipairs({ "altitude", "pitch", "roll", "yaw", "speed" }) do
+    for _, k in ipairs({ "altitude", "pitch", "roll", "yaw" }) do
         local p = DEFAULT_PID[k]
         local extra = ""
         if p.d_on_measurement then

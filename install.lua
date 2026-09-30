@@ -4,7 +4,11 @@
 --
 -- After install, run: startup
 
-local BASE_URL = "https://raw.githubusercontent.com/Artmoby7674/aeronautics_artcorp_os/master"
+-- Pinned ref (commit SHA on origin/master). NEVER install from "master":
+-- a moving branch silently changes what ships get, and a half-updated
+-- install is a broken ship. Bump REF deliberately when releasing.
+local REF = "166f7d4ce31b4eb07214b8e8701411e4fef465e1"
+local BASE_URL = "https://raw.githubusercontent.com/Artmoby7674/aeronautics_artcorp_os/" .. REF
 
 local files = {
     "startup",
@@ -36,7 +40,7 @@ for _, f in ipairs(files) do
 end
 print("")
 print("Files will be downloaded from:")
-print("  " .. BASE_URL)
+print("  ref " .. REF)
 print("")
 write("Continue? [Y/n] ")
 local answer = read()
@@ -54,54 +58,96 @@ if not ok_http then
     return
 end
 
-local installed = 0
-local failed = 0
+-- Phase 1: download EVERYTHING into memory first. Nothing is written
+-- until every file is verified, so a network failure can never leave a
+-- half-updated install (the classic "one stale lib among new ones" boot).
+local downloaded = {}
+local failures = {}
 
 for _, filepath in ipairs(files) do
     local url = BASE_URL .. "/" .. filepath
-    io.write("  Downloading " .. filepath .. "... ")
+    io.write("  Downloading " .. filepath:sub(1, 40) .. "... ")
 
     local response, err = http.get(url)
-    if response then
+    if not response then
+        print("FAILED (" .. tostring(err) .. ")")
+        table.insert(failures, filepath .. ": " .. tostring(err))
+    else
+        local code = nil
+        if response.getResponseCode then
+            local okc, c = pcall(response.getResponseCode)
+            if okc then code = c end
+        end
         local content = response.readAll()
         response.close()
 
-        if content then
-            local dir = filepath:match("(.*/)")
-            if dir then
-                fs.makeDir(dir)
-            end
-
-            local f = io.open(filepath, "w")
-            if f then
-                f:write(content)
-                f:close()
-                print("OK")
-                installed = installed + 1
-            else
-                print("FAILED (write error)")
-                failed = failed + 1
-            end
-        else
-            print("FAILED (empty response)")
-            failed = failed + 1
+        -- Integrity: HTTP 200, non-empty, and not an error page. CC never
+        -- returns HTML from raw.githubusercontent, so "<" at the start is
+        -- always a CDN/proxy error page.
+        local bad = nil
+        if code and code ~= 200 then
+            bad = "HTTP " .. tostring(code)
+        elseif not content or #content == 0 then
+            bad = "empty response"
+        elseif #content < 40 then
+            bad = "suspiciously short (" .. #content .. " bytes)"
+        elseif content:sub(1, 1) == "<" then
+            bad = "got HTML instead of Lua"
         end
-    else
-        print("FAILED (" .. tostring(err) .. ")")
-        failed = failed + 1
+        if bad then
+            print("REJECTED (" .. bad .. ")")
+            table.insert(failures, filepath .. ": " .. bad)
+        else
+            print("OK (" .. #content .. " bytes)")
+            downloaded[filepath] = content
+        end
     end
-
     sleep(0.2)
 end
 
+-- Phase 2: any failure at all = abort loudly with NOTHING written.
+-- Re-run install after the connection is fixed; a partial install is
+-- worse than none (mismatched libs fail in confusing ways mid-boot).
 print("")
 print("=============================")
-if installed > 0 then
-    print("  Installed " .. installed .. " files!")
+if #failures > 0 then
+    print("  INSTALL ABORTED - " .. #failures .. " of " .. #files .. " files failed:")
+    for _, f in ipairs(failures) do
+        print("    " .. f)
+    end
+    print("")
+    print("  NO files were written. Check the connection / ref, then")
+    print("  re-run install. Do NOT run startup on a partial install.")
+    print("=============================")
+    return
 end
-if failed > 0 then
-    print("  " .. failed .. " files failed.")
+
+local written = 0
+local write_failures = {}
+for _, filepath in ipairs(files) do
+    local dir = filepath:match("(.*/)")
+    if dir then
+        pcall(fs.makeDir, dir)
+    end
+    local f = io.open(filepath, "w")
+    if not f then
+        table.insert(write_failures, filepath)
+    else
+        f:write(downloaded[filepath])
+        f:close()
+        written = written + 1
+    end
 end
-print("")
-print("  Run 'startup' to begin.")
+
+print("  Installed " .. written .. "/" .. #files .. " files from ref " .. REF:sub(1, 8) .. ".")
+if #write_failures > 0 then
+    print("  WRITE FAILURES (disk full / permissions?):")
+    for _, f in ipairs(write_failures) do
+        print("    " .. f)
+    end
+    print("  Partial write - re-run install before starting.")
+else
+    print("")
+    print("  Run 'startup' to begin.")
+end
 print("=============================")

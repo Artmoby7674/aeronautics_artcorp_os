@@ -2,6 +2,16 @@ local Hardware = {}
 local config = nil
 local devices = {}
 
+-- Last value actually sent per relay pin ("relayName:side"). applyOutputs
+-- runs at 20 Hz and most channels are steady, so identical writes are
+-- skipped — this is the per-tick peripheral (main-thread task) budget of
+-- the whole control loop. Invalidated whenever devices are re-wrapped.
+local out_cache = {}
+
+function Hardware.invalidateOutputs()
+    out_cache = {}
+end
+
 function Hardware.init(cfg)
     config = cfg
 end
@@ -66,6 +76,7 @@ function Hardware.connect()
     end
 
     devices = connected
+    out_cache = {} -- re-wrapped peripherals may have missed state changes
     return connected, missing
 end
 
@@ -117,9 +128,9 @@ function Hardware.readInputs()
         local relay = devices[relayKey]
         if relay then
             for key, side in pairs(sides) do
-                local success, val = pcall(function()
-                    return relay.getAnalogInput(side)
-                end)
+                -- pcall(fn, arg) instead of a per-channel closure: this runs
+                -- every 20 Hz tick and allocates nothing per call
+                local success, val = pcall(relay.getAnalogInput, side)
                 keys[key] = success and val or 0
             end
         end
@@ -137,9 +148,7 @@ function Hardware.getProximity()
     if not prox then return 0 end
     local relay = devices[prox.input_key]
     if not relay then return 0 end
-    local ok, val = pcall(function()
-        return relay.getAnalogInput(prox.side)
-    end)
+    local ok, val = pcall(relay.getAnalogInput, prox.side)
     if not ok or type(val) ~= "number" then return 0 end
     return math.max(0, math.min(15, math.floor(val)))
 end
@@ -150,9 +159,10 @@ function Hardware.setGear(deployed)
     local relay = devices[g.relay]
     if not relay then return false end
     local value = deployed and (g.deploy or 15) or (g.retract or 0)
-    local ok = pcall(function()
-        relay.setAnalogOutput(g.side, value)
-    end)
+    local cache_key = g.relay .. ":" .. g.side
+    if out_cache[cache_key] == value then return true end
+    local ok = pcall(relay.setAnalogOutput, g.side, value)
+    if ok then out_cache[cache_key] = value end
     return ok
 end
 
@@ -174,9 +184,12 @@ function Hardware.setPropellerOutput(prop, side, value)
         value = 15 - value
     end
 
-    local success = pcall(function()
-        relay.setAnalogOutput(relaySide, value)
-    end)
+    -- Steady-state skip: only touch the peripheral when the pin actually
+    -- changes (failures are never cached, so they retry next tick)
+    local cache_key = mapping.relay .. ":" .. relaySide
+    if out_cache[cache_key] == value then return true end
+    local success = pcall(relay.setAnalogOutput, relaySide, value)
+    if success then out_cache[cache_key] = value end
 
     return success
 end
@@ -198,9 +211,10 @@ function Hardware.setRearOutput(direction, value)
     -- Invert at the wire: more speed = less redstone signal.
     value = 15 - value
 
-    local success = pcall(function()
-        relay.setAnalogOutput(relaySide, value)
-    end)
+    local cache_key = mapping.relay .. ":" .. relaySide
+    if out_cache[cache_key] == value then return true end
+    local success = pcall(relay.setAnalogOutput, relaySide, value)
+    if success then out_cache[cache_key] = value end
 
     return success
 end
@@ -212,9 +226,11 @@ function Hardware.setRearReverse(on)
     if not mapping or not mapping.rev then return false end
     local relay = devices[mapping.relay]
     if not relay then return false end
-    local ok = pcall(function()
-        relay.setAnalogOutput(mapping.rev, on and 15 or 0)
-    end)
+    local value = on and 15 or 0
+    local cache_key = mapping.relay .. ":" .. mapping.rev
+    if out_cache[cache_key] == value then return true end
+    local ok = pcall(relay.setAnalogOutput, mapping.rev, value)
+    if ok then out_cache[cache_key] = value end
     return ok
 end
 
@@ -230,18 +246,18 @@ function Hardware.setLiftReverse(on)
 end
 
 function Hardware.cutAllOutputs()
+    -- Route through the cached setters (same wire values: thrust 0 -> signal
+    -- 15) so the every-tick power-off/estop hammer becomes a steady-state
+    -- no-op once the pins are at their cut values.
     for prop, mapping in pairs(config.output_map or {}) do
-        local relay = devices[mapping.relay]
-        if relay then
-            pcall(function()
-                if mapping.tilt_fwd then relay.setAnalogOutput(mapping.tilt_fwd, 0) end
-                if mapping.tilt_bwd then relay.setAnalogOutput(mapping.tilt_bwd, 0) end
-                -- Speed is inverted slow-down: 15 = fully braked / props stopped
-                if mapping.speed    then relay.setAnalogOutput(mapping.speed, 15) end
-                -- Rear fw/bw use the same inverted slow-down wiring (15 = stopped)
-                if mapping.fw       then relay.setAnalogOutput(mapping.fw, 15) end
-                if mapping.bw       then relay.setAnalogOutput(mapping.bw, 15) end
-            end)
+        if prop == "REAR" then
+            if mapping.fw then Hardware.setRearOutput("fw", 0) end
+            if mapping.bw then Hardware.setRearOutput("bw", 0) end
+        else
+            if mapping.tilt_fwd then Hardware.setPropellerOutput(prop, "tilt_fwd", 0) end
+            if mapping.tilt_bwd then Hardware.setPropellerOutput(prop, "tilt_bwd", 0) end
+            -- Speed is inverted slow-down: thrust 0 -> device signal 15
+            if mapping.speed then Hardware.setPropellerOutput(prop, "speed", 0) end
         end
     end
     -- Propulsion safety: never leave starter high from a cut

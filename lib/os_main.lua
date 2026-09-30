@@ -12,6 +12,14 @@ local function loadLib(name)
     error(mod, 0)
 end
 
+-- Timestamp prefix for log lines. Declared up front because the boot
+-- sequence below calls OS.doAction("apcancel") during startup, which is
+-- before the old declaration position was reached -> it resolved to a nil
+-- global and threw "attempt to call a nil value (global 'ts')".
+local function ts()
+    return string.format("[%02.0f]", os.clock())
+end
+
 local Flight = loadLib("lib.flight")
 local Hardware = loadLib("lib.hardware")
 local Rec = loadLib("lib.record")
@@ -57,7 +65,7 @@ local function pidFilePath()
     return "config/pid_" .. slot .. ".lua"
 end
 
-local PID_NAMES = { "altitude", "pitch", "roll", "yaw", "speed" }
+local PID_NAMES = { "altitude", "pitch", "roll", "yaw" }
 
 local function loadPidGains()
     local path = pidFilePath()
@@ -80,26 +88,6 @@ local function loadPidGains()
     return any, path
 end
 
-function OS.savePidGains()
-    if not flight then return false end
-    local path = pidFilePath()
-    local f = io.open(path, "w")
-    if not f then
-        print("  WARN: cannot write " .. path)
-        return false
-    end
-    f:write("-- Auto-tuned PID gains (ArtCorpOS). Delete to re-run auto-tune.\nreturn {\n")
-    for _, name in ipairs(PID_NAMES) do
-        local g = flight.pid[name]:getGains()
-        f:write(string.format("  %s = { kp = %.4f, ki = %.4f, kd = %.4f },\n",
-            name, g.kp or 0, g.ki or 0, g.kd or 0))
-    end
-    f:write("}\n")
-    f:close()
-    print("  PID gains saved: " .. path)
-    return true
-end
-
 function OS.start(cfg, hardware)
     config = cfg
     hw = hardware
@@ -109,22 +97,15 @@ function OS.start(cfg, hardware)
 
     print("Initializing flight controller...")
     flight = Flight.new(config, hw)
-    flight.onTuneComplete = function(ok)
-        if ok then OS.savePidGains() end
-    end
     flight.onGearAutoDeploy = function(prox)
         status_message = "PROX " .. tostring(prox) .. " - GEAR DOWN"
         status_time = os.clock()
         print("[" .. string.format("%.0f", os.clock()) .. "] gear auto-deploy (prox=" .. tostring(prox) .. ")")
     end
 
-    -- Load saved PID gains, or arm auto-tune if the file is missing
-    -- (first boot, or someone deleted config/pid_<slot>.lua).
-    -- Armed AFTER landed/gear init below so requestAutoTune sees real state.
-    local pid_loaded, pid_path = false, nil
-    if hasFeature("auto_tune") then
-        pid_loaded, pid_path = loadPidGains()
-    end
+    -- Load saved PID gains from config/pid_<slot>.lua if present
+    -- (manual override file; without it the config.pid gains apply).
+    local pid_loaded, pid_path = loadPidGains()
 
     local state = hw.getShipState()
     flight.targets.altitude = state.altitude
@@ -158,14 +139,11 @@ function OS.start(cfg, hardware)
         flight.land_state = Flight.LAND_IDLE
     end
 
-    -- Arm auto-tune only now that landed/mode are known
-    if hasFeature("auto_tune") then
-        if pid_loaded then
-            print("  PID gains loaded: " .. tostring(pid_path))
-        else
-            print("  PID file missing (" .. tostring(pid_path) .. ") - auto-tune armed")
-            flight:requestAutoTune()
-        end
+    -- Report which gains are active (override file vs config defaults)
+    if pid_loaded then
+        print("  PID gains loaded: " .. tostring(pid_path))
+    else
+        print("  PID file missing (" .. tostring(pid_path) .. ") - using config.pid gains")
     end
 
     hw.setAllSpeed(0)
@@ -231,7 +209,6 @@ function OS.start(cfg, hardware)
         (feats.clutch and " clutch" or "") ..
         (feats.auto_land and " auto-land" or "") ..
         (feats.cruise_mode and " cruise" or "") ..
-        (feats.auto_tune and " auto-tune" or "") ..
         (feats.fuel_level and " fuel" or ""))
     print("Power: OFF (splash) — tap boot to start sequence")
     print("")
@@ -246,7 +223,6 @@ function OS.start(cfg, hardware)
     local ctrl = "  Actions (monitor ACTIONS tab):"
     if hasFeature("auto_land") then ctrl = ctrl .. " land" end
     if hasFeature("gear") then ctrl = ctrl .. " gear" end
-    if hasFeature("auto_tune") then ctrl = ctrl .. " tune" end
     ctrl = ctrl .. " mode  e-stop  reset  tabs"
     print(ctrl)
     print("  Red circle (top-left) - shutdown (decouples clutch)")
@@ -265,14 +241,56 @@ function OS.mainLoop(controlTimer)
             OS.handleKey(param1, param2)
         elseif event == "timer" then
             if param1 == controlTimer then
+                -- 20 Hz cadence health: real inter-tick period + controlTick
+                -- work time (os.clock is wall time). Surfaced as the SYSTEMS
+                -- tab LOOP readout and as a terminal warning when we run
+                -- slow — timers fire late, never early, so the controller
+                -- may detune under load but the fixed dt keeps it stable.
+                local stats = OS.loop_stats
+                if not stats then
+                    stats = { ema = 0, worst = 0, late = 0, late_streak = 0,
+                              work_ema = 0, work_worst = 0, n = 0 }
+                    OS.loop_stats = stats
+                end
+                if stats._last then
+                    local period = now - stats._last
+                    stats.n = stats.n + 1
+                    if stats.n == 1 then
+                        stats.ema = period
+                    else
+                        stats.ema = stats.ema + (period - stats.ema) * 0.05
+                    end
+                    if period > stats.worst then stats.worst = period end
+                    if period > 0.075 then
+                        stats.late = stats.late + 1
+                        stats.late_streak = stats.late_streak + 1
+                        if stats.late_streak == 5 then
+                            print(string.format(
+                                "[LOOP] control slow: %.0f ms avg (target 50)",
+                                stats.ema * 1000))
+                        end
+                    else
+                        stats.late_streak = 0
+                    end
+                end
+                stats._last = now
+
                 -- Always re-arm so a control error cannot kill the 20 Hz loop;
                 -- log each distinct error (once) instead of swallowing it
+                local t0 = os.clock()
                 local ok, err = pcall(OS.controlTick)
-                if not ok and err ~= OS._last_tick_error then
+                if ok then
+                    local work = os.clock() - t0
+                    if stats.work_ema == 0 then
+                        stats.work_ema = work
+                    else
+                        stats.work_ema = stats.work_ema + (work - stats.work_ema) * 0.05
+                    end
+                    if work > stats.work_worst then stats.work_worst = work end
+                    OS._last_tick_error = nil
+                elseif err ~= OS._last_tick_error then
                     OS._last_tick_error = err
                     print("[CONTROL ERROR] " .. tostring(err))
-                elseif ok then
-                    OS._last_tick_error = nil
                 end
                 controlTimer = os.startTimer(0.05)
             end
@@ -512,19 +530,6 @@ function OS.controlTick()
         end
         status_time = os.clock()
     end
-
-    if flight.tune_status and flight.tune_status ~= "" then
-        local ts = flight.tune_status
-        if ts == "queued" or ts == "running" or ts == "waiting for air" then
-            status_message = "Tune: " .. ts
-            status_time = os.clock()
-        else
-            status_message = "Tune: " .. ts
-            status_time = os.clock()
-            print("[" .. string.format("%.0f", os.clock()) .. "] Auto-tune " .. ts)
-            flight.tune_status = nil
-        end
-    end
 end
 
 -- Shared by keyboard (M/L/G/X/R/T/N) and ACTIONS tab buttons
@@ -585,16 +590,6 @@ function OS.doAction(name)
             status_time = os.clock()
         end
 
-    elseif name == "tune" then
-        if not hasFeature("auto_tune") then
-            status_message = "No auto-tune on this ship"
-            status_time = os.clock()
-        else
-            local ok, msg = flight:requestAutoTune()
-            status_message = ok and "Auto-tuning altitude PID..." or ("Auto-tune: " .. tostring(msg))
-            status_time = os.clock()
-        end
-
     elseif name == "autopilot" then
         -- Toggle the waypoint window (list -> popup -> travel/delete)
         local hud = loadLib("lib.hud")
@@ -633,10 +628,6 @@ function OS.findPrinter()
     end
     OS._printer_cache = pr
     return pr
-end
-
-local function ts()
-    return string.format("[%02.0f]", os.clock())
 end
 
 local function validName(v)
@@ -874,15 +865,8 @@ function OS.beginBoot()
     clutch_engaged = false
     -- A fresh boot must not inherit the previous run's e-stop latch
     -- (powerOff->emergencyStop leaves it set; HUD would show READY otherwise).
-    -- Tune flags: Flight:update() gates them on landed+HOVER+estop, but
-    -- powerOff's emergencyStop cleared the armed-pending tune — re-arm it
-    -- if the PID file is still missing.
     if flight then
         flight.estop = false
-        if hasFeature("auto_tune") and not fs.exists(pidFilePath()) then
-            flight.tune_pending = true
-            flight.tune_status = nil
-        end
     end
     status_message = ""
     print("[" .. string.format("%.0f", os.clock()) .. "] Boot sequence (" .. tostring(BOOT_DURATION) .. "s)...")
@@ -905,8 +889,8 @@ function OS.powerOff()
     OS._starter_on = false
     power_state = "off"
     -- Session state back to a first-time OS start: HOVER mode, default tab,
-    -- no stale status. (beginBoot still clears the e-stop latch and re-arms
-    -- auto-tune on the next boot.) Next screen is the boot splash.
+    -- no stale status. (beginBoot still clears the e-stop latch on the next
+    -- boot.) Next screen is the boot splash.
     flight:setMode(Flight.MODE_HOVER)
     Rec.stop()
     Kbd.cancel("shutdown")
@@ -1010,6 +994,7 @@ function OS.updateDisplay()
     local ok, err = pcall(function()
         local status = flight:getStatus()
         -- OS-level fields the NAV tab buttons/status line need
+        status.loop = OS.loop_stats -- 20 Hz cadence stats (SYSTEMS tab)
         status.recording = Rec.isActive()
         status.rec_t = Rec.duration()
         status.rec_n = Rec.count()

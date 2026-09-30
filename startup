@@ -180,7 +180,6 @@ local FALLBACK_TEMPLATE = [[return {
         gear = true,
         auto_land = true,
         cruise_mode = true,
-        auto_tune = true,
         engine_auto_start = false,
         clutch = false,
         fuel_level = false,
@@ -230,7 +229,7 @@ local FALLBACK_TEMPLATE = [[return {
         RR = { x = 3,  y = 0, z = -3 },
     },
     limits = {
-        max_speed = 80, max_altitude = 320, min_altitude = 0,
+        max_speed = 80, max_altitude = 450, min_altitude = 0,  -- operator safety cap only; the flight ceiling is discovered at runtime
         max_tilt = 15, max_climb_rate = 10, max_descent_rate = 5,
         hover_speed = 2, tilt_max = 12, hover_min_speed = 0, hover_max_speed = 15,
         hover_throttle = 6,
@@ -249,7 +248,6 @@ local FALLBACK_TEMPLATE = [[return {
         pitch    = { kp = 2.0, ki = 0.0, kd = 1.0, integral_limit = 5, output_limit = 6 },
         roll     = { kp = 2.0, ki = 0.0, kd = 1.0, integral_limit = 5, output_limit = 6 },
         yaw      = { kp = 2.2, ki = 0.0, kd = 1.4, integral_limit = 5, output_limit = 15 },
-        speed    = { kp = 0.15, ki = 0.04, kd = 0.0, integral_limit = 40, output_limit = 15 },
     },
     signal = { max = 15, min = 0 },
     optional_peripherals = { "aux_relay", "engine_relay" },

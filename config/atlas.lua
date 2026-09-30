@@ -4,7 +4,7 @@ return {
 
     -- Offset of computer from center of mass (in blocks)
     -- Positive X = right, Positive Y = up, Positive Z = forward
-    computer_offset = { x = 0, y = 6, z = 56 },
+    computer_offset = { x = 0, y = 6, z = 0 },
 
     -- Feature flags: OS only offers / runs what the ship actually has.
     -- Multi-ship packs flip these off without changing OS code.
@@ -13,7 +13,6 @@ return {
         gear = true,
         auto_land = true,
         cruise_mode = true,
-        auto_tune = true,
         engine_auto_start = true, -- boot sequence: starter pulse + clutch
         clutch = true,
         fuel_level = false,       -- reserved: fuel container item count later
@@ -125,7 +124,12 @@ return {
 
     limits = {
         max_speed = 80,
-        max_altitude = 320,
+        -- NOT the flight ceiling. The real one depends on hover_throttle,
+        -- hover_max_speed and how dense the world's air is at altitude, so the
+        -- autopilot discovers it at runtime: climb past the 280 floor until
+        -- the lift props are down to 13 of 15. This is only an operator cap
+        -- on commanded altitude, set above anything the ship can reach.
+        max_altitude = 450,
         min_altitude = 0,
         max_tilt = 15,
         max_climb_rate = 10,
@@ -154,8 +158,6 @@ return {
         pitch    = { kp = 2.0, ki = 0.0, kd = 1.0, integral_limit = 5, output_limit = 6 },
         roll     = { kp = 2.0, ki = 0.0, kd = 1.0, integral_limit = 5, output_limit = 6 },
         yaw      = { kp = 2.2, ki = 0.0, kd = 1.4, integral_limit = 5, output_limit = 15 },
-        -- cruise horizontal speed -> rear thruster 0..15
-        speed    = { kp = 0.15, ki = 0.04, kd = 0.0, integral_limit = 40, output_limit = 15 },
     },
 
     signal = {

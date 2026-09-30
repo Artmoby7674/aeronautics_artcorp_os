@@ -1,5 +1,10 @@
 -- Waypoint storage: config/wp_<slot>.lua next to the config it belongs to.
--- Entries: { name = "...", x = <number>, z = <number>, heading = <deg> }.
+-- Entries: { name = "...", x = <number>, z = <number>, heading = <deg>,
+--           alt = <number|nil> }. alt is optional: when omitted, the autopilot
+-- climbs to the operating ceiling (y280 floor, then as high as the lift props
+-- stay above 13) and cruises the whole leg there. Give alt to pin an exact
+-- height instead -- an explicit value is honoured and is not treated as a
+-- ceiling request.
 
 local WP = {}
 
@@ -21,11 +26,14 @@ function WP.load(slot)
         if ok and type(data) == "table" then
             for _, w in ipairs(data) do
                 if type(w) == "table" and w.name and w.x and w.z then
+                    local alt = tonumber(w.alt)
+                    if alt ~= alt then alt = nil end   -- NaN guard
                     WP.list[#WP.list + 1] = {
                         name = tostring(w.name),
                         x = tonumber(w.x) or 0,
                         z = tonumber(w.z) or 0,
                         heading = ((tonumber(w.heading) or 0) % 360 + 360) % 360,
+                        alt = alt,
                     }
                 end
             end
@@ -40,10 +48,20 @@ function WP.save()
     if not f then return false end
     f.writeLine("return {")
     for _, w in ipairs(WP.list) do
-        f.writeLine(string.format("  { name = %q, x = %s, z = %s, heading = %s },",
-            tostring(w.name), tostring(tonumber(w.x) or 0),
-            tostring(tonumber(w.z) or 0),
-            tostring(((tonumber(w.heading) or 0) % 360 + 360) % 360)))
+        if w.alt then
+            f.writeLine(string.format(
+                "  { name = %q, x = %s, z = %s, heading = %s, alt = %s },",
+                tostring(w.name), tostring(tonumber(w.x) or 0),
+                tostring(tonumber(w.z) or 0),
+                tostring(((tonumber(w.heading) or 0) % 360 + 360) % 360),
+                tostring(tonumber(w.alt))))
+        else
+            f.writeLine(string.format(
+                "  { name = %q, x = %s, z = %s, heading = %s },",
+                tostring(w.name), tostring(tonumber(w.x) or 0),
+                tostring(tonumber(w.z) or 0),
+                tostring(((tonumber(w.heading) or 0) % 360 + 360) % 360)))
+        end
     end
     f.writeLine("}")
     f.close()
@@ -54,11 +72,14 @@ function WP.add(wp)
     if type(wp) ~= "table" or not wp.name or not wp.x or not wp.z then
         return nil, "BAD WAYPOINT"
     end
+    local alt = tonumber(wp.alt)
+    if alt ~= alt then alt = nil end       -- NaN guard
     WP.list[#WP.list + 1] = {
         name = tostring(wp.name),
         x = tonumber(wp.x) or 0,
         z = tonumber(wp.z) or 0,
         heading = ((tonumber(wp.heading) or 0) % 360 + 360) % 360,
+        alt = alt,
     }
     WP.save()
     return #WP.list

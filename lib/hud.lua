@@ -366,6 +366,7 @@ local function drawSystemsStatic()
     label(x, y + 20, "PITCH")
     label(x, y + 40, "ROLL")
     label(x, y + 60, "YAW")
+    label(x, y + 70, "LOOP") -- control-loop period (20 Hz target)
     label(x, y + 86, "PID GAINS")
     Gfx.fillRect(x, y + 96, L.content_w, 2, C.panel)
     label(x, y + 106, "ALT")
@@ -406,7 +407,6 @@ local ACTION_BTNS = {
     { id = "land",  label = "AUTO-LAND", feat = "auto_land" },
     { id = "gear",  label = "GEAR",      feat = "gear" },
     { id = "estop", label = "E-STOP" },
-    { id = "tune",  label = "AUTO-TUNE", feat = "auto_tune" },
     { id = "autopilot", label = "AUTOPILOT" },
     { id = "apcancel",  label = "CANCEL A/P" },
 }
@@ -670,7 +670,8 @@ local function drawFlightDynamic(s)
     -- Vertical altitude target gauge (right edge)
     local gx = x + L.content_w - 12
     local gh = 184
-    local max_alt = 320
+    local max_alt = 450 -- gauge scale: AP_CEIL_HARD, not the discovered ceiling
+    -- (a learned ceiling above this would otherwise pin the needle)
     local function altY(alt)
         local a = clamp(alt or 0, 0, max_alt)
         return y + gh - 3 - math.floor((a / max_alt) * (gh - 8))
@@ -719,6 +720,17 @@ local function drawSystemsDynamic(s)
     slotText(x + 70, y + 40, vw, string.format("%+8.1f", roll), rc, "right")
 
     slotText(x + 70, y + 60, vw, string.format("%+8.1f", s.yaw or 0), C.text, "right")
+
+    -- Control-loop period: green = on the 20 Hz timer, red = starved
+    local loop = s.loop
+    if loop and (loop.ema or 0) > 0 then
+        local lp = loop.ema
+        local lc = C.good
+        if lp > 0.09 then lc = C.bad elseif lp > 0.06 then lc = C.warn end
+        slotText(x + 70, y + 70, vw, string.format("%.1fms", lp * 1000), lc, "right")
+    else
+        slotText(x + 70, y + 70, vw, "--", C.dim, "right")
+    end
 
     local pid = {
         { y + 106, (s.pid_gains or {}).altitude },
@@ -822,6 +834,12 @@ local function drawAlarmsDynamic(s, status_msg)
     end
     if s.estop then
         table.insert(msgs, { "E-STOP LATCHED (RESET)", C.bad })
+    end
+    -- Control loop starving (persistent late timers): see SYSTEMS LOOP row
+    local loop = s.loop
+    if loop and (loop.late_streak or 0) >= 5 then
+        table.insert(msgs, { string.format("CONTROL LOOP SLOW %.0fMS",
+            (loop.ema or 0) * 1000), C.bad })
     end
     -- status feedback ("Tab: X", "GEAR DOWN", ...) is not an alarm — this
     -- tab is reserved for real alarms

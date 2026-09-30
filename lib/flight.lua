@@ -146,6 +146,8 @@ local AP_BANK_SIGN = -1     -- cruise bank direction: -1 = positive bearing err
 local AP_BANK_KP = 0.6      -- deg bank per deg heading error
 local AP_BANK_MAX = 8       -- deg max bank command
 local AP_BANK_DEAD = 1      -- deg heading deadband (no bank correction)
+local AP_BANK_ALT_FADE = 4    -- m: altitude error over which the bank
+                            -- command fades to zero (climb first)
 local AP_BANK_RATE_LEAD = 0.6 -- s: back off the bank command by yaw_rate so
                             -- the turn bleeds off instead of coasting through
                             -- the bearing (rate lead = angle - k * rate)
@@ -162,20 +164,111 @@ local AP_YAW_STILL = 2      -- deg/s: rotation counts as settled (codebase
                             -- treats <1.5 as stationary, see rotationControl)
 local AP_YAW_EXIT_RATE = 4  -- deg/s: max rotation to leave aim/align (hand
                             -- over to bank-only cruise with no spin left)
-local AP_CLIMB_GOAL_RATE = 35 -- m/s: aim climb goal rise (until demand hits TOP)
-local AP_CLIMB_TOP = 13       -- prop demand cap AND goal-freeze trigger
-                            -- (= slow-down signal 2, a little under max rpm)
+-- Yaw-tilt disturbance decoupling. The props do NOT counter-rotate, so
+-- vertical thrust cannot yaw the ship: yaw IS the left/right tilt
+-- differential (a pure couple — the two pairs push fore/aft against each
+-- other at mirrored lever arms, so net force is zero and yaw is the only
+-- moment). But the hull turns about an axis AFT of the centre of mass (big
+-- rear fins), so the same manoeuvre also rolls and pitches it. The
+-- stabiliser used to discover that as a disturbance and chase it, which is
+-- the visible rock-through-every-turn. These estimate the coupling so the
+-- levelling PIDs aim at the compensating attitude in the SAME tick.
+-- Reduction only (never raise a prop above base) — at max altitude there is
+-- no thrust headroom to give back.
+-- Yaw-compensation trim: deg of roll/pitch the stabiliser is pre-aimed at per
+-- unit of commanded yaw tilt, to offset the attitude the hull picks up while
+-- turning about an axis aft of the centre of mass.
+--
+-- DEFAULT 0, i.e. DISABLED, and that is a decision rather than an omission.
+-- These were never measured -- they were guesses -- and the guess turns out to
+-- be conceptually wrong for THIS ship. It yaws by pitching and rolling, so a
+-- commanded roll offset is not a disturbance to be trimmed away, it is more
+-- yaw input: the feedforward and the heading controller then both steer, and
+-- they steer against each other. The cost of leaving a wrong guess enabled is
+-- a permanent fight during the aim phase, which is the wobble on the way to
+-- facing a waypoint. Set them from measurement, one axis at a time, or leave
+-- them at 0 and let the heading controller own yaw on its own.
+local AP_YAW_ROLL_COUPLING = 0.0   -- overridable per-ship via limits.*
+local AP_YAW_PITCH_COUPLING = 0.0
+local AP_YAW_FF_MAX = 3.0     -- deg: ceiling on the yaw-compensation trim
+-- Physical tilt. The prop block only has two positions -- rotated
+-- AP_TILT_ANGLE forward, or AP_TILT_ANGLE backward -- and its analog input is
+-- NOT proportional, so the tilt command is a request for a direction, not a
+-- magnitude. (Analog tilt would be a nice future mod feature; until then every
+-- code path that reasons about tilt must go through tiltPhysicalAngle below,
+-- or it will silently assume a proportional actuator that does not exist.)
+local AP_TILT_ANGLE = 25 -- deg: the only tilt the block can hold
+local AP_TILT_RAD = math.pi / 180
+local AP_TILT_DEADBAND = 0.15 -- fraction of tilt_max below which we leave the
+                              -- prop LEVEL rather than buzzing it to 25 deg for
+                              -- a sliver of thrust (25 deg is not a small thing)
+-- A tilt command -> the angle the prop is ACTUALLY at. Anything past the
+-- deadband snaps to the full fixed tilt, because that is what the block does.
+local function tiltPhysicalAngle(command, tilt_max)
+    if math.abs(command) < (tilt_max or 12) * AP_TILT_DEADBAND then return 0 end
+    return command > 0 and AP_TILT_ANGLE or -AP_TILT_ANGLE
+end
+local AP_CLIMB_GOAL_RATE = 60 -- m/s: aim climb goal rise. The goal is CLAMPED
+                            -- at the target, so a fast rise just means the
+                            -- approach law gets the full height error sooner;
+                            -- it cannot itself cause overshoot.
+local AP_CLIMB_TOP = 13       -- prop demand cap near the goal (settle band),
+                            -- = 2 under max rpm so the ship can still hold
+local AP_CLIMB_SETTLE_BAND = 40 -- m: inside this much height error, drop to
+                            -- AP_CLIMB_TOP so the ship settles; outside it,
+                            -- climb on the full authority available
 local AP_CLIMB_KP = 0.6       -- prop units per m/s of velocity error
 local AP_CLIMB_APPROACH = 0.6 -- 1/s: v_des = APPROACH * height error (the brake
                             -- law that settles the ship AT the frozen goal)
-local AP_CLIMB_MAX_V = 35     -- m/s: clamp on |v_des|
+local AP_CLIMB_MAX_V = 60     -- m/s: clamp on |v_des|. Thrust, not this, is the
+                            -- real limit -- the clamp only stops a huge height
+                            -- error from demanding an absurd rate
 local AP_CLIMB_TOL = 2        -- m: one-sided gap: at/above goal - tol counts
                             -- as arrived (paired with |climb_rate| stop)
 local AP_CLIMB_STILL = 0.5    -- m/s: climb rate that counts as settled
-local AP_CEIL_MARGIN = 10     -- m: goal hard-cap = max_altitude - this
+-- OPERATING CEILING, DISCOVERED RATHER THAN ASSUMED.
+-- The old 285 was a guess: it came from a wiki thrust curve for THIS ship at
+-- 256 rpm and 12.8*sqrt(sails) airflow, but the ship gets shared, the props get
+-- re-tuned, and other people's servers have different build limits. A hardcoded
+-- number is wrong on all three counts.
+--
+-- So the ship finds its own ceiling. y280 is a FLOOR, not a ceiling: cruise
+-- travel never happens below it, but it is not the stopping point either.
+-- Above the floor the ship watches the one number that reveals the ceiling --
+-- the prop speed the hover feedforward needs to hold station. While that is
+-- UNDER AP_CEIL_LIFT there is thrust in hand, so it keeps climbing; when it
+-- reaches AP_CEIL_LIFT, 2 of 15 are all that remain, and that altitude is the
+-- ceiling. Those 2 units ARE the safety margin, which is why the target is
+-- the discovered altitude itself and not something below it.
+--
+-- This is what makes one build work on any world. On a flat world the props
+-- are already near max at y280, demand crosses 13 almost immediately, and the
+-- ship cruises on its floor. Where the player has terrain and builds high the
+-- air is denser up there, the props may still be turning at ~5 on reaching
+-- y280, and the ship keeps going up -- potentially a very long way -- until
+-- the props come back down to 13.
+local AP_CEIL_FLOOR = 280  -- m: cruise never goes below this; climb here first
+local AP_CEIL_LIFT = 13    -- prop speed (of hover_max_speed) at which the climb
+                            -- stops. 13 leaves 2 in hand: enough to level and
+                            -- to absorb a gust without sinking.
+local AP_CEIL_HARD = 450   -- m: absolute guard. Physics should stop the probe
+                           -- long before this; it only catches a mis-tuned
+                           -- hover_throttle, never a real ship.
+-- While the ship still has altitude to make up, attitude correction only gets
+-- a SLICE of the thrust headroom, so the climb can actually happen. Without
+-- this the two fight over the same units and attitude wins every time (it is
+-- the faster loop): the ship held 35 m under its target forever, spending the
+-- entire climb budget on levelling. Once it is ON altitude the band below
+-- stops applying and attitude gets the whole remainder again, so the settled
+-- cruise still levels properly and low-altitude handling is unchanged.
 local AP_CLIMB_MIN_GAIN = 5   -- m: climb must gain this much ...
 local AP_CLIMB_MIN_PT = 3     -- s: ... within this long, else HOLD the
                             -- current altitude and go to the TURN step
+local AP_STOP_TAU = 0.4     -- s: EMA time constant of the climb-stop detector
+                            -- (the ship bobs around the goal: thrust collapses
+                            -- with climb rate and recovers as it falls, so the
+                            -- INSTANTANEOUS rate never sits still at 0.5)
+local AP_STOP_HOLD = 0.2    -- s: settle must hold this long before TURN
 local AP_PHASE_TIMEOUT = 45 -- s failsafe per phase (no-drag ships coast forever)
 local AP_HOVER_RANGE = 500  -- m: inside this (at enable or ANY time later,
                             -- incl. mid-cruise) the trip runs on HOVER
@@ -193,6 +286,36 @@ local LAND_ROLL_CAP = 5     -- max roll correction units while landing (vs 4 nor
 -- atan2 with a Lua-version-safe fallback (CC provides either form)
 local atan2 = math.atan2 or function(y, x) return math.atan(y, x) end
 
+-- ============================================================
+-- Prop-thrust physics feedforward (Create:Aeronautics, wiki-verified):
+--   pressure(H) = e^(-0.004 * (H - 63))   -- DimensionPhysics.java
+--   thrust      = pressure(H) * (s/6) * (1 - v/airflow) * weight
+-- The altitude PID used a FIXED hover feedforward (limits.hover_throttle),
+-- which is only correct near sea level: at y260 props make 45% thrust and a
+-- fast climb eats another 30-40%. That is why cruise entry sank (y260 ->
+-- y160: demand maxed at 13 < the 13.2 needed to even hover) and why the
+-- climb bobbed around the goal. Scale the feedforward so prop speed is
+-- weight-equivalent at every height and vertical rate:
+--   s = hover * e^(0.004*(H-63)) / (1 - v/airflow)
+-- ============================================================
+local AP_PRESS_K = 0.004   -- pressure falloff per metre (wiki)
+local AP_PRESS_REF = 63    -- sea-level reference (world Y)
+local AP_AIRFLOW = 25      -- m/s through the prop ~= 12.8*sqrt(sail count)
+                           -- at 256 rpm (wiki: thrust = ...*(1-v/airflow)).
+                           -- Climb still sags at speed -> raise; overshoots
+                           -- -> lower. Clamped to den 0.3..3 either way.
+local function hoverFF(limits, state)
+    local base = (limits or {}).hover_throttle or 6
+    local den = 1 - ((state or {}).climb_rate or 0) / AP_AIRFLOW
+    if den < 0.3 then den = 0.3 elseif den > 3 then den = 3 end
+    local h = (state or {}).altitude
+    if h == nil then h = AP_PRESS_REF end
+    local kh = math.exp(AP_PRESS_K * (h - AP_PRESS_REF))
+    -- second return: kh (pressure factor); third: den (climb-rate thrust
+    -- factor, clamped) — attitude scheduling needs BOTH (kh/den).
+    return base * kh / den, kh, den
+end
+
 function Flight.new(config, hardware)
     local self = setmetatable({}, Flight)
     self.config = config
@@ -205,8 +328,6 @@ function Flight.new(config, hardware)
         pitch    = PID.new(config.pid.pitch),
         roll     = PID.new(config.pid.roll),
         yaw      = PID.new(config.pid.yaw),
-        speed    = PID.new(config.pid.speed or
-            { kp = 0.15, ki = 0.04, kd = 0.0, integral_limit = 40, output_limit = 15 }),
     }
 
     self.targets = {
@@ -290,12 +411,6 @@ function Flight.new(config, hardware)
     self.last_update = os.clock()
     self.update_count = 0
     self.tick_rate = 0.05
-    self.tune_requested = false
-    self.tune_pending = false -- wait for airborne HOVER (e.g. boot while landed)
-    self.tuning = false
-    self.tune_speed = 0
-    self.tune_status = nil
-    self.onTuneComplete = nil -- function(ok) called when a tune finishes
     self.last_sable_error = nil
 
     return self
@@ -365,17 +480,61 @@ function Flight:pollShift(shift_value)
     return toggled
 end
 
+-- The altitude the ship should actually CRUISE at.
+--
+-- The probe stops the climb while 2 of 15 are still in hand, so the altitude
+-- it discovers is already the safe one to fly at and no extra margin is owed
+-- on top of it. The only floor applied here is AP_CEIL_FLOOR: an alt-less
+-- waypoint cruises at the discovered ceiling, and never below y280.
+function Flight:ceilingTarget()
+    local learned = tonumber((self.config.limits or {}).ceiling)
+    -- >= not >: a ceiling learned exactly ON the floor is a real answer. With
+    -- > it fell through to AP_CEIL_HARD and the ship re-probed to 450 forever.
+    if learned and learned >= AP_CEIL_FLOOR then
+        -- No margin to subtract: the probe already stopped 2 prop units short
+        -- of max, so the discovered altitude is itself the safe one.
+        return learned
+    end
+    return AP_CEIL_HARD
+end
+
+-- Ceiling probe. Returns true while there is still spare thrust (keep
+-- climbing), false once the feedforward has pinned at max (that is the
+-- ceiling, so stop asking for more). Only probes above AP_CEIL_FLOOR: below
+-- that there is obviously thrust to spare and probing would be pointless.
+function Flight:ceilingProbe(altitude, hmax)
+    -- Below the floor there is nothing to decide: go up.
+    if altitude < AP_CEIL_FLOOR then return true end
+    -- The prop speed needed to hold station here with no climb rate. (Parens
+    -- matter: hoverFF(...)[1] would index the returned NUMBER, since Lua
+    -- truncates the call to one value first.)
+    local need = hoverFF(self.config.limits, { altitude = altitude })
+    -- Demand has reached the stopping speed, so this altitude is the ceiling.
+    -- Clamped to just under hmax so a raised AP_CEIL_LIFT can never leave the
+    -- probe unable to terminate.
+    local stop_at = math.min(AP_CEIL_LIFT, hmax - 0.05)
+    if need >= stop_at then
+        local lim = self.config.limits or {}
+        if not lim.ceiling or lim.ceiling > altitude then
+            lim.ceiling = altitude
+        end
+        return false
+    end
+    return true
+end
+
 function Flight:adjustAltitude(delta)
     if self.auto_land and self.land_state ~= Flight.LAND_IDLE then
         return false
     end
-    if self.tuning then
-        return false -- do not move the setpoint mid-tune
-    end
     self.estop = false -- pilot input cancels e-stop latch
     local limits = self.config.limits or {}
     local lo = limits.min_altitude or 0
-    local hi = limits.max_altitude or 320
+    -- max_altitude is an OPERATOR safety cap, not the flight ceiling: the
+    -- ceiling is discovered at runtime and can be far higher. Falling back to
+    -- the retired 285 here would quietly cap manual commands -- and therefore
+    -- cruise -- below the very altitude the probe is trying to reach.
+    local hi = tonumber(limits.max_altitude) or AP_CEIL_HARD
     self.targets.altitude = clamp(self.targets.altitude + delta, lo, hi)
     if self.landed and delta > 0 then
         -- command climb off ground
@@ -488,6 +647,27 @@ function Flight:startAutopilot(wp)
     local start_dist = math.sqrt(dx * dx + dz * dz)
     if start_dist <= AP_ARRIVE_R then return false, "ALREADY THERE" end
 
+    local limits = self.config.limits or {}
+    local alt_now = self.state.altitude or 0
+    -- Operative ceiling for this run: a learned one if we have probed it,
+    -- otherwise the absolute guard so the climb may go find out.
+    local ceiling = self:ceilingTarget()
+    -- CLIMB TARGET. The goal used to ramp toward the AP *ceiling* on every
+    -- trip, because the waypoint's own altitude was never read: a level
+    -- waypoint still sent the ship climbing, froze the goal near the top of
+    -- its authority and then fought a ~200 m height error (the climb bob and
+    -- the sag after the turn). The target is the waypoint's own altitude when
+    -- it supplies one. When it does NOT, the ship climbs to its operating
+    -- ceiling instead -- at least AP_CEIL_FLOOR, higher if the props allow --
+    -- because "no altitude given" means "take me to cruising height", and
+    -- "hold exactly here" was what turned every short hop into a 200 m climb.
+    -- The learned ceiling is stable once probed, so re-running a route does
+    -- not re-climb; only a genuinely higher ceiling (different props, higher
+    -- build limit) moves the goal again.
+    local goal_alt = tonumber(wp.alt)
+    if not goal_alt or goal_alt ~= goal_alt then goal_alt = ceiling end
+    goal_alt = clamp(goal_alt, 0, ceiling)
+
     self.ap = {
         name = tostring(wp.name or "WP"),
         x = tonumber(wp.x),
@@ -496,7 +676,7 @@ function Flight:startAutopilot(wp)
         phase = "aim",
         pt = 0,          -- seconds in current phase (timeout failsafe)
         paused = false,  -- unflip pause; resumes where it left off
-        brake_reverse = false, -- post-dispatch reverse brake this tick
+        brake_reverse = false, -- flag; written after mode rear outputs (Flight:update)
         start_dist = start_dist,
         dist = start_dist,
         err = 0,
@@ -505,10 +685,14 @@ function Flight:startAutopilot(wp)
         speed = 0,
         alt = self.state.altitude or 0,  -- captured flight altitude (all phases)
         step = "climb",  -- aim sub-step: climb first (always), then turn
-        climb_goal = self.state.altitude or 0, -- rises +AP_CLIMB_GOAL_RATE b/s
-        climb_alt0 = self.state.altitude or 0, -- for the stall failsafe
-        climb_frozen = false, -- demand hit AP_CLIMB_TOP: goal stops rising
-        ceil = ((self.config.limits or {}).max_altitude or 320) - AP_CEIL_MARGIN,
+        goal_alt = goal_alt,        -- m: altitude the climb converges on
+        needs_climb = goal_alt > alt_now + AP_CLIMB_TOL, -- else skip to TURN
+        climb_goal = alt_now,      -- rises toward goal_alt, then freezes there
+        climb_alt0 = alt_now,      -- for the stall failsafe
+        climb_frozen = false,      -- at goal_alt (or demand hit AP_CLIMB_TOP)
+        rate_ema = nil,   -- EMA of climb_rate (bobbing-proof stop detector)
+        stop_hold = 0,    -- s the settle condition has held continuously
+        ceil = ceiling,
         hover_only = start_dist < AP_HOVER_RANGE, -- short hop: hover travel
     }
     if not self.heading_valid then self:captureHeading() end
@@ -595,7 +779,9 @@ function Flight:updateAutopilot(dt)
     local dist = math.sqrt(dx * dx + dz * dz)
     local err = self:apBearingError(dist, dx, dz)
     local speed = state.speed or 0
-    local hover = (self.config.limits or {}).hover_throttle or 6
+    local limits = self.config.limits or {}
+    local hover = hoverFF(limits, state) -- height/rate-scaled prop feedforward
+    local hmax = limits.hover_max_speed or 15
 
     ap.dist = dist
     ap.err = err
@@ -614,6 +800,17 @@ function Flight:updateAutopilot(dt)
     end
     local function timedOut()
         return ap.pt > AP_PHASE_TIMEOUT
+    end
+    -- Rear props spool at limits.cruise_ramp (level/s) instead of jumping to
+    -- the target: an instant 0->15 kick at cruise entry pitches the nose over
+    -- before the pitch stab can answer (the y260 -> y160 entry dive). Only
+    -- RISES are ramped — braking/crawl drops stay instant.
+    local function rearRamp(want)
+        local cur = self.targets.speed or 0
+        if want > cur then
+            want = math.min(want, cur + (limits.cruise_ramp or 8) * dt)
+        end
+        self.targets.speed = want
     end
 
     -- Autopilot owns these axes; manual inputs are gated off upstream.
@@ -667,49 +864,136 @@ function Flight:updateAutopilot(dt)
         -- TURN onto the bearing. Cruise only once both are done.
         if self.mode ~= Flight.MODE_HOVER then self:setMode(Flight.MODE_HOVER) end
 
-        if ap.step ~= "turn" then
-            -- STEP 1 — CLIMB: the goal rises +AP_CLIMB_GOAL_RATE b/s until
-            -- prop demand hits AP_CLIMB_TOP (13 = slow-down signal 2); then
-            -- the goal FREEZES and the velocity-profile law
-            -- (v_des = AP_CLIMB_APPROACH * height error) settles the ship at
-            -- it — no drag means a fixed-thrust climb would sail past.
-            if not ap.climb_frozen then
-                ap.climb_goal = math.min(
-                    ap.climb_goal + AP_CLIMB_GOAL_RATE * dt, ap.ceil)
+        -- CEILING PROBE, every phase, every tick. It has to run here rather
+        -- than inside the climb step: the climb finishes as soon as the ship is
+        -- steady at its target, so a climb-only probe never saw the ship
+        -- actually sitting at its ceiling and never learned anything (the
+        -- ceiling stayed unset and the ship cruised on the hard guard).
+        -- Holding station is the best place to measure thrust headroom anyway.
+        --
+        -- Once the lift props are down to AP_CEIL_LIFT there is nothing left
+        -- to climb with, so that altitude IS the ceiling -- record it and
+        -- cruise there. The 2 units of thrust still in hand are the margin, so
+        -- no extra subtraction is applied. This is what replaces the hardcoded
+        -- 285, and it re-derives itself for different props, a denser world,
+        -- or a re-tuned engine.
+        if self:ceilingProbe(state.altitude or 0, hmax) then
+            if not tonumber((limits or {}).ceiling) then
+                ap.ceil = AP_CEIL_HARD -- still searching: keep looking
             end
-            local h_err = ap.climb_goal - state.altitude
-            local vdes = clamp(
-                AP_CLIMB_APPROACH * h_err, -AP_CLIMB_MAX_V, AP_CLIMB_MAX_V)
-            local demand = clamp(hover + AP_CLIMB_KP
-                * (vdes - (state.climb_rate or 0)), 0, AP_CLIMB_TOP)
-            ap.climb_demand = demand -- updateHover applies it as base speed
-            if demand >= AP_CLIMB_TOP then ap.climb_frozen = true end
-            self.targets.altitude = ap.climb_goal
-            self.targets.yaw_cmd = clamp(self.pilot_yaw or 0, -1, 1) -- Q/E only
-            if ap.pt >= AP_CLIMB_MIN_PT
-                and (state.altitude - (ap.climb_alt0 or 0)) < AP_CLIMB_MIN_GAIN then
-                -- STALLED CLIMB (gained < 5 m in 3 s): hold here — freeze
-                -- the goal at the current altitude and move on to the
-                -- heading phase instead of waiting out the phase timeout.
-                ap.climb_goal = state.altitude
-                ap.alt = state.altitude -- hold THIS during the turn (once!)
+        else
+            ap.ceil = self:ceilingTarget()
+            ap.goal_alt = math.min(ap.goal_alt, ap.ceil)
+            ap.climb_goal = math.min(ap.climb_goal, ap.ceil)
+            if ap.alt and ap.alt > ap.ceil then ap.alt = ap.ceil end
+        end
+
+        if ap.step ~= "turn" then
+            -- STEP 1 — CLIMB toward ap.goal_alt (the waypoint's altitude, or
+            -- simply hold where we are). The goal rises at
+            -- AP_CLIMB_GOAL_RATE but is CLAMPED AT THE TARGET, so the height
+            -- error the approach law has to service stays bounded instead of
+            -- growing to the ceiling.
+            if not ap.needs_climb then
+                -- Already at (or above) the target altitude: no climb at all.
+                -- Hand straight to the turn step instead of "settling" a climb
+                -- that was never needed.
+                ap.alt = ap.goal_alt
                 ap.step = "turn"
-                ap.climb_demand = nil -- props back to the altitude PID
-                ap.pt = 0 -- the rotation gets its own timeout window
-            elseif (ap.climb_frozen
-                and math.abs(state.climb_rate or 0) <= AP_CLIMB_STILL
-                -- "stopped climbing" = vertical motion is gone AND we are
-                -- at/above the goal band (ONE-sided: the abs check used to
-                -- fail at the overshoot peak and wait out another slow
-                -- cycle) or the climb has simply run long enough.
-                and (h_err <= AP_CLIMB_TOL or ap.pt >= AP_CLIMB_MIN_PT))
-                or timedOut() then
-                -- Capture the hold altitude ONCE; the turn step must not
-                -- re-capture it or the goal follows any sag downward.
-                ap.alt = state.altitude
-                ap.step = "turn"
-                ap.climb_demand = nil -- hand the props back to the altitude PID
-                ap.pt = 0 -- the rotation gets its own timeout window
+                ap.climb_demand = nil
+                ap.pt = 0
+            end
+            if ap.step == "climb" then
+                if not ap.climb_frozen then
+                    ap.climb_goal = math.min(
+                        ap.climb_goal + AP_CLIMB_GOAL_RATE * dt,
+                        math.min(ap.goal_alt, ap.ceil))
+                    -- reached the target: freeze, the law below settles it there
+                    if ap.climb_goal >= ap.goal_alt - 1e-6 then
+                        ap.climb_frozen = true
+                    end
+                end
+                -- Stop detector: thrust collapses as the ship climbs (rate term)
+                -- and recovers as it falls, so it BOBS around the goal and the
+                -- instantaneous rate flickers through 0.5 m/s over and over.
+                -- EMA the rate (tau AP_STOP_TAU) and require the settle condition
+                -- to hold AP_STOP_HOLD seconds before starting the turn.
+                local rate = state.climb_rate or 0
+                ap.rate_ema = (ap.rate_ema or rate)
+                    + (rate - (ap.rate_ema or rate)) * math.min(1, dt / AP_STOP_TAU)
+                local h_err = ap.climb_goal - state.altitude
+                local vdes = clamp(
+                    AP_CLIMB_APPROACH * h_err, -AP_CLIMB_MAX_V, AP_CLIMB_MAX_V)
+                -- Feedforward scales with height and current rate (hoverFF), so
+                -- the law still means what it says at altitude: freeze exactly
+                -- when prop demand reaches AP_CLIMB_TOP, hold up to hover_max_speed
+                -- (15) on the freeze tick instead of clipping BELOW what the ship
+                -- needs to hover — the old 0..13 clip under-thruster at y260 and
+                -- the stall failsafe then bailed out of the climb.
+                -- RATE GAIN MUST EXCEED THE FEEDFORWARD'S OWN RATE SLOPE or the
+                -- climb loses its damping and bobs. hover() carries 1/(1 -
+                -- rate/25), so it RISES with climb rate at d(hover)/d(rate) =
+                -- hover/25. At y280 that slope is 0.57, which almost exactly
+                -- cancels the 0.60 KP and leaves ~0 net damping -- that is why
+                -- the climb did ups and downs, and why it got worse the higher
+                -- it went. Folding hover/25 back into the gain makes the net
+                -- rate feedback a constant -AP_CLIMB_KP at EVERY altitude.
+                local k_rate = AP_CLIMB_KP + hover / AP_AIRFLOW
+                local raw = hover + k_rate * (vdes - rate)
+                -- Full authority in transit, and NO freeze on demand while in
+                -- transit. raw >= hmax only means the climb is asking for more
+                -- than the props can deliver, which is what every fast climb
+                -- does -- clipping is the correct response, not giving up
+                -- (freezing there stopped the climb dead at y118 on the first
+                -- test, with 8 prop units still unused). Whether the ship has
+                -- actually run out of thrust is a question about the HOVER
+                -- demand, not the climb demand, and that is what
+                -- ceilingProbe below answers.
+                --
+                -- "Close" is measured against the FINAL target, not the ramping
+                -- goal: the goal rises far faster than the ship, so
+                -- climb_goal - altitude stays small all the way up and a band
+                -- on it would pin the ship at 13/15 immediately.
+                local remain = (math.min(ap.goal_alt, ap.ceil) or ap.climb_goal)
+                    - (state.altitude or 0)
+                if remain <= AP_CLIMB_SETTLE_BAND and raw >= AP_CLIMB_TOP then
+                    ap.climb_frozen = true
+                end
+                local demand = clamp(raw, 0, hmax)
+                ap.climb_demand = demand -- updateHover applies it as base speed
+                self.targets.altitude = ap.climb_goal
+                self.targets.yaw_cmd = clamp(self.pilot_yaw or 0, -1, 1) -- Q/E only
+                local stalled = ap.pt >= AP_CLIMB_MIN_PT
+                    and (state.altitude - (ap.climb_alt0 or 0)) < AP_CLIMB_MIN_GAIN
+                local settle = ap.climb_frozen
+                    and math.abs(ap.rate_ema) <= AP_CLIMB_STILL
+                    -- "stopped climbing" = vertical motion is gone AND we are
+                    -- at/above the goal band (ONE-sided: the abs check used to
+                    -- fail at the overshoot peak and wait out another slow
+                    -- cycle) or the climb has simply run long enough.
+                    and (h_err <= AP_CLIMB_TOL or ap.pt >= AP_CLIMB_MIN_PT)
+                ap.stop_hold = (settle and not stalled)
+                    and ((ap.stop_hold or 0) + dt) or 0
+                if stalled then
+                    -- STALLED CLIMB (gained < 5 m in 3 s): hold here — freeze
+                    -- the goal at the current altitude and move on to the
+                    -- heading phase instead of waiting out the phase timeout.
+                    ap.climb_goal = state.altitude
+                    ap.alt = state.altitude -- hold THIS during the turn (once!)
+                    ap.step = "turn"
+                    ap.climb_demand = nil -- props back to the altitude PID
+                    ap.pt = 0 -- the rotation gets its own timeout window
+                elseif (settle and ap.stop_hold >= AP_STOP_HOLD) or timedOut() then
+                    -- Hold the TARGET altitude, not wherever the ship happened
+                    -- to be when the climb gave up: capturing state.altitude
+                    -- froze the cruise at the overshoot peak and the ship then
+                    -- sank through the turn. The altitude PID converges the
+                    -- remainder while the turn is already running.
+                    ap.alt = ap.climb_frozen and ap.goal_alt or state.altitude
+                    ap.step = "turn"
+                    ap.climb_demand = nil -- hand the props back to the altitude PID
+                    ap.pt = 0 -- the rotation gets its own timeout window
+                end
             end
         else
             -- STEP 2 — TURN: HOLD the altitude captured once when the climb
@@ -732,7 +1016,7 @@ function Flight:updateAutopilot(dt)
                     self.targets.speed = 0
                 else
                     self:setMode(Flight.MODE_CRUISE) -- freezes altitude at current
-                    self.targets.speed = AP_MAX_LEVEL
+                    rearRamp(AP_MAX_LEVEL) -- spool at cruise_ramp (no kick-dive)
                 end
                 setPhase("cruise")
             end
@@ -742,7 +1026,7 @@ function Flight:updateAutopilot(dt)
         -- CRUISE: bank-to-turn heading hold + rear taper (anti-overshoot).
         if self.mode ~= Flight.MODE_CRUISE then
             self:setMode(Flight.MODE_CRUISE)
-            self.targets.speed = AP_MAX_LEVEL
+            rearRamp(AP_MAX_LEVEL) -- spool at cruise_ramp (no kick-dive)
         end
         self.targets.yaw_cmd = 0
         self.targets.altitude = ap.alt
@@ -751,7 +1035,7 @@ function Flight:updateAutopilot(dt)
         elseif dist <= AP_BRAKE_R then
             setPhase("arrive")
         else
-            self.targets.speed = clamp(math.floor(dist / AP_LEVEL_PER), 1, AP_MAX_LEVEL)
+            rearRamp(clamp(math.floor(dist / AP_LEVEL_PER), 1, AP_MAX_LEVEL))
         end
 
     elseif ap.phase == "correct" then
@@ -771,14 +1055,14 @@ function Flight:updateAutopilot(dt)
         end
         if slow and math.abs(err) <= AP_CORRECT_TOL then
             ap.brake_reverse = false
-            self.targets.speed = AP_MAX_LEVEL
+            rearRamp(AP_MAX_LEVEL) -- re-accelerate on the ramp, not a kick
             setPhase("cruise")
         elseif dist <= AP_BRAKE_R then
             ap.brake_reverse = false
             setPhase("arrive")
         elseif timedOut() then
             ap.brake_reverse = false
-            self.targets.speed = AP_MAX_LEVEL
+            rearRamp(AP_MAX_LEVEL)
             setPhase("cruise")
         end
 
@@ -793,7 +1077,7 @@ function Flight:updateAutopilot(dt)
             self.targets.speed = 0
             ap.brake_reverse = self:hasFeature("rear_reverse")
         else
-            self.targets.speed = clamp(math.floor(want), 0, AP_MAX_LEVEL)
+            rearRamp(clamp(math.floor(want), 0, AP_MAX_LEVEL))
         end
         if (dist <= AP_ARRIVE_R and speed <= AP_STOP_SPEED) or timedOut() then
             ap.brake_reverse = false
@@ -835,12 +1119,9 @@ function Flight:updateAutopilot(dt)
         end
     end
 
-    -- Reverse brake must be written AFTER the mode function wrote the rear
-    -- outputs (updateHover always zeroes them; updateCruise writes level).
-    if ap.brake_reverse then
-        local brk = clamp(math.ceil(speed * 3), 1, 8)
-        self:apRear(brk, true)
-    end
+    -- The reverse brake write itself lives in Flight:update(): this
+    -- function now runs BEFORE the mode function, so the flag it sets here
+    -- is consumed there, after the mode/auto-land rear outputs.
 end
 
 function Flight:updateState()
@@ -1092,54 +1373,19 @@ function Flight:update()
         end
     end
 
-    -- E-stop latch first: no tune may start or run while latched.
-    -- (emergencyStop finishes any active tune, so tuning is already false here.)
+    -- E-stop latch first: outputs are cut while latched.
     if self.estop then
         self:cutPropsSoft()
         self:applyOutputs()
         return self.outputs
     end
 
-    -- Altitude PID auto-tune: bang-bang while airborne in HOVER
-    if self.tuning then
-        if self.landed or self.mode ~= Flight.MODE_HOVER then
-            self:finishAutoTune(false, "aborted")
-        else
-            local done, tune_ok = self.pid.altitude:updateAutoTune(dt)
-            self:cutPropsSoft()
-            self:setUniformSpeed(self.tune_speed or 0)
-            self:applyOutputs()
-            if done then
-                local g = self.pid.altitude:getGains()
-                self:finishAutoTune(tune_ok, tune_ok
-                    and string.format("K%.1f I%.2f D%.1f", g.kp, g.ki, g.kd)
-                    or "no oscillation")
-            end
-            return self.outputs
-        end
-    end
-
-    -- Promote a pending tune once we are actually flying in HOVER
-    if self.tune_pending and not self.landed and self.mode == Flight.MODE_HOVER then
-        self.tune_pending = false
-        self.tune_requested = true
-        self.tune_status = "queued"
-    end
-
-    if self.tune_requested then
-        if self.landed or self.mode ~= Flight.MODE_HOVER then
-            -- conditions changed since the request (e.g. landed at boot)
-            self.tune_requested = false
-            self.tune_pending = true
-            self.tune_status = "waiting for air"
-        else
-            self:beginAutoTune()
-            self:cutPropsSoft()
-            self:setUniformSpeed(self.tune_speed or 0)
-            self:applyOutputs()
-            return self.outputs
-        end
-    end
+    -- Waypoint AUTOPILOT FIRST: it reads only state/targets/land_state (no
+    -- outputs) and computes mode, yaw/altitude/speed targets, phases and the
+    -- reverse-brake flag for THIS tick — so the mode function below checks
+    -- the position AND applies the correction inside the same 20 Hz tick
+    -- (the old AP-last order deferred every correction by one full tick).
+    self:updateAutopilot(dt)
 
     if self.mode == Flight.MODE_HOVER then
         self:updateHover(dt)
@@ -1149,10 +1395,14 @@ function Flight:update()
 
     self:updateAutoLand(dt)
 
-    -- Waypoint AUTOPILOT: runs after the mode function wrote its outputs so
-    -- it can override the rear with a reverse brake. It owns mode/yaw/alt/
-    -- speed for the NEXT tick (one 20 Hz tick of latency, imperceptible).
-    self:updateAutopilot(dt)
+    -- Reverse brake must be written AFTER the mode function wrote the rear
+    -- outputs (updateHover zeroes them; updateCruise writes level) and after
+    -- auto-land's pulsed rear writes — exactly where the AP block used to
+    -- sit when it ran last. The flag itself is computed above, same tick.
+    if self.ap and self.ap.brake_reverse then
+        local brk = clamp(math.ceil((self.state.speed or 0) * 3), 1, 8)
+        self:apRear(brk, true)
+    end
 
     if self.landed and not self.auto_land then
         -- idle on ground: creep + anti-drift (unless pilot already commanded climb)
@@ -1332,7 +1582,7 @@ function Flight:updateHover(dt)
     local targets = self.targets
     local limits = self.config.limits
     local tilt_max = limits.tilt_max or 12
-    local hover = limits.hover_throttle or 6
+    local hover, kh, den = hoverFF(limits, state) -- height/rate-scaled feedforward
     local hmin = limits.hover_min_speed or 0
     local hmax = limits.hover_max_speed or 15
 
@@ -1358,11 +1608,26 @@ function Flight:updateHover(dt)
         yaw_stick = 0
     end
 
-    -- Tilt: pilot stick only (W/S collective, Q/E yaw).
-    -- Sign flipped: W (forward) was pushing the ship backward.
-    local collective = -fwd * tilt_max
-
     local yaw_tilt = self:rotationControl(dt, yaw_stick, tilt_max)
+
+    -- Tilt is TRANSLATION, not angle control. The props only vector fore/aft
+    -- (tilt_fwd/tilt_bwd), so:
+    --   collective  = all four props the same angle -> forward/back thrust.
+    --                 Only wanted when the ship is otherwise stationary;
+    --                 asking for translation and yaw at once fights over the
+    --                 same actuator.
+    --   yaw_tilt    = left pair one way, right pair the other -> a pure yaw
+    --                 couple (see AP_YAW_ROLL_COUPLING).
+    -- Angle control (pitch/roll) is PROP SPEED, below, never tilt.
+    local collective = -fwd * tilt_max
+    -- Yaw gets priority on the shared tilt authority. Sharing it outright let
+    -- a hard turn saturate the sum and CANCEL forward thrust (collective at
+    -- -tilt_max plus yaw at +tilt_max clamps one side to 0), so the ship
+    -- lost all drive mid-turn. Fade the collective as the yaw demand grows:
+    -- full yaw = no translation request, which is the intended behaviour.
+    if math.abs(yaw_tilt) > 0.01 then
+        collective = collective * (1 - math.min(1, math.abs(yaw_tilt) / tilt_max))
+    end
 
     -- Stability via prop speed REDUCTION only (never tilt, never speeding a
     -- prop above the altitude-PID base): PID leveling + gyro damp toward 0
@@ -1374,8 +1639,34 @@ function Flight:updateHover(dt)
     -- W/S stick fades the pitch axis (the pilot's angle-maneuver override);
     -- AP-driven forward tilt does NOT fade it. PIDs update every tick so the
     -- derivative state stays fresh under override.
-    local pitch_out = self.pid.pitch:update(0, state.pitch, dt)
-    local roll_out = self.pid.roll:update(0, state.roll, dt)
+    -- Yaw is not a free manoeuvre: the hull turns about an axis AFT of the
+    -- centre of mass (rear fin drag), so commanding yaw also rolls and
+    -- pitches it. Previously the levelling PIDs only saw that as a
+    -- disturbance and chased it, which is the rock/wiggle through every
+    -- turn. Estimate the coupling from the commanded tilt and aim the PIDs at
+    -- the compensating attitude instead, so the correction lands in the same
+    -- tick. Still reduction-only: raising a prop above base has no headroom
+    -- at altitude.
+    -- Both terms are bounded. They compensate for the attitude the hull picks
+    -- up while yawing about an axis aft of the centre of mass, so they are a
+    -- TRIM, and a trim is small. AP_YAW_ROLL_COUPLING is still an unmeasured
+    -- guess: unclamped, full yaw asked the stabiliser to hold 0.55*12 = 6.6
+    -- deg of bank and 3.6 deg of pitch, which is not a correction any more --
+    -- it is a hard turn command, and with the cap correctly keyed to the error
+    -- the stabiliser now obeys it hard enough to fly the ship off its bearing.
+    -- Bounding it means a too-small guess under-corrects (the stabiliser still
+    -- trims a little) instead of commanding an attitude that wrecks the turn.
+    -- Read from config so the trim can be calibrated per ship and per world
+    -- without editing code, and so a test can exercise the enabled case.
+    local yc = self.config.limits or {}
+    local k_roll = tonumber(yc.yaw_roll_coupling)
+    local k_pitch = tonumber(yc.yaw_pitch_coupling)
+    if k_roll == nil then k_roll = AP_YAW_ROLL_COUPLING end
+    if k_pitch == nil then k_pitch = AP_YAW_PITCH_COUPLING end
+    local yaw_roll_ff = clamp(-k_roll * yaw_tilt, -AP_YAW_FF_MAX, AP_YAW_FF_MAX)
+    local yaw_pitch_ff = clamp(-k_pitch * yaw_tilt, -AP_YAW_FF_MAX, AP_YAW_FF_MAX)
+    local pitch_out = self.pid.pitch:update(0, state.pitch - yaw_pitch_ff, dt)
+    local roll_out = self.pid.roll:update(0, state.roll - yaw_roll_ff, dt)
     local pitch_auth = (self.ap and 1) or (1 - math.min(1, math.abs(fwd)))
     local function stabCap(att)
         local a = math.abs(att)
@@ -1397,10 +1688,44 @@ function Flight:updateHover(dt)
         if a <= 12 then return roll_top end
         return roll_top + 2
     end
-    local pitch_cap = stabCap(state.pitch) * pitch_auth
-    local roll_cap = rollCap(state.roll)
-    local pitch_corr = clamp(pitch_out - 0.25 * (state.pitch_rate or 0), -pitch_cap, pitch_cap)
-    local roll_corr = clamp(roll_out - 0.25 * (state.roll_rate or 0), -roll_cap, roll_cap)
+    -- The cap is a gain limit on "how far is the ship from where it should
+    -- be", so it has to be keyed to the PID ERROR, not to the measured
+    -- attitude. Those are the same quantity only while the setpoint is level
+    -- -- and it no longer is, because the yaw feedforward above aims the PIDs
+    -- at a compensating attitude of up to 0.55*12 = 6.6 deg of roll and
+    -- 0.30*12 = 3.6 deg of pitch.
+    --
+    -- Keyed to the attitude, a ship sitting near level mid-turn measured
+    -- |roll| < 2 and was handed a cap of ZERO: stabilisation switched itself
+    -- off at the exact moment the error was largest. It then had its gain
+    -- doubled crossing 6 deg on the way to its own 6.6 deg target, and
+    -- retriggered every breakpoint again as the converging bearing walked the
+    -- setpoint back down through them. Stepping loop gain while the error is
+    -- still live is what turns a turn into a rock.
+    --
+    -- These are the same errors the PIDs compute internally (their setpoint is
+    -- 0, their measurement is state.X - ff), so the cap and the correction
+    -- can no longer disagree. With no yaw command -- every level, climb and
+    -- landing case the caps were tuned on -- ff is 0, the error equals the
+    -- attitude, and the schedule is bit-for-bit the old one.
+    local pitch_err = yaw_pitch_ff - (state.pitch or 0)
+    local roll_err = yaw_roll_ff - (state.roll or 0)
+    local pitch_cap = stabCap(pitch_err) * pitch_auth
+    local roll_cap = rollCap(roll_err)
+    -- Pressure- + climb-rate-scheduled authority (scale = kh/den): prop
+    -- speed DIFS make thrust pressure-scaled AND cut by the (1 - v/airflow)
+    -- factor while the ship climbs, but the disturbance (gravity on an
+    -- off-centre hull) does neither — at y260 the caps only deliver 45% of
+    -- their sea-level moment, and a climb at v=8 cuts the correction
+    -- another 32% (the hull noses up and the weak diff never arrives).
+    -- Multiplying corr + cap by kh/den restores ground-equivalent authority
+    -- at any height AND climb rate (kh=1, den=1 near the ground and in
+    -- level flight, so takeoff/landing/level behaviour is untouched).
+    local scale = kh / den
+    local pitch_corr = clamp((pitch_out - 0.25 * (state.pitch_rate or 0)) * scale,
+        -pitch_cap * scale, pitch_cap * scale)
+    local roll_corr = clamp((roll_out - 0.25 * (state.roll_rate or 0)) * scale,
+        -roll_cap * scale, roll_cap * scale)
 
     -- Time-domain precision: strength is quantized, so trim with duration —
     -- a pulse train (STAB_PERIOD window) whose duty grows 0 -> 0.5 -> 1.0
@@ -1425,8 +1750,25 @@ function Flight:updateHover(dt)
         end
         return 0.5 + 0.5 * (a - 2) / 8
     end
-    local pitch_duty = stabDuty(state.pitch) * pitch_auth
-    local roll_duty = rollDuty(state.roll)
+    -- Same reasoning as the caps above: the deadband here means "am I already
+    -- where I was told to be", so it has to be measured against the PID error.
+    -- Keyed to the raw attitude it reads a trimmed ship as perfectly level and
+    -- gates the axis off. Under the autopilot this is currently masked (the
+    -- override below forces continuous correction), but in manual flight a
+    -- yaw trim would be silently discarded, and the day that override is
+    -- revisited the bug returns. With no trim -- the default -- the error
+    -- equals the attitude and this is the original schedule unchanged.
+    local pitch_duty = stabDuty(pitch_err) * pitch_auth
+    local roll_duty = rollDuty(roll_err)
+    if self.ap then
+        -- Under the autopilot the pulse train is OFF: duty 0.5-1.0 halves
+        -- attitude authority and rings the hull through long climbs ("tips
+        -- up, wobbles"). The caps + deadband still bound the correction —
+        -- this only makes it CONTINUOUS (cruise has run continuous all
+        -- along and the pilot called it perfect). Manual flight unchanged.
+        pitch_duty = pitch_auth
+        roll_duty = 1
+    end
     if self.stab_phase >= pitch_duty then pitch_corr = 0 end
     if self.stab_phase >= roll_duty then roll_corr = 0 end
 
@@ -1435,6 +1777,27 @@ function Flight:updateHover(dt)
     local RL_tilt = clamp(collective + yaw_tilt, -tilt_max, tilt_max)
     local RR_tilt = clamp(collective - yaw_tilt, -tilt_max, tilt_max)
 
+    -- TILT IS A BINARY ACTUATOR. The block rotates each prop a fixed
+    -- AP_TILT_ANGLE (25 deg) forward or backward and leaves it level otherwise;
+    -- the analog level is not proportional, so a command of 6 and a command of
+    -- 12 tilt by exactly the same 25 deg. Consequences:
+    --
+    --  * Tilting REDUCES vertical thrust to cos(25 deg) = 0.906 of level, i.e.
+    --    the ship loses 9.4% of its lift the moment it translates or yaws.
+    --    mean_tilt_lift below is what is left, and the altitude channel scales
+    --    its demand by 1/mean_tilt_lift to pay it back. Without this the ship
+    --    sags every time it moves.
+    --  * A collective value that is merely SMALL does not mean "a little
+    --    thrust" -- it still means a full 25 deg. So the fade above is only
+    --    meaningful in that it snaps one side to level, which trades thrust for
+    --    yaw. tiltVerticalFactor quantises explicitly so the model and the
+    --    code agree on what the block actually does.
+    local tilt_vert = 0
+    for _, tv in ipairs({ FL_tilt, FR_tilt, RL_tilt, RR_tilt }) do
+        tilt_vert = tilt_vert + math.cos(tiltPhysicalAngle(tv, tilt_max) * AP_TILT_RAD)
+    end
+    local mean_tilt_lift = clamp(tilt_vert / 4, 0.1, 1)
+
     -- Altitude: mean prop speed (attitude uses per-prop speed differentials).
     -- D uses climb rate (measurement) so altitude steps do not kick.
     local alt_output = self.pid.altitude:update(targets.altitude, state.altitude, dt, state.climb_rate)
@@ -1442,10 +1805,10 @@ function Flight:updateHover(dt)
     local flying = false
 
     if not self.landed then
-        base_speed = clamp(hover + alt_output, hmin, hmax)
+        base_speed = clamp((hover + alt_output) / mean_tilt_lift, hmin, hmax)
         flying = true
     elseif targets.altitude > state.altitude + 0.5 then
-        base_speed = clamp(hover + alt_output, hmin, hmax)
+        base_speed = clamp((hover + alt_output) / mean_tilt_lift, hmin, hmax)
         flying = true
     else
         base_speed = 0
@@ -1469,10 +1832,42 @@ function Flight:updateHover(dt)
     -- altitude target alone produces the descent command. (A reduced
     -- feedforward here made the ship free-fall below the path.)
     if flying then
-        -- Only-reduce: no prop ever goes above base_speed. The pair on the
-        -- side needing less lift slows down (nose down -> rear slows, right
-        -- down -> left slows); the opposite pair stays at base, so the
-        -- altitude PID absorbs the small mean-thrust loss.
+        -- ATTITUDE CORRECTION MUST NOT SPEND THE LIFT.
+        --
+        -- The stabiliser is reduce-only, so a correction costs altitude
+        -- directly. High up, hover already wants 14.3 of 15, leaving under one
+        -- unit of margin: a routine attitude correction spent it, the mean prop
+        -- speed dropped below hover, the ship started sinking, and the
+        -- stabiliser then kept cutting to chase an attitude it no longer had
+        -- the thrust to correct -- it fell 180 m and parked there, roll and
+        -- pitch frozen at 16 degrees on 7/15 thrust. That feedback loop is
+        -- exactly the "climb does ups and downs" symptom.
+        --
+        -- Correction is DIFFERENTIAL, so only its COMMON-MODE part costs lift:
+        -- the mean prop speed after the cut is
+        --     base - (|pitch_corr| + |roll_corr|) / 2
+        -- (one of p_front/p_rear is always zero, likewise left/right). Cap that
+        -- loss at the headroom above hover, scaling both axes together so the
+        -- attitude correction stays in proportion and simply gets gentler as
+        -- the lift budget runs out. Altitude wins; attitude gets whatever is
+        -- left, instead of attitude winning and the ship falling out of the sky.
+        -- NOTE: attitude correction is deliberately NOT budgeted against
+        -- hover thrust here. It was tempting to cap it by the spare thrust
+        -- above hover, on the grounds that a levelling correction must not
+        -- steal the climb's lift. Measured against the two test models that
+        -- idea is wrong, and in the trusted vertical model it is actively
+        -- harmful: mid-climb the stabiliser legitimately asks for ~6.8 units
+        -- of differential with only ~0.1 spare, and uncapped it still climbs
+        -- and still holds pitch inside 6 deg -- which is exactly the 22/22
+        -- green baseline, and the behaviour the shipped cruise was tuned on.
+        -- Budgeting it collapsed pitch to 23 deg (limit 6) and a hard cap at
+        -- the top of the climb also pinned mean thrust at 7 against a hover
+        -- demand of 13.5. The vertical model and the 0-15 Create model also
+        -- do not share thrust scaling, so a fraction tuned on one is simply
+        -- wrong on the other. Allocation stays uncapped; the altitude/attitude
+        -- interaction is handled by the climb's own rate gain instead.
+        local mean_loss = (math.abs(pitch_corr) + math.abs(roll_corr)) / 2
+        if mean_loss < 0 then mean_loss = 0 end
         self.outputs.speed = base_speed
         local p_front = math.max(pitch_corr, 0)
         local p_rear = math.max(-pitch_corr, 0)
@@ -1502,7 +1897,7 @@ function Flight:updateCruise(dt)
     local state = self.state
     local targets = self.targets
     local limits = self.config.limits or {}
-    local hover = limits.hover_throttle or 6
+    local hover, kh, den = hoverFF(limits, state) -- height/rate-scaled prop feedforward
     local hmin = limits.hover_min_speed or 0
     local hmax = limits.hover_max_speed or 15
 
@@ -1513,13 +1908,18 @@ function Flight:updateCruise(dt)
 
     local alt_output = self.pid.altitude:update(targets.altitude, state.altitude, dt, state.climb_rate)
 
+    -- Cruise flies wings-level: all prop tilt is zeroed further down, so there
+    -- is no tilt lift loss to pay back and mean_tilt_lift is exactly 1. Kept as
+    -- a named value so both flight modes share one demand formula.
+    local mean_tilt_lift = 1
+
     local base_speed = 0
     local flying = false
     if not self.landed then
-        base_speed = clamp(hover + alt_output, hmin, hmax)
+        base_speed = clamp((hover + alt_output) / mean_tilt_lift, hmin, hmax)
         flying = true
     elseif targets.altitude > state.altitude + 0.5 then
-        base_speed = clamp(hover + alt_output, hmin, hmax)
+        base_speed = clamp((hover + alt_output) / mean_tilt_lift, hmin, hmax)
         flying = true
     else
         base_speed = 0
@@ -1553,10 +1953,53 @@ function Flight:updateCruise(dt)
         if math.abs(eff) > AP_BANK_DEAD then
             roll_target = clamp(AP_BANK_KP * eff, -AP_BANK_MAX, AP_BANK_MAX) * AP_BANK_SIGN
         end
+        -- Bank-to-turn is a luxury the ship cannot always afford. A bank is
+        -- paid for out of the MEAN thrust (the differential is reduce-only),
+        -- so climbing while banked can stall: measured on the 0-15 model, the
+        -- ship sat 35 m under target holding a 6.8 deg bank, because the
+        -- levelling correction and the climb were competing for the same
+        -- units and attitude -- the faster loop -- kept winning.
+        --
+        -- So fade the bank out as the altitude error grows and bring it back
+        -- once the ship is on altitude. The recovery climb is then flown
+        -- level, and heading control resumes at the target. This attenuates
+        -- the DEMAND rather than capping thrust, which is why it does not
+        -- disturb the levelling authority the vertical tests pin down.
+        local alt_err = math.abs((targets.altitude or 0) - (state.altitude or 0))
+        if alt_err > 1e-6 then
+            roll_target = roll_target * (1 - clamp(alt_err / AP_BANK_ALT_FADE, 0, 1))
+        end
         local roll_out = self.pid.roll:update(roll_target, state.roll, dt)
-        local roll_corr = clamp(roll_out - 0.15 * (state.roll_rate or 0), -AP_STAB_OUT, AP_STAB_OUT)
         local pitch_out = self.pid.pitch:update(0, state.pitch, dt)
-        local pitch_corr = clamp(pitch_out - 0.15 * (state.pitch_rate or 0), -AP_STAB_OUT, AP_STAB_OUT)
+        -- Same kh/den authority scheduling as updateHover (pressure AND
+        -- climb-rate cut the prop DIFS but not the hull disturbance);
+        -- scale=1 at sea level in level flight -> cruise feel unchanged.
+        local scale = kh / den
+        local roll_corr = clamp((roll_out - 0.15 * (state.roll_rate or 0)) * scale,
+            -AP_STAB_OUT * scale, AP_STAB_OUT * scale)
+        local pitch_corr = clamp((pitch_out - 0.15 * (state.pitch_rate or 0)) * scale,
+            -AP_STAB_OUT * scale, AP_STAB_OUT * scale)
+        -- Same lift-budget cap as updateHover: a reduce-only attitude
+        -- correction costs altitude, and near the ceiling there is no altitude
+        -- to spend. Without this the correction drives the mean prop speed
+        -- below hover and the ship sinks out from under itself.
+        -- NOTE: attitude correction is deliberately NOT budgeted against
+        -- hover thrust here. It was tempting to cap it by the spare thrust
+        -- above hover, on the grounds that a levelling correction must not
+        -- steal the climb's lift. Measured against the two test models that
+        -- idea is wrong, and in the trusted vertical model it is actively
+        -- harmful: mid-climb the stabiliser legitimately asks for ~6.8 units
+        -- of differential with only ~0.1 spare, and uncapped it still climbs
+        -- and still holds pitch inside 6 deg -- which is exactly the 22/22
+        -- green baseline, and the behaviour the shipped cruise was tuned on.
+        -- Budgeting it collapsed pitch to 23 deg (limit 6) and a hard cap at
+        -- the top of the climb also pinned mean thrust at 7 against a hover
+        -- demand of 13.5. The vertical model and the 0-15 Create model also
+        -- do not share thrust scaling, so a fraction tuned on one is simply
+        -- wrong on the other. Allocation stays uncapped; the altitude/attitude
+        -- interaction is handled by the climb's own rate gain instead.
+        local mean_loss = (math.abs(pitch_corr) + math.abs(roll_corr)) / 2
+        if mean_loss < 0 then mean_loss = 0 end
         local p_front = math.max(pitch_corr, 0)
         local p_rear = math.max(-pitch_corr, 0)
         local r_left = math.max(-roll_corr, 0)
@@ -1701,11 +2144,11 @@ function Flight:runUnflip(dt)
     end
 
     -- Detection: near-or-at 180 for INV_HOLD seconds (airborne, no e-stop,
-    -- not mid-auto-tune, cooldown elapsed).
+    -- cooldown elapsed).
     local inverted = math.abs(state.pitch) >= INV_ATT
         or math.abs(state.roll) >= INV_ATT
     if inverted and not self.landed and not self.estop
-        and not self.tuning and self.inv_cooldown <= 0 then
+        and self.inv_cooldown <= 0 then
         self.inv_time = self.inv_time + dt
         if self.inv_time >= INV_HOLD then
             self.inv_time = 0
@@ -1737,82 +2180,17 @@ function Flight:emergencyStop()
     self.targets.yaw_cmd = 0
     self.targets.speed = 0 -- do not retain a cruise speed target across e-stop
     self.estop = true
-    self.tune_pending = false
-    self.tune_requested = false
     self:cancelAutopilot(nil) -- e-stop also aborts the autopilot (no event: estop announces itself)
     self.wp_event = nil       -- do not replay a stale arrived/cancelled event after reboot
     self.unflip = nil       -- cutAllOutputs below also drops the reverse link
     self.inv_time = 0
     self.inv_cooldown = 0
     self.shutdown_request = nil
-    if self.tuning then
-        self:finishAutoTune(false, "e-stop")
-    end
     self.hw.cutAllOutputs()
     self:cutPropsSoft()
     for _, pid in pairs(self.pid) do
         pid:reset()
     end
-end
-
-function Flight:requestAutoTune()
-    if self.estop then
-        self.tune_status = "e-stop active"
-        return false, self.tune_status
-    end
-    if self.unflip then
-        self.tune_status = "unflip active"
-        return false, self.tune_status
-    end
-    if self.tuning then
-        self.tune_status = "already tuning"
-        return false, self.tune_status
-    end
-    if self.landed or self.mode ~= Flight.MODE_HOVER then
-        -- wait until airborne HOVER (boot while grounded / wrong mode)
-        self.tune_pending = true
-        self.tune_requested = false
-        self.tune_status = "waiting for air"
-        return true, self.tune_status
-    end
-    self.tune_pending = false
-    self.tune_requested = true
-    self.tune_status = "queued"
-    return true, "queued"
-end
-
-function Flight:beginAutoTune()
-    local pid = self.pid.altitude
-    pid:startAutoTune(
-        function()
-            -- live target: reads targets.altitude each tick (adjustAltitude
-            -- is blocked while tuning, but auto-land also walks the target)
-            return self.targets.altitude - self.state.altitude
-        end,
-        function(out)
-            -- bang-bang altitude drive: map ±output_limit to 0..15 speed
-            self.tune_speed = math.max(0, math.min(15, 7.5 + (out / pid.output_limit) * 7.5))
-        end
-    )
-    self.tuning = true
-    self.tune_requested = false
-    self.tune_pending = false
-    self.tune_status = "running"
-end
-
-function Flight:finishAutoTune(ok, msg)
-    self.tuning = false
-    self.tune_requested = false
-    self.tune_pending = false
-    self.tune_speed = 0
-    self.tune_status = msg or (ok and "done" or "failed")
-    self.pid.altitude:reset()
-    self.pid.pitch:reset()
-    self.pid.roll:reset()
-    if self.onTuneComplete then
-        pcall(self.onTuneComplete, ok)
-    end
-    return ok, self.tune_status
 end
 
 function Flight:getStatus()
@@ -1836,8 +2214,6 @@ function Flight:getStatus()
         land_state = self.land_state,
         proximity = self.proximity,
         sable_error = self.last_sable_error,
-        tuning = self.tuning,
-        tune_status = self.tune_status,
         estop = self.estop,
         unflip = self.unflip ~= nil,
         position = self.state.position,
