@@ -154,6 +154,38 @@ local AP_BANK_RATE_LEAD = 0.6 -- s: back off the bank command by yaw_rate so
 local AP_STAB_OUT = 6       -- max cruise attitude speed-diff units (pitch+roll);
                             -- matches the hover high-angle cap (6). 10 slashed a
                             -- side to 0 and rolled violently. Raise for more.
+local AP_STAB_ADAPT_KNEE = 0.5 -- prop headroom (as a fraction of hmax) below
+                            -- which attitude authority starts tapering. Full
+                            -- authority while the props have room to give.
+local AP_STAB_ADAPT_MIN = 0.2  -- taper floor: corrections shrink as the props
+                            -- approach max speed but never vanish, so the hull
+                            -- can always be caught.
+                            --
+                            -- The floor has to be LOW on purpose. scale is
+                            -- kh/den * adapt, and kh is itself proportional to
+                            -- the prop speed (both go as 1/pressure), so a mild
+                            -- taper LOSES to the kh term and corrections still
+                            -- grow with altitude -- the exact wiggle that was
+                            -- reported. At 0.4 the net scale was 1.15 at y270
+                            -- against 1.07 at y80, i.e. still rising. At 0.2 the
+                            -- product turns over: 1.07 at y80 (adapt=1, low
+                            -- altitude untouched), 1.27 at y150, 0.78 at y270.
+                            -- The peak sits in the mid climb, where the ship
+                            -- still has plenty of headroom to give.
+local AP_BANK_GIVEUP = 25   -- deg heading error bank-to-turn cannot recover
+                            -- from at the ceiling -> re-acquire in hover, where
+                            -- yaw is tilt-driven and needs no lift headroom
+local AP_BANK_HEADROOM = 3  -- prop units of hover headroom required before
+                            -- bank-to-turn is attempted at all. A bank is
+                            -- reduce-only, so it is paid for out of the mean
+                            -- thrust; with less than this in hand the
+                            -- saturated bank cannot be sustained and the ship
+                            -- spins. Below it, steering is handed to hover.
+local AP_BANK_AFFORD = 0.9  -- prop units of headroom required to hold a bank
+                            -- at all. Lower than AP_BANK_HEADROOM (which gates
+                            -- the whole cruise phase) because once committed
+                            -- the loop has to see it through; the fade below
+                            -- then shrinks the bank as the margin is spent.
 local AP_YAW_GAIN = 30      -- deg err for full yaw stick (aim)
 local AP_ALIGN_GAIN = 12    -- deg err for full yaw stick (align, finer)
 local AP_YAW_LEAD = 2       -- PD lead: restores the open-loop turn rate that
@@ -235,10 +267,13 @@ end
 --   5. A velocity PID closes the loop on MEASURED climb rate
 --      (sublevel.getLinearVelocity), and a slew limiter caps how far the
 --      collective may move per tick so the props can no longer jump 0 <-> 15.
-local AP_CLIMB_V = 5          -- m/s: cruise climb rate in transit. Deliberately
-                              -- gentle: the ship has to keep 2 prop units in
-                              -- hand for attitude control, and a fast climb
-                              -- costs a proportional amount of that headroom.
+local AP_CLIMB_V = 8          -- m/s: cruise climb rate in transit. Raised from
+                              -- 5 once the measured climb was steady and
+                              -- smooth: the headroom cost is paid by
+                              -- stabAdapt() tapering attitude authority as the
+                              -- props speed up, not by crawling. The v^2 brake
+                              -- curve means a higher target costs nothing near
+                              -- the goal -- only the mid-climb transit speeds up.
 local AP_CLIMB_BRAKE = 0.9    -- m/s^2: assumed braking capability, used only
                               -- to shape v_des. The velocity PID absorbs any
                               -- error between this guess and the real ship, so
@@ -278,9 +313,8 @@ local AP_CLIMB_TIMEOUT = 180   -- s: dedicated climb-phase failsafe. The generic
                               -- really bounded by the ceiling probe (physical
                               -- limit) and the stall failsafe (no progress);
                               -- this is only a last-resort backstop.
-local AP_CLIMB_KD_CUT = 3     -- m: below this remaining, derivative (rate
-                              -- lead) is faded out so the arrival is governed
-                              -- by the brake profile, not by rate noise
+-- NOTE: there is no AP_CLIMB_KD_CUT any more. The velocity loop is PI (see
+-- the climb block); a derivative fade was computed once and never applied.
 -- OPERATING CEILING, DISCOVERED RATHER THAN ASSUMED.
 -- The old 285 was a guess: it came from a wiki thrust curve for THIS ship at
 -- 256 rpm and 12.8*sqrt(sails) airflow, but the ship gets shared, the props get
@@ -671,6 +705,38 @@ function Flight:apYawCmd(err, gain, dead)
     return clamp(AP_YAW_SIGN * lead - damp, -1, 1)
 end
 
+-- ADAPTIVE STABILISER GAIN. The attitude correction is a reduce-only prop
+-- speed DIFFERENTIAL, so the room it has to work in is the headroom left above
+-- hover. Near the ceiling hover is already ~14.3 of 15, and the old law scaled
+-- corrections UP with kh (1/pressure) to restore angular authority. That hands
+-- a big differential to a prop that has almost nothing to give: the
+-- differential eats mean thrust, the hull drops, the altitude loop pushes back,
+-- and the ship rocks. That is the high-altitude wiggle.
+--
+-- So scale authority by the headroom instead: untouched while the props have
+-- room, tapering to a floor as hover eats into hmax.
+--
+-- The headroom MUST be keyed on the STATIC hover (base * kh), not on the
+-- live `hover` feedforward. The live value carries the 1/den climb-rate term,
+-- so keying on it ties attitude gain to climb rate: at y150 a climb at 8 m/s
+-- reads hover=12.5 against 8.5 level, and tapers the gain to 0.6 while level
+-- flight kept 0.92 -- a 0.65 multiplier on the climb's attitude correction.
+-- That is exactly the moment invariance the vertical test pins (it failed at
+-- ratio 0.652). Callers pass hover*den, which cancels the climb term and
+-- leaves the altitude-only part.
+--
+-- This is a GAIN taper with a floor, NOT the hard lift-budget cap that was
+-- tried and reverted -- that pinned mean thrust at 7 against a 13.5 hover
+-- demand and collapsed pitch to 23 deg. AP_STAB_ADAPT_MIN deliberately keeps
+-- real authority so a leaning hull is still caught.
+local function stabAdapt(static_hover, hmax)
+    local span = math.max(hmax or 0, 0.001)
+    local headroom = clamp((span - (static_hover or 0)) / span, 0, 1)
+    if headroom >= AP_STAB_ADAPT_KNEE then return 1 end
+    return AP_STAB_ADAPT_MIN
+        + (1 - AP_STAB_ADAPT_MIN) * (headroom / AP_STAB_ADAPT_KNEE)
+end
+
 function Flight:startAutopilot(wp)
     if self.estop then return false, "E-STOP LATCHED" end
     if self.unflip then return false, "UNFLIP RUNNING" end
@@ -961,21 +1027,25 @@ function Flight:updateAutopilot(dt)
                     vdes = math.min(AP_CLIMB_V, v_brake, AP_CLIMB_VLIM)
                 end
 
-                -- (2) VELOCITY PID on MEASURED climb rate. I is a leaky
+                -- (2) VELOCITY PI on MEASURED climb rate. I is a leaky
                 --     integrator: it trims the steady-state offset but leaks
                 --     whenever the velocity error is small, so it cannot wind
                 --     up during the long cruise at rate and then fire on
-                --     arrival. D is rate-lead faded out over the last
-                --     AP_CLIMB_KD_CUT metres so the final metres are governed
-                --     by the brake profile instead of by rate noise.
+                --     arrival.
+                --
+                --     There is deliberately NO D term here. The earlier draft
+                --     computed a `kd` that faded over the last AP_CLIMB_KD_CUT
+                --     metres, but it was never multiplied into v_out -- the
+                --     loop has always been PI. Rather than keep a constant and
+                --     a fade that do nothing, the dead code is gone; the final
+                --     metres are governed by the v^2 brake profile in (1),
+                --     which is what actually settles the arrival. A D term on
+                --     v_err would also fight that profile and re-introduce the
+                --     last-metre bounce the brake curve exists to prevent.
                 local v_err = vdes - rate
                 ap.climb_vi = (ap.climb_vi or 0) + v_err * dt
                 local leak = math.max(0, 1 - dt / 3.0)
                 ap.climb_vi = ap.climb_vi * leak
-                local kd = AP_CLIMB_KP
-                if remain < AP_CLIMB_KD_CUT then
-                    kd = AP_CLIMB_KP * math.max(0, remain / AP_CLIMB_KD_CUT)
-                end
                 local v_out = AP_CLIMB_KP * v_err + AP_CLIMB_KI * ap.climb_vi
 
                 -- (3) COLLECTIVE = feedforward + velocity PID, then the
@@ -1070,7 +1140,35 @@ function Flight:updateAutopilot(dt)
         end
         self.targets.yaw_cmd = 0
         self.targets.altitude = ap.alt
-        if math.abs(err) > AP_OFFCOURSE then
+        -- Bank-to-turn is a LUXURY that has to be paid for out of the mean
+        -- thrust (the differential is reduce-only), and near the ceiling hover
+        -- is already ~14.3 of 15 -- there is nothing left to bank with. A
+        -- saturated bank that cannot be sustained is worse than no bank at
+        -- all: the ship yawed at 44 deg/s off a 8 deg bank, overshot the
+        -- bearing, and the reversed bank drove it straight back -- an
+        -- unrecoverable limit cycle. Measured, the ship then sat at 1 m/s with
+        -- the bearing error past 100 deg, oscillating cruise<->correct, and
+        -- never made forward progress. Sweeping the rear ramp slower did not
+        -- help (1/s diverged identically) -- the ceiling has no headroom,
+        -- full stop.
+        --
+        -- So bank only when there is real margin in hand, and otherwise steer
+        -- with tilt-yaw in hover, which costs no lift headroom and already
+        -- lands on the bearing cleanly (the aim turn settles inside 4 deg).
+        local bank_ok = (hmax - hover) >= AP_BANK_HEADROOM
+        -- With headroom, the bank loop owns corrections up to AP_OFFCOURSE and
+        -- only hands over beyond AP_BANK_GIVEUP (past the point a saturated
+        -- bank can recover). Without headroom the bank is already faded to
+        -- nothing in updateCruise, so the ship is flying straight: hold that
+        -- line and only re-acquire once the bearing has genuinely drifted.
+        local giveup = bank_ok and AP_BANK_GIVEUP or AP_OFFCOURSE
+        if math.abs(err) > giveup then
+            self:setMode(Flight.MODE_HOVER)
+            self.targets.speed = 0
+            ap.step = "turn"
+            ap.pt = 0
+            setPhase("aim")
+        elseif math.abs(err) > AP_OFFCOURSE then
             setPhase("correct")
         elseif dist <= AP_BRAKE_R then
             setPhase("arrive")
@@ -1761,7 +1859,13 @@ function Flight:updateHover(dt)
     -- Multiplying corr + cap by kh/den restores ground-equivalent authority
     -- at any height AND climb rate (kh=1, den=1 near the ground and in
     -- level flight, so takeoff/landing/level behaviour is untouched).
-    local scale = kh / den
+    --
+    -- ...and then stabAdapt() scales the whole thing back down as hover eats
+    -- the prop-speed headroom. kh/den alone over-corrects up high: it inflates
+    -- the differential on a prop that cannot spare it, which is what rings the
+    -- hull through a high climb. adapt = 1 until there is less than half the
+    -- prop range in hand, then tapers to AP_STAB_ADAPT_MIN.
+    local scale = kh / den * stabAdapt(hover * den, hmax)
     local pitch_corr = clamp((pitch_out - 0.25 * (state.pitch_rate or 0)) * scale,
         -pitch_cap * scale, pitch_cap * scale)
     local roll_corr = clamp((roll_out - 0.25 * (state.roll_rate or 0)) * scale,
@@ -2009,12 +2113,27 @@ function Flight:updateCruise(dt)
         if alt_err > 1e-6 then
             roll_target = roll_target * (1 - clamp(alt_err / AP_BANK_ALT_FADE, 0, 1))
         end
+        -- Headroom gate: a bank is reduce-only, so holding one costs mean
+        -- thrust. With under AP_BANK_AFFORD units of hover margin the bank
+        -- cannot be sustained, and an unsustained saturated bank is a positive
+        -- feedback loop -- the hull yaws, overshoots the bearing, the bank
+        -- reverses and yaws it back. Measured at the ceiling: 8 deg of bank
+        -- produced 44 deg/s of yaw and a ship that never settled. Fade the
+        -- bank out as the margin is spent so the ship holds its bearing, and
+        -- let the autopilot hand steering to the hover turn (which costs no
+        -- headroom) instead of spinning here.
+        local bank_margin = clamp(
+            ((hmax - hover) - AP_BANK_AFFORD) / math.max(AP_BANK_AFFORD, 0.001),
+            0, 1)
+        roll_target = roll_target * bank_margin
         local roll_out = self.pid.roll:update(roll_target, state.roll, dt)
         local pitch_out = self.pid.pitch:update(0, state.pitch, dt)
         -- Same kh/den authority scheduling as updateHover (pressure AND
         -- climb-rate cut the prop DIFS but not the hull disturbance);
         -- scale=1 at sea level in level flight -> cruise feel unchanged.
-        local scale = kh / den
+        -- stabAdapt() then tapers it back as hover eats the headroom, so the
+        -- differential shrinks the faster the props must spin (see stabAdapt).
+        local scale = kh / den * stabAdapt(hover * den, hmax)
         local roll_corr = clamp((roll_out - 0.15 * (state.roll_rate or 0)) * scale,
             -AP_STAB_OUT * scale, AP_STAB_OUT * scale)
         local pitch_corr = clamp((pitch_out - 0.15 * (state.pitch_rate or 0)) * scale,

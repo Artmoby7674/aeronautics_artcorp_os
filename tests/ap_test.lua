@@ -719,5 +719,110 @@ do
         peak, env.plant.alt, arrive_v or -1, max_dcmd, mean_rate))
 end
 
+-- 10. THE TURN -> CRUISE HANDOFF MUST NOT SPIN THE SHIP.
+--     Reported: "after rotating to face the wp, the ship dove again and lost
+--     100 blocks of altitude and also didn't start going forward at all."
+--     Root cause was NOT the rear spool (sweeping cruise_ramp to 1/s diverged
+--     identically). It was the bank-to-turn loop: near the ceiling hover eats
+--     the prop headroom, the reduce-only bank cannot be sustained, and a
+--     saturated bank that cannot be held is positive feedback -- the hull yaws
+--     off it, overshoots the bearing, and the reversed bank yaws it straight
+--     back. Measured 8 deg of bank -> 44 deg/s of yaw and a bearing error
+--     past 100 deg, with the ship sitting at 1 m/s oscillating
+--     cruise<->correct and never making forward progress.
+--
+--     The fix gates banking on available headroom and hands steering back to
+--     the hover turn (tilt-yaw costs no lift headroom) when the margin is
+--     gone. So the bearing error must stay BOUNDED after the turn completes,
+--     and the ship must actually get up to speed.
+--
+--     Leg is 200 m at the learned ceiling (the hard case: least headroom).
+--     KNOWN GAP, not asserted here: legs past ~400 m still stall out at the
+--     ceiling and past ~600 m at any altitude, because the bank-to-turn loop
+--     itself is under-damped in this plant -- 8 deg of bank yaws at 44 deg/s,
+--     so the bank saturates, overshoots, and reverses. That predates this
+--     change (baseline f7a1272 reached max err 114 and the same 1.9 m/s crawl
+--     on an 800 m leg) and needs in-game measurement of the bank->yaw gain
+--     before it can be retuned honestly.
+do
+    local env = makeEnv({ alt0 = 60 })
+    local f = env.flight
+    -- Bearing 90 deg off the nose, so the run must turn before it can cruise.
+    f:startAutopilot{ name = "TURN", x = 200, z = 0, heading = 90 }
+
+    local turned, max_err_after, max_spd, arrived = false, 0, 0, false
+    for _ = 1, 6000 do                       -- 300 s
+        env.step()
+        if not finite(env.plant.alt) then break end
+        if f.ap then
+            if f.ap.phase == "cruise" then turned = true end
+            if turned then
+                max_err_after = math.max(max_err_after, math.abs(tonumber(f.ap.err) or 0))
+            end
+            max_spd = math.max(max_spd, math.sqrt(env.plant.vx ^ 2 + env.plant.vz ^ 2))
+            if f.ap.phase == "align" then arrived = true end
+        end
+    end
+    check("turn: the run reaches a cruise leg", turned, "never entered cruise")
+    -- The old loop ran the error out past 100 deg and kept going. Bound it.
+    check("turn: bearing error stays bounded after the turn (<= 40 deg)",
+        max_err_after <= 40, string.format("max err=%.1f", max_err_after))
+    -- "Didn't start going forward": the ship has to build real speed, not sit
+    -- at the 1 m/s crawl the runaway pinned it to.
+    check("turn: ship builds forward speed after the turn (>= 3 m/s)",
+        max_spd >= 3, string.format("max v=%.2f m/s", max_spd))
+    -- And it has to actually finish the leg, not stall short of it.
+    check("turn: leg completes after the turn", arrived, "never reached align")
+    print(string.format("turn: reached_cruise=%s max_err_after=%.1f max_v=%.2f arrived=%s",
+        tostring(turned), max_err_after, max_spd, tostring(arrived)))
+end
+
+-- 11. THE STABILISER TAPERS AS THE PROPS SPEED UP.
+--     Reported: "the higher we are, the faster the propeller speeds and so,
+--     the stronger the corrections. So we need an adaptive PID that sends
+--     smaller corrections the faster the propeller speed."
+--     stabAdapt() scales the attitude differential by the headroom left above
+--     hover, with a floor so the hull is still catchable. Same attitude error,
+--     two altitudes: the correction up high must be SMALLER, not bigger.
+--     Keyed on the STATIC hover (hover*den) so the gain does not move with
+--     climb rate -- keying it on the live feedforward broke climb moment
+--     invariance (vertical_test caught ratio 0.652).
+--
+--     NB the differential is measured on the Flight's OWN state table (f.state,
+--     not env.state) -- Flight caches a copy, so writing env.state does
+--     nothing and the test silently measured the undisturbed ship.
+do
+    local function meanDiffAt(alt0)
+        local env = makeEnv({ alt0 = alt0 })
+        local f = env.flight
+        f:startAutopilot{ name = "TAPER", x = 2000, z = 0, heading = 0, alt = alt0 }
+        local acc, n = 0, 0
+        for _ = 1, 1200 do
+            env.step()
+            if f.ap and f.ap.phase == "aim" and f.ap.step == "turn" then
+                -- same disturbance both times: hold a roll, measure the diff
+                f.state.roll = -4.0
+                f.state.roll_rate = 0
+                f.state.yaw_rate = 0
+                f:updateHover(0.05)
+                local o = f.outputs
+                acc = acc + math.abs((o.RL_speed or 0) - (o.RR_speed or 0))
+                n = n + 1
+                if n >= 200 then break end
+            end
+        end
+        return (n > 0) and (acc / n) or 0
+    end
+    local low = meanDiffAt(80)     -- plenty of headroom
+    local high = meanDiffAt(270)   -- props near max, almost nothing in hand
+    check("taper: high-altitude correction is smaller than low-altitude",
+        high < low * 0.85, string.format("low=%.3f high=%.3f", low, high))
+    -- ...but it must not vanish: a leaning hull still has to be caught.
+    check("taper: high-altitude correction keeps a floor (>= 25% of low)",
+        high >= low * 0.25, string.format("low=%.3f high=%.3f", low, high))
+    print(string.format("taper: low_alt_diff=%.3f high_alt_diff=%.3f ratio=%.2f",
+        low, high, (low > 0) and (high / low) or 0))
+end
+
 print(string.format("ap_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("ap_test FAILED", 0) end
