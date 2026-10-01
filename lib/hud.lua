@@ -106,8 +106,12 @@ local function applyLayout()
     L.tab_h = math.floor((avail - (n - 1) * L.tab_gap) / n)
     L.tab_h = math.max(14, math.min(24, L.tab_h))
 
-    -- shutdown circle: top-left of header
-    local d = 16
+    -- Shutdown circle: top-left of header. d is both the drawn diameter and the
+    -- tap rect. Tap targets here are CHARACTER CELLS (6x9 px) which the cell
+    -- sampler walks centre-then-corners, so the reachable set is already the
+    -- whole cell span overlapping the box -- an earlier HIT_PAD widened the
+    -- rect by 3 px and provably added zero reachable cells, so it is gone.
+    local d = 15
     shutdown_rect = { x = L.border + 4, y = L.border + 2, w = d, h = d, d = d }
     -- boot button under splash title (leave room for 3x logo + subtitle)
     local bw, bh = 64, 18
@@ -1395,7 +1399,12 @@ local function hitTest(x, y)
         return "boot"
     end
 
-    if shutdown_rect and inRect(shutdown_rect.x, shutdown_rect.y, shutdown_rect.w, shutdown_rect.h, x, y) then
+    -- Shutdown is gated on the ring actually being DRAWN. On the splash/boot
+    -- screens drawSplash never paints it, but the rect stayed hit-testable, so
+    -- a tap in the top-left corner was consumed and did nothing -- it could
+    -- not boot either (boot lives centre-screen), so the tap was simply lost.
+    if not splash_active and shutdown_rect
+        and inRect(shutdown_rect.x, shutdown_rect.y, shutdown_rect.w, shutdown_rect.h, x, y) then
         return "shutdown"
     end
 

@@ -1458,5 +1458,153 @@ do
         string.format("integral=%.3f after re-stamp", w.pid.altitude.integral or 0))
 end
 
+--- 16. THE REDSTONE OFF BUTTON.
+--- The monitor's red circle had no redstone equivalent, so the only way to
+--- power the ship down was a tap on a touch monitor -- with no working screen,
+--- no keyboard, or a dead network there was no off at all. The button is on
+--- the engine relay's LEFT face, the only free left INPUT on the ship: the
+--- starter link on that face is an OUTPUT, and a relay face carries input and
+--- output independently.
+do
+    local e = makeEnv({ alt0 = 200 })
+    local f = e.flight
+
+    -- The relay audit that justifies the wiring choice, asserted so a future
+    -- config edit cannot quietly double-book the left face.
+    local function loadcfg(path)
+        local fh = io.open(path, "r")
+        if not fh then return nil end
+        local src = fh:read("*a")
+        fh:close()
+        local chunk = loadstring and loadstring(src, path) or load(src, path)
+        if not chunk then return nil end
+        local ok, val = pcall(chunk)
+        return ok and val or nil
+    end
+    local cfg = loadcfg("config/atlas.lua")
+    check("off: the shipped config maps OFF to the engine relay",
+        cfg ~= nil and cfg.input_map ~= nil
+            and cfg.input_map.engine_relay ~= nil
+            and cfg.input_map.engine_relay.OFF == "left",
+        cfg == nil and "config/atlas.lua did not load"
+            or string.format("engine_relay.OFF=%s",
+                tostring(cfg.input_map and cfg.input_map.engine_relay
+                    and cfg.input_map.engine_relay.OFF)))
+    check("off: OFF shares the left face with the starter OUTPUT, which is legal",
+        cfg ~= nil and cfg.engine ~= nil and cfg.engine.start_side == "left",
+        "engine.start_side is not left")
+
+    -- No other input may sit on that same face side of the same relay.
+    if cfg and cfg.input_map and cfg.input_map.engine_relay then
+        local clashes = {}
+        for key, side in pairs(cfg.input_map.engine_relay) do
+            if key ~= "OFF" and side == "left" then clashes[#clashes + 1] = key end
+        end
+        check("off: nothing else claims the engine relay left face",
+            #clashes == 0, "also on left: " .. table.concat(clashes, ","))
+    end
+
+    -- The rising edge: fires once on press, not once per tick held.
+    -- Two presses in this sequence (idx2 and idx7); the 3-tick hold at idx2..4
+    -- is the case that matters -- it must fire ONCE, not once per tick.
+    local seq, presses = { 0, 0, 15, 15, 15, 0, 0, 15, 0 }, 0
+    for _, v in ipairs(seq) do
+        if f:pollOff(v) then presses = presses + 1 end
+    end
+    check("off: a held button fires exactly once per press",
+        presses == 2, string.format("fired %d times over 2 presses", presses))
+
+    -- A button held down from boot must fire on its first tick, not wait for
+    -- a release it may never get.
+    local g = makeEnv({ alt0 = 200 }).flight
+    g.off_level, g.off_armed = 0, true
+    check("off: a press already active at boot fires immediately",
+        g:pollOff(15) == true, "did not fire on the first held tick")
+    check("off: and does not refire while still held",
+        g:pollOff(15) == false and g:pollOff(15) == false,
+        "refired while held")
+
+    -- Released is what arms it; a low signal must never fire.
+    local h = makeEnv({ alt0 = 200 }).flight
+    h.off_level, h.off_armed = 0, true
+    check("off: a released button never fires",
+        h:pollOff(0) == false and h:pollOff(0) == false, "fired while released")
+
+    -- And it must not be gated on the autopilot: shutting down is the escape
+    -- from a run that has gone wrong.
+    local i = makeEnv({ alt0 = 200 }).flight
+    i.ap = { phase = "cruise" }
+    i.off_level, i.off_armed = 0, true
+    check("off: the off button works during an autopilot run",
+        i:pollOff(15) == true, "blocked by the autopilot")
+end
+
+--- 17. THE OFF BUTTON IS ACTUALLY WIRED UP, END TO END.
+--- pollOff can be perfect and the button still dead if the config omits the
+--- key or nothing calls it. Neither shows up in a unit test of the latch
+--- itself, so assert the three connections that make it a real control:
+--- config -> key name -> controlTick.
+do
+    local function loadcfg(path)
+        local fh = io.open(path, "r")
+        if not fh then return nil end
+        local src = fh:read("*a")
+        fh:close()
+        local chunk = loadstring and loadstring(src, path) or load(src, path)
+        if not chunk then return nil end
+        local ok, val = pcall(chunk)
+        return ok and val or nil
+    end
+
+    -- startup carries the wizard's built-in default config, which is what a
+    -- fresh ship with no config/ gets. It is a script, not a loadable table
+    -- (it needs CC peripherals), so assert the line instead of the value.
+    local sfh = io.open("startup", "r")
+    local ssrc = sfh and sfh:read("*a") or ""
+    if sfh then sfh:close() end
+    check("off: startup's default config also maps OFF to the engine relay left",
+        ssrc:find('engine_relay = { UP = "front", DOWN = "back", OFF = "left" }',
+            1, true) ~= nil,
+        "startup's default engine_relay has no OFF = left")
+
+    -- The live ship's own config. Deploy never touches config/, so this is
+    -- edited by hand and can drift from the shipped one.
+    local live = loadcfg(
+        os.getenv("ATLAS_COMPUTERCRAFT") and
+            (os.getenv("ATLAS_COMPUTERCRAFT") .. "/5/config/ArtAtlas.lua")
+        or (os.getenv("HOME") ..
+            "/.var/app/com.modrinth.ModrinthApp/data/ModrinthApp/profiles/" ..
+            "Create Aeronautics/saves/Atlas Warmachine World/computercraft/" ..
+            "computer/5/config/ArtAtlas.lua"))
+    if live then
+        check("off: the live ship's config has OFF on the engine relay left",
+            live.input_map ~= nil and live.input_map.engine_relay ~= nil
+                and live.input_map.engine_relay.OFF == "left",
+            string.format("live ArtAtlas engine_relay.OFF=%s",
+                tostring(live.input_map and live.input_map.engine_relay
+                    and live.input_map.engine_relay.OFF)))
+    end
+
+    -- controlTick must poll it. os_main needs the full hardware stack and
+    -- cannot be required here, so check the call survives as a source line.
+    -- Match the whole line, not the substring: "if false and
+    -- flight:pollOff(keys.OFF) then" still CONTAINS "pollOff(keys.OFF)" and
+    -- would pass a substring search while polling nothing.
+    local fh = io.open("lib/os_main.lua", "r")
+    local src = fh and fh:read("*a") or ""
+    if fh then fh:close() end
+    -- Normalise whitespace so `if false and flight:pollOff(...)` is recognised as
+    -- a modified form rather than passing as the bare call.
+    local norm = src:gsub("%s+", " ")
+    local callsPoll = norm:find("if flight:pollOff(keys.OFF) then", 1, true) ~= nil
+    check("off: controlTick polls the OFF key every tick (not disabled)",
+        callsPoll,
+        "no bare `if flight:pollOff(keys.OFF) then` in controlTick "
+            .. "(a disabled 'if false and ...' form would also fail here)")
+    check("off: a fired OFF edge actually shuts the ship down",
+        callsPoll and src:find("OS.powerOff()", 1, true) ~= nil,
+        "no OS.powerOff() in os_main")
+end
+
 print(string.format("ap_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("ap_test FAILED", 0) end

@@ -427,5 +427,131 @@ check("PAUSED is shown while held", (function()
     return findText("PAUSED") ~= nil
 end)())
 
+-- --- 6. the shutdown circle is actually tappable --------------------------
+-- This control had NO coverage at all, and "the off button doesn't work" was
+-- reported from the cockpit. Two things make it easy to get wrong and neither
+-- is visible by looking at the drawing code:
+--   * a tap arrives as a 6x9 CHARACTER cell, not a pixel, so a rect that looks
+--     correct can still be unreachable for every cell that touches it
+--   * the circle sits in the header, the same band as the tab strip, so a
+--     neighbouring control can win the hit
+-- So drive it the way monitor_touch does (cells) and require that every cell
+-- the ring visually covers returns "shutdown", and that the body/tab band
+-- does not.
+reset()
+frame("flight", { ap = nil })
+local SD = BORDER + 4          -- shutdown rect x
+local ST = BORDER + 2          -- shutdown rect y
+-- The drawn ring is d px across from (SD, ST); the tap rect is padded. Find
+-- every cell whose pixel span overlaps the ring box and require a shutdown.
+local hits, cell = {}, {}
+for cy = 1, 4 do
+    for cx = 1, 8 do
+        local x0, x1 = (cx - 1) * 6, cx * 6 - 1
+        local y0, y1 = (cy - 1) * 9, cy * 9 - 1
+        if x1 >= SD and x0 < SD + 18 and y1 >= ST and y0 < ST + 18 then
+            cell[#cell + 1] = string.format("(%d,%d)", cx, cy)
+            if HUD.handleTouch(cx, cy) == "shutdown" then hits[#hits + 1] = true end
+        end
+    end
+end
+check("every cell the shutdown ring covers returns shutdown",
+    #hits == #cell,
+    string.format("%d/%d cells: %s", #hits, #cell, table.concat(cell, " ")))
+
+-- The centre of the ring must hit (the one tap every pilot aims for).
+check("the centre cell of the shutdown ring returns shutdown",
+    HUD.handleTouch(3, 2) == "shutdown",
+    tostring(HUD.handleTouch(3, 2)))
+
+-- The header band to the right of the circle is the tab strip / title area,
+-- not shutdown: a pilot reaching for the off button must not get a tab switch,
+-- and a tab switch must not power the ship down.
+check("a tap on the header title does not shut the ship down",
+    HUD.handleTouch(12, 2) ~= "shutdown",
+    tostring(HUD.handleTouch(12, 2)))
+check("a tap in the body does not shut the ship down",
+    HUD.handleTouch(5, 12) ~= "shutdown",
+    tostring(HUD.handleTouch(5, 12)))
+
+-- The DRAWN radius, asserted in pixels. The requested change was d 16 -> 15,
+-- and at CELL granularity that is invisible: cells (2..4, 1..3) cover the ring
+-- at d=15 and at d=16 both, so a cell-only test cannot see the size at all
+-- (verified: the reachable cell sets are identical). Measure the drawn
+-- bounding box of the 1px ops in the header corner instead.
+reset()
+frame("flight", { ap = nil })
+local rx0, ry0, rx1, ry1 = math.huge, math.huge, -math.huge, -math.huge
+for _, o in ipairs(ops) do
+    if o.x < 40 and o.y < 30 and o.w == 1 and o.h == 1 then
+        rx0, ry0 = math.min(rx0, o.x), math.min(ry0, o.y)
+        rx1, ry1 = math.max(rx1, o.x + o.w - 1), math.max(ry1, o.y + o.h - 1)
+    end
+end
+local ring_w, ring_h = rx1 - rx0 + 1, ry1 - ry0 + 1
+check("the shutdown ring is drawn 15 px across (radius reduced by 1)",
+    ring_w == 15 and ring_h == 15,
+    string.format("bbox %dx%d at (%d,%d)", ring_w, ring_h, rx0, ry0))
+check("the ring sits where the tap rect is",
+    rx0 == BORDER + 4 and ry0 == BORDER + 2,
+    string.format("bbox origin (%d,%d), expected (%d,%d)",
+        rx0, ry0, BORDER + 4, BORDER + 2))
+
+-- Shutdown must survive every tab: it is a safety control, and if it were
+-- scoped to one screen it would be gone exactly when the pilot is lost in the
+-- menus.
+-- NOTE: handleTouch drops a touch whose coords repeat within 50 ms (the
+-- multi-block double-fire guard), so each probe below uses its own cell.
+local SD_CELLS = { { 3, 2 }, { 2, 1 }, { 3, 1 }, { 2, 2 }, { 3, 3 }, { 2, 3 }, { 4, 1 } }
+for i, t in ipairs({ "flight", "engines", "systems", "nav", "alarms", "actions", "ap" }) do
+    reset()
+    frame(t, { ap = ap() })
+    local c = SD_CELLS[i]
+    check("shutdown stays live on the " .. t .. " tab",
+        HUD.handleTouch(c[1], c[2]) == "shutdown",
+        string.format("cell (%d,%d) -> %s", c[1], c[2],
+            tostring(HUD.handleTouch(c[1], c[2]))))
+end
+
+-- The waypoint window is modal and swallows stray taps, but shutdown is a
+-- safety control and must stay reachable over it.
+reset()
+frame("nav", { ap = nil })
+HUD.setWaypoints({ { name = "A", x = 1, y = 2, z = 3 } })
+HUD.wpOpen()
+-- (4,3) is inside the modal panel (wp:noop); (4,2) is the cell just outside
+-- it that still covers the ring. Distinct cells: handleTouch drops a repeat of
+-- the same coords within 50 ms, and the per-tab loop above just used them.
+check("shutdown stays live over the waypoint window",
+    HUD.handleTouch(4, 2) == "shutdown",
+    tostring(HUD.handleTouch(4, 2)))
+check("the waypoint window is still modal inside the panel",
+    HUD.handleTouch(4, 3) == "wp:noop",
+    tostring(HUD.handleTouch(4, 3)))
+HUD.wpClose()
+
+-- On the splash the red circle must NOT be live: the boot button owns the
+-- screen, and a tap near it must not power the ship down instead of booting.
+reset()
+HUD.renderPower("off", 0, "")
+-- The ring is not painted on the splash, so it must not swallow a tap there:
+-- a top-left tap was consumed and could neither boot nor shut down. These
+-- cells are the ones that DO reach the ring while powered (proved above), so
+-- they are exactly the taps that used to be lost. Distinct cells, because
+-- handleTouch drops a repeat of the same coords within 50 ms and a nil there
+-- would make this check pass for the wrong reason.
+for _, c in ipairs({ { 3, 2 }, { 2, 1 }, { 4, 3 }, { 2, 3 }, { 4, 1 } }) do
+    check("the shutdown ring is inert on the splash (cell " ..
+        c[1] .. "," .. c[2] .. ")",
+        HUD.handleTouch(c[1], c[2]) ~= "shutdown",
+        string.format("returned %s -- the splash is eating a real ring tap",
+            tostring(HUD.handleTouch(c[1], c[2]))))
+end
+-- boot_rect is centred and lower-middle: x=(348-64)/2=142, y=min(216-70,
+-- 216*0.58)=125, hit-expanded to 136,116 76x36 -> cell (26,15) covers it.
+check("the splash still boots from its own button",
+    HUD.handleTouch(26, 15) == "boot",
+    tostring(HUD.handleTouch(26, 15)))
+
 print(string.format("hud_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("hud_test FAILED", 0) end

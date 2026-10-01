@@ -78,6 +78,10 @@ return {
         engine_relay = {
             UP = "front",
             DOWN = "back",
+            -- LEFT face input. The starter link on this face is an OUTPUT
+            -- (engine.start_side), and a relay face carries input and output
+            -- independently, so the OFF button can share the face.
+            OFF = "left",
         },
     },
 

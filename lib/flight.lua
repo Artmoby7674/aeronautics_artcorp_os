@@ -666,6 +666,26 @@ function Flight:pollShift(shift_value)
     return toggled
 end
 
+--- Rising-edge detect for the OFF button (engine relay left face input).
+--- Returns true on the tick the button goes from released to pressed, so a
+--- held button fires ONCE, not on all 50 subsequent ticks.
+---
+--- This lives here rather than inline in os_main for the same reason
+--- pollShift does: the latch is stateful across ticks and is easy to write
+--- backwards (assign the new level, then compare it -- which never fires) or
+--- to drop entirely (which fires every tick while held). Both bugs are
+--- invisible from the cockpit and trivial to assert here. os_main acts on the
+--- returned edge.
+function Flight:pollOff(value)
+    local level = (value or 0) > 0 and 1 or 0
+    local fired = (level == 1 and self.off_armed and self.off_level == 0)
+    if level == 0 then
+        self.off_armed = true
+    end
+    self.off_level = level
+    return fired == true
+end
+
 -- The altitude the ship PLANS to cruise at, and the number shown as the goal.
 --
 -- This used to fall back to AP_CEIL_HARD, which made the 450 m guard a real

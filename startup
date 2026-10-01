@@ -211,7 +211,7 @@ local FALLBACK_TEMPLATE = [[return {
         input_1 = { W = "front", S = "back", A = "left", D = "right" },
         input_2 = { Q = "left", E = "right", SPACE = "front", CTRL = "back" },
         aux_relay = { SHIFT = "left", PROX = "back" },
-        engine_relay = { UP = "front", DOWN = "back" },
+        engine_relay = { UP = "front", DOWN = "back", OFF = "left" },
     },
     gear_output = { relay = "aux_relay", side = "front", deploy = 15, retract = 0 },
     proximity = { input_key = "aux_relay", side = "back", landed_threshold = 15, gear_deploy_threshold = 1, max_blocks = 15, gear_settle_ticks = 20 },

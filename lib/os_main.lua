@@ -226,6 +226,7 @@ function OS.start(cfg, hardware)
     ctrl = ctrl .. " mode  e-stop  reset  tabs"
     print(ctrl)
     print("  Red circle (top-left) - shutdown (decouples clutch)")
+    print("    also the engine relay LEFT-face OFF button (rising edge)")
     print("")
 
     local controlTimer = os.startTimer(0.05)
@@ -438,6 +439,20 @@ function OS.controlTick()
     end
     OS._tab_edge.up = up_d
     OS._tab_edge.down = dn_d
+
+    -- OFF button: engine relay LEFT face input, same action as the monitor's
+    -- red circle. Works with the network down and with no keyboard, which is
+    -- the point of putting it on a relay face.
+    --
+    -- The rising edge lives in Flight:pollOff (stateful across ticks). Checked
+    -- BEFORE the flight tick and it returns immediately: powerOff cuts all
+    -- outputs, so nothing later in this tick may re-command what it just cut.
+    if flight:pollOff(keys.OFF) then
+        print("[" .. string.format("%.0f", os.clock()) ..
+            "] OFF button (engine relay left) -> shutdown")
+        OS.powerOff()
+        return
+    end
 
     -- Flight recorder (10 s samples) + keyboard ask timeout
     Rec.tick(os.clock(), flight.state.position)
