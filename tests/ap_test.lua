@@ -48,6 +48,21 @@ local function clampf(v, lo, hi)
 end
 
 -- ---------------------------------------------------------------- plant
+-- Boots are driven from lib/os_main.lua, which needs the full hardware +
+-- graphics stack and cannot be required here. What matters for the altitude
+-- re-stamp is the CONTRACT between beginBoot() and Flight:update(), so this
+-- stub reproduces beginBoot's one arming line verbatim. If os_main.lua stops
+-- setting the flag, this fails instead of the suite quietly going green.
+local function readBootArmsRecapture()
+    local path = "lib/os_main.lua"
+    local fh = io.open(path, "r")
+    if not fh then return nil end
+    local src = fh:read("*a")
+    fh:close()
+    local f = src:find("flight.recapture_alt = true", 1, true)
+    return f ~= nil
+end
+
 local function makeEnv(opts)
     opts = opts or {}
     local alt0 = opts.alt0 or 60
@@ -1287,7 +1302,7 @@ do
     h.targets.altitude = h.state.altitude
     env3.step(); env3.step()
     sunk = propDiff(h)
-    print(string.format("  RATEDBG2 lvl=%.4f sunk=%.4f phase=%s mode=%s v=%.2f", lvl, sunk, tostring(h.ap and h.ap.phase), tostring(h.mode), h.state.climb_rate or 0))    check("bank: a fast climb/sink rate fades the bank out",
+    check("bank: a fast climb/sink rate fades the bank out",
         sunk < lvl * 0.8 + 0.1,
         string.format("diff %.4f -> %.4f at 9 m/s vertical", lvl, sunk))
 
@@ -1355,6 +1370,92 @@ do
     check("recourse: a moderate error does not re-aim (stays with correct)",
         m.ap.phase == "correct", string.format("phase=%s err=%.1f",
             tostring(m.ap.phase), m.ap.err or 0))
+end
+
+--- 15. THE ALTITUDE GOAL MUST BE RE-STAMPED ON BOOT.
+--- powerOff() runs setMode(HOVER), which captures targets.altitude from
+--- state.altitude. While the splash/boot screens are up, controlTick returns
+--- before flight:update(), so state is never re-read and the goal is frozen at
+--- the power-off altitude. Move the ship in that window and power-up flies it
+--- back to the pre-move altitude -- the reported "it tries to get back to the
+--- altitude you were at when in the splash screen".
+do
+    check("boot: beginBoot() arms the re-capture flag in os_main.lua",
+        readBootArmsRecapture(),
+        "lib/os_main.lua no longer sets flight.recapture_alt = true")
+
+    local env = makeEnv({ alt0 = 200 })
+    local f = env.flight
+    -- Reproduce the freeze exactly: a goal stamped at 200, then the ship moved
+    -- to 120 with no update() in between (what the splash screen does -- it
+    -- never calls flight:update(), so state.altitude stays at the old value).
+    f.targets.altitude = 200
+    env.plant.alt = 120
+    env.step()               -- refresh state from the plant: altitude -> 120
+    env.plant.alt = 120
+    check("boot: the stale goal survives the move (precondition)",
+        math.abs(f.targets.altitude - f.state.altitude) > 50,
+        string.format("goal=%.1f state=%.1f", f.targets.altitude, f.state.altitude))
+
+    -- Arm the one-shot the way beginBoot() does, then run ONE tick.
+    f.recapture_alt = true
+    env.step()
+    check("boot: the altitude goal is re-stamped from the fresh reading",
+        math.abs(f.targets.altitude - 120) < 0.5,
+        string.format("goal=%.1f, expected the live altitude 120", f.targets.altitude))
+    check("boot: the re-capture is one-shot (flag cleared)",
+        f.recapture_alt == false, string.format("recapture_alt=%s", tostring(f.recapture_alt)))
+
+    -- And it must not re-stamp every tick afterwards, which would silently
+    -- disable manual altitude commands (W/S, Space/Ctrl) for good. The flag is
+    -- one-shot, so the goal must now behave like any other manual altitude.
+    env.plant.alt = 150
+    env.step()
+    f:adjustAltitude(2)
+    local stepped = f.targets.altitude
+    env.step()
+    check("boot: a manual altitude command is not overwritten on later ticks",
+        math.abs(f.targets.altitude - stepped) < 0.5,
+        string.format("after adjust=%.1f, next tick=%.1f", stepped, f.targets.altitude))
+
+    -- The altitude PID must not carry integral wind-up from before the boot
+    -- into the re-stamped goal, or the ship lurches on the first tick.
+    local env2 = makeEnv({ alt0 = 300 })
+    local g = env2.flight
+    env2.step()                       -- settle at 300
+    g.targets.altitude = 300
+    env2.plant.alt = 250
+    env2.step()                       -- state now 250, goal still 300: error
+    g.recapture_alt = true
+    env2.step()
+    check("boot: the re-stamped goal has no altitude PID wind-up",
+        math.abs(g.targets.altitude - 250) < 0.5,
+        string.format("goal=%.1f, expected the live altitude 250", g.targets.altitude))
+
+    -- The PID reset is load-bearing, and it is specifically the ALTITUDE PID's
+    -- integral: with the goal re-stamped but the integral still holding the
+    -- pre-boot error, the first powered tick gets a large accumulated command
+    -- and the ship lurches away from the altitude it was just told to hold.
+    --
+    -- integral_separation is 2.5, so a large error does NOT wind the integral
+    -- up -- the error has to be small and persistent (holding station slightly
+    -- low on hover feedforward is the real case). So hold the error at 2.0 by
+    -- re-asserting the goal each tick, which saturates the integral.
+    local e3 = makeEnv({ alt0 = 300 })
+    local w = e3.flight
+    e3.step()
+    for _ = 1, 200 do
+        w.targets.altitude = w.state.altitude + 2.0
+        e3.step()
+    end
+    local wound = w.pid.altitude.integral or 0
+    check("boot: the altitude integral really does wind up before the boot",
+        wound > 0.5, string.format("integral=%.3f", wound))
+    w.recapture_alt = true
+    e3.step()
+    check("boot: the altitude PID integral is cleared with the re-stamped goal",
+        math.abs(w.pid.altitude.integral or 0) < 1e-9,
+        string.format("integral=%.3f after re-stamp", w.pid.altitude.integral or 0))
 end
 
 print(string.format("ap_test: %d passed, %d failed", passed, failed))

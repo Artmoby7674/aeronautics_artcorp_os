@@ -500,6 +500,11 @@ function Flight.new(config, hardware)
 
     self.estop = false        -- latched by X until reset (R / altitude / mode)
 
+    -- One-shot: on the next update() (i.e. the first tick after the boot
+    -- sequence powers on), re-capture the altitude goal from freshly read
+    -- telemetry. See resyncAltitudeTarget().
+    self.recapture_alt = false
+
     -- Manual Q/E stick forwarded by os_main every tick. The autopilot's
     -- aim/align phases add it to their own yaw_cmd; cruise/correct/arrive
     -- ignore it (bank-to-turn owns the heading there).
@@ -578,6 +583,29 @@ function Flight:captureHeading()
     self.targets.yaw = self.state.yaw
     self.heading_valid = true
     self.pid.yaw:reset()
+end
+
+--- Re-capture the altitude goal from the CURRENT measured altitude.
+---
+--- Why this is needed: setMode() stamps targets.altitude from state.altitude,
+--- and powerOff() runs setMode(HOVER). While the splash/boot screens are up,
+--- controlTick returns before flight:update(), so state is never re-read and
+--- the sampled altitude FROZEN at the power-off value. Move the ship while the
+--- splash is up and that stale goal is still in force on power-up: the first
+--- real tick sees the live altitude against a goal from before the move and
+--- flies the ship back to it. That is the reported "it tries to get back to the
+--- altitude you were at when in the splash screen".
+---
+--- So the goal has to be re-stamped from fresh telemetry AFTER power returns,
+--- not at the moment the boot button is pressed (state is still stale then).
+--- os_main sets flight.recapture_alt = true in beginBoot(); update() consumes
+--- the flag right after updateState(), so it happens exactly once, on the first
+--- powered tick, using a real reading. The altitude PID is reset so no integral
+--- wind-up from before the boot survives the re-stamp.
+function Flight:resyncAltitudeTarget()
+    self.targets.altitude = self.state.altitude
+    local ap = self.pid and self.pid.altitude
+    if ap then ap:reset() end
 end
 
 function Flight:setMode(mode)
@@ -1674,6 +1702,14 @@ function Flight:update()
     self.update_count = self.update_count + 1
 
     self:updateState()
+    -- First tick after boot: re-stamp the altitude goal from the telemetry we
+    -- just read, NOT from whatever setMode captured while the splash was up
+    -- (see resyncAltitudeTarget). Must sit after updateState() and before any
+    -- mode function reads targets.altitude.
+    if self.recapture_alt then
+        self.recapture_alt = false
+        self:resyncAltitudeTarget()
+    end
     self:debugAttitude(dt)
 
     self.proximity = self.hw.getProximity() or 0

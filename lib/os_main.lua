@@ -867,6 +867,15 @@ function OS.beginBoot()
     -- (powerOff->emergencyStop leaves it set; HUD would show READY otherwise).
     if flight then
         flight.estop = false
+        -- Re-stamp the altitude goal on the first powered tick. powerOff ran
+        -- setMode(HOVER), which froze targets.altitude at the power-off
+        -- altitude, and controlTick does not call flight:update() while the
+        -- splash/boot screens are up -- so state.altitude never refreshes
+        -- during them. If the ship was moved in that window, powering up would
+        -- otherwise fly it back to the pre-move altitude. The flag is consumed
+        -- in Flight:update() after updateState(), so the goal comes from a
+        -- fresh reading rather than the stale one (Flight:resyncAltitudeTarget).
+        flight.recapture_alt = true
     end
     status_message = ""
     print("[" .. string.format("%.0f", os.clock()) .. "] Boot sequence (" .. tostring(BOOT_DURATION) .. "s)...")
