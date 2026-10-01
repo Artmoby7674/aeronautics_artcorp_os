@@ -130,13 +130,16 @@ local LAND_ALT_ERR_SHUTDOWN = 20 -- m goal-below-ship error: stop + OS shutdown
 local AP_AIM_DEADBAND = 3   -- deg: stop yawing when this close to bearing
 local AP_AIM_TOL = 5        -- deg: "facing target" to leave aim phase
 local AP_OFFCOURSE = 10     -- deg: heading error that triggers slow+correct
-local AP_RECOURSE = 90      -- deg: heading error too big to chip away at —
+local AP_RECOURSE = 45      -- deg: heading error too big to chip away at —
                             -- re-enter ROTATE (phase 2) instead. The phase
                             -- machine had NO cruise/correct -> aim edge at all,
                             -- so once a run left the first rotation it could
                             -- never re-aim; a large error could only be fed
                             -- to `correct`, which is a brake-and-hold, not a
-                            -- re-aim. 60 deg is well outside the bank's useful
+                            -- re-aim. Was 90 (the comment above it said 60, so
+                            -- the two had drifted apart), which left a 90 deg
+                            -- error trying to be banked out at AP_BANK_MAX 8
+                            -- deg of authority. 45 is outside the bank's useful
                             -- authority but inside "spin round and try again".
 local AP_CORRECT_SPEED = 10 -- m/s: slow down to before re-accelerating
 local AP_CORRECT_TOL = 5    -- deg: heading good enough to re-accelerate
@@ -149,8 +152,25 @@ local AP_MAX_LEVEL = 15
 local AP_YAW_SIGN = 1       -- aim/align yaw_cmd sign: +1 maps a left bearing to
                             -- the stick direction that turns left. Flip if the
                             -- ship faces AWAY from the waypoint.
-local AP_BANK_SIGN = -1     -- cruise bank direction: -1 = positive bearing err
-                            -- (target left) banks LEFT. Flip if it banks away.
+local AP_BANK_SIGN = 1      -- cruise bank direction. This was -1, and it was
+                            -- the "ship tries to yaw right in fast travel"
+                            -- report: -1 banks AWAY from the bearing, which is
+                            -- positive feedback, not a wrong-way turn.
+                            -- The chain, end to end (config/atlas.lua:116 FL
+                            -- x=-3 / FR x=+3 => +x is right; hardware.lua:296
+                            -- "roll + = right down"; right wing down tilts the
+                            -- lift vector right => turns right; and
+                            -- apBearingError returns POSITIVE for a target on
+                            -- +x, i.e. on the right). Closing a positive error
+                            -- therefore needs roll POSITIVE, so the sign is +1.
+                            -- With -1 the ship banked left to reach a target
+                            -- on its right: error grew, bank grew harder, and
+                            -- the leg spiralled away — which is why it read as
+                            -- a steady pull to one side rather than a turn that
+                            -- failed to converge. Not measurable in the test
+                            -- plant (cruise zeroes tilt => fz = 0 => no
+                            -- bank->yaw coupling at all), so it is pinned by
+                            -- asserting the commanded ROLL sign, below.
 local AP_BANK_KP = 0.6      -- deg bank per deg heading error
 local AP_BANK_MAX = 8       -- deg max bank command
 local AP_BANK_DEAD = 1      -- deg heading deadband (no bank correction)

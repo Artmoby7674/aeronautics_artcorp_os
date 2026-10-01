@@ -1606,5 +1606,161 @@ do
         "no OS.powerOff() in os_main")
 end
 
+-- 18. THE CRUISE BANK MUST STEER TOWARD THE WAYPOINT, NOT AWAY FROM IT.
+-- "The ship tries to yaw to the right in fast travel" was AP_BANK_SIGN = -1,
+-- which banks AWAY from the bearing. That is positive feedback, not a turn
+-- that fails to converge: the ship banks left to reach a target on its right,
+-- which grows the error, which banks harder. It reads as a steady pull to one
+-- side and it never arrives, which is why it did not look like a sign flip.
+--
+-- The chain, none of it a matter of taste:
+--   config/atlas.lua:116  FL x=-3 / FR x=+3  => +x is the ship's right
+--   hardware.lua:296      roll + = right down
+--   right wing down       tilts the lift vector right => the ship turns right
+--   apBearingError        returns POSITIVE for a target on +x (on the right)
+-- So closing a positive error needs roll POSITIVE: the bank must carry the
+-- SAME SIGN as the bearing error. That invariant is the whole test, and it is
+-- what makes the old -1 fail.
+--
+-- This plant still cannot watch the yaw happen -- cruise zeroes prop tilt, so
+-- fz = 0 for every prop and the yaw couple YAW_SIGN*x*fz is identically zero
+-- (see the note above AP_TILT...). So assert the commanded ROLL, which is
+-- directly observable as both a hull angle and a left/right prop differential.
+-- Two independent observables, so the test cannot pass by coincidence.
+local function bankSign(side)
+    local env = makeEnv({ alt0 = 200 })
+    local k = env.flight
+    k:setMode("CRUISE")
+    local dx = (side == "right") and 3000 or -3000
+    k.ap = { name = "BANK", x = dx, z = 4000, alt = 200, phase = "cruise",
+             pt = 0, needs_climb = false, progress = 0, start_dist = 5000,
+             wp = { x = dx, z = 4000, alt = 200 }, paused = false }
+    env.plant.vx, env.plant.vz = 0, 12
+    k.state.speed = 12
+    local err, roll = nil, nil
+    for _ = 1, 40 do
+        env.step()
+        err = k.ap.err
+        roll = env.plant.roll
+    end
+    local o = k.outputs
+    return err, roll, (o.FR_speed or 0) - (o.FL_speed or 0)
+end
+
+local bErrR, bRollR, bDiffR = bankSign("right")
+local bErrL, bRollL, bDiffL = bankSign("left")
+check("bank: a target to the right produces a POSITIVE bearing error",
+    bErrR ~= nil and bErrR > 0,
+    string.format("err=%s", tostring(bErrR)))
+check("bank: hull rolls toward the target (sign(roll) == sign(err)), right side",
+    bRollR ~= nil and bErrR ~= nil and (bRollR > 0) == (bErrR > 0),
+    string.format("err=%+.1f roll=%+.3f", bErrR or 0, bRollR or 0))
+check("bank: hull rolls toward the target (sign(roll) == sign(err)), left side",
+    bRollL ~= nil and bErrL ~= nil and (bRollL < 0) == (bErrL < 0),
+    string.format("err=%+.1f roll=%+.3f", bErrL or 0, bRollL or 0))
+check("bank: the prop differential backs the hull roll (FR-FL), right side",
+    bDiffR ~= nil and bErrR ~= nil and (bDiffR > 0) == (bErrR > 0),
+    string.format("FR-FL=%+.3f err=%+.1f", bDiffR or 0, bErrR or 0))
+check("bank: the prop differential backs the hull roll (FR-FL), left side",
+    bDiffL ~= nil and bErrL ~= nil and (bDiffL < 0) == (bErrL < 0),
+    string.format("FR-FL=%+.3f err=%+.1f", bDiffL or 0, bErrL or 0))
+-- The failure mode that actually bit: the sign is fine but the bank is
+-- vanishing. AP_BANK_MIN_SPEED sits at 6 m/s and the gate is
+-- (speed - 3)/3, so anything under 3 m/s gets NO bank at all.
+check("bank: a full-speed leg keeps a usable bank command (not faded to nothing)",
+    math.abs(bRollR or 0) > 0.1 and math.abs(bRollL or 0) > 0.1,
+    string.format("|roll| right=%.3f left=%.3f", math.abs(bRollR or 0), math.abs(bRollL or 0)))
+
+-- 18b. RECOURSE THRESHOLD. Now 45 deg (was 90, whose own comment said 60).
+-- Below the threshold `correct` must keep the leg alive; above it the run must
+-- drop back to phase 2 (aim) rather than trying to bank out of an error it
+-- has no authority over.
+local envR = makeEnv({ alt0 = 200 })
+local r = envR.flight
+r:startAutopilot{ name = "RECOURSE45", x = 2000, z = 0, heading = 90, alt = 200 }
+for _ = 1, 6000 do
+    envR.step()
+    if r.ap and r.ap.phase == "cruise" then break end
+end
+check("recourse45: run reaches the cruise phase", r.ap and r.ap.phase == "cruise",
+    string.format("phase=%s", r.ap and tostring(r.ap.phase) or "no ap"))
+-- The nose does NOT face exactly +x after the aim phase (it comes out ~86 deg
+-- off), so the offset -> error map has to be MEASURED, not derived. Rather than
+-- pick two lucky offsets and trust them, sweep the whole neighbourhood and
+-- assert the phase flips exactly at 45. This pins the boundary itself, so it
+-- cannot be satisfied by any threshold other than 45.
+local function setCourse(dx, dz)
+    local p = r.state.position or { x = 0, y = 0, z = 0 }
+    r.ap.x = (p.x or 0) + dx
+    r.ap.z = (p.z or 0) + dz
+end
+local maxCorrect, minAim = 0, 360
+local mismatches, samples = {}, 0
+for dz = -400, -1800, -40 do
+    r.ap.phase, r.ap.pt = "cruise", 0
+    setCourse(1200, dz)
+    envR.step()
+    local e = r.ap.err or 0
+    local ph = r.ap.phase
+    samples = samples + 1
+    -- expected phase from the two thresholds under test
+    local want = (e > 45) and "aim" or ((e > 10) and "correct" or "cruise")
+    if ph ~= want then
+        mismatches[#mismatches + 1] = string.format("err=%.1f got=%s want=%s", e, ph, want)
+    end
+    if ph == "aim" then
+        minAim = math.min(minAim, e)
+    else
+        maxCorrect = math.max(maxCorrect, e)
+    end
+end
+check(string.format("recourse45: %d sampled headings all land on the right phase", samples),
+    #mismatches == 0,
+    #mismatches > 0 and table.concat(mismatches, "; ") or "no samples")
+check("recourse45: nothing below 45 deg re-aims",
+    maxCorrect < 45, string.format("largest non-aim error=%.2f", maxCorrect))
+check("recourse45: everything above 45 deg re-aims",
+    minAim > 45 and minAim < 360, string.format("smallest aim error=%.2f", minAim))
+
+-- The bank must not merely point the right way, it must actually be there: a
+-- faded-to-nothing bank would steer correctly and never arrive. Assert the
+-- allocation GROWS with the error, measured against a dead-straight leg as the
+-- zero reference. A relative check, because the absolute number is small and
+-- plant-specific (reduce-only authority trims the hull at ~0.8 deg against an
+-- 8 deg setpoint, so demanding a large absolute differential would be tuning
+-- the test to the plant instead of to the law).
+local function bankAlloc(tx, tz)
+    local e = makeEnv({ alt0 = 200 })
+    local g = e.flight
+    g:setMode("CRUISE")
+    g.ap = { name = "ALLOC", x = tx, z = tz, alt = 200, phase = "cruise",
+             pt = 0, needs_climb = false, progress = 0, start_dist = 5000,
+             wp = { x = tx, z = tz, alt = 200 }, paused = false }
+    e.plant.vx, e.plant.vz = 0, 12
+    g.state.speed = 12
+    for _ = 1, 40 do e.step() end
+    local o = g.outputs
+    return g.ap.err or 0, e.plant.roll or 0,
+        math.abs((o.FR_speed or 0) - (o.FL_speed or 0))
+        + math.abs((o.RR_speed or 0) - (o.RL_speed or 0))
+end
+-- dead straight: target along the nose, so the bank law must ask for nothing
+local zErr, zRoll, zDiff = bankAlloc(0, 4000)
+-- well off, but under the 45 deg recourse so `correct` never throttles to a
+-- crawl and AP_BANK_MIN_SPEED does not fade the bank out
+local oErr, oRoll, oDiff = bankAlloc(-2400, 4000)
+check("bank: the straight reference leg really is straight",
+    math.abs(zErr) < 1, string.format("err=%.2f", zErr))
+check("bank: the straight leg banks essentially nothing",
+    math.abs(zDiff) < 0.01, string.format("diff=%.4f", zDiff))
+check("bank: a ~31 deg course error asks the law for a real bank",
+    math.abs(oErr) > 20 and math.abs(oErr) < 45, string.format("err=%.1f", oErr))
+check("bank: the allocation grows with the error (bank is not faded out)",
+    oDiff > math.max(zDiff * 5, 0.05),
+    string.format("straight=%.4f  off-course=%.4f", zDiff, oDiff))
+check("bank: the roll stabiliser is engaged (hull actually banks)",
+    math.abs(oRoll) > math.abs(zRoll) and math.abs(oRoll) > 0.1,
+    string.format("straight roll=%.3f  off-course roll=%.3f", zRoll, oRoll))
+
 print(string.format("ap_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("ap_test FAILED", 0) end
