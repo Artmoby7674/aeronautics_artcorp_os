@@ -920,7 +920,6 @@ function OS.handleMonitorTouch(x, y)
             status_time = os.clock()
             print("[" .. string.format("%.0f", os.clock()) .. "] Shutdown blocked: " .. tostring(msg))
         end
-        -- success: powerOff already cleared status (fresh-start splash state)
     elseif action:sub(1, 4) == "act:" then
         OS.doAction(action:sub(5))
     elseif action:sub(1, 4) == "nav:" then

@@ -107,8 +107,8 @@ local function applyLayout()
     L.tab_h = math.max(14, math.min(24, L.tab_h))
 
     -- shutdown circle: top-left of header
-    local d = 12
-    shutdown_rect = { x = L.border + 4, y = L.border + 4, w = d, h = d, d = d }
+    local d = 16
+    shutdown_rect = { x = L.border + 4, y = L.border + 2, w = d, h = d, d = d }
     -- boot button under splash title (leave room for 3x logo + subtitle)
     local bw, bh = 64, 18
     boot_rect = {
@@ -200,13 +200,13 @@ local function drawShutdownButton()
     local cy = r.y + math.floor(r.h / 2)
     local rad = math.floor(r.d / 2) - 1
     -- always active: shutdown is allowed landed or airborne
-    local col = C.power_on
+    local col = C.power_off
     -- dark ring
     drawCircle(cx, cy, rad + 1, 15)
     drawCircle(cx, cy, rad, col)
-    -- inner highlight
-    drawCircle(cx, cy, math.max(1, rad - 3), 0)
-    drawCircle(cx, cy, math.max(1, rad - 4), col)
+    -- inner highlight (empty center)
+    drawCircle(cx, cy, math.max(1, rad - 5), 0)
+    drawCircle(cx, cy, math.max(1, rad - 6), col)
 end
 
 -- ============================================================
