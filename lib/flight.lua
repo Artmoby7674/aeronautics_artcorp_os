@@ -130,6 +130,14 @@ local LAND_ALT_ERR_SHUTDOWN = 20 -- m goal-below-ship error: stop + OS shutdown
 local AP_AIM_DEADBAND = 3   -- deg: stop yawing when this close to bearing
 local AP_AIM_TOL = 5        -- deg: "facing target" to leave aim phase
 local AP_OFFCOURSE = 10     -- deg: heading error that triggers slow+correct
+local AP_RECOURSE = 90      -- deg: heading error too big to chip away at —
+                            -- re-enter ROTATE (phase 2) instead. The phase
+                            -- machine had NO cruise/correct -> aim edge at all,
+                            -- so once a run left the first rotation it could
+                            -- never re-aim; a large error could only be fed
+                            -- to `correct`, which is a brake-and-hold, not a
+                            -- re-aim. 60 deg is well outside the bank's useful
+                            -- authority but inside "spin round and try again".
 local AP_CORRECT_SPEED = 10 -- m/s: slow down to before re-accelerating
 local AP_CORRECT_TOL = 5    -- deg: heading good enough to re-accelerate
 local AP_ARRIVE_R = 4       -- m: reached the waypoint XZ position
@@ -151,6 +159,25 @@ local AP_BANK_ALT_FADE = 4    -- m: altitude error over which the bank
 local AP_BANK_RATE_LEAD = 0.6 -- s: back off the bank command by yaw_rate so
                             -- the turn bleeds off instead of coasting through
                             -- the bearing (rate lead = angle - k * rate)
+local AP_BANK_MIN_SPEED = 6  -- m/s: a bank yaws a ship ONLY by tilting the lift
+                            -- vector, so it needs airspeed. Below this the
+                            -- bank produces NO yaw while still costing mean
+                            -- thrust and rolling the hull — i.e. it can only
+                            -- make things worse. Never decelerate below it.
+local AP_COURSE_MIN_SPEED = 3 -- m/s: below this the velocity vector is too
+                            -- noisy/short to define a course, so the bank
+                            -- falls back to the nose heading
+local AP_BANK_RATE_FADE = 3  -- m/s: |climb_rate| over which the bank fades out.
+                            -- AP_BANK_ALT_FADE keys the bank on altitude
+                            -- POSITION error only, which closes up a limit
+                            -- cycle rather than damping it: bank -> lift
+                            -- vector tilts -> vertical lift drops -> ship
+                            -- sinks -> position error grows -> bank fades ->
+                            -- ship climbs -> bank re-engages -> sinks again.
+                            -- That loop is the slow -3..-30 wiggle, and it
+                            -- runs away into the deep dive when the bank is
+                            -- large at low thrust margin. The rate term
+                            -- breaks it in the same tick the sink starts.
 local AP_STAB_OUT = 6       -- max cruise attitude speed-diff units (pitch+roll);
                             -- matches the hover high-angle cap (6). 10 slashed a
                             -- side to 0 and rolled violently. Raise for more.
@@ -399,6 +426,16 @@ local AP_HOVER_SPEED = 20   -- m/s: speed cap for hover tilt travel
 local AP_HOVER_ACCEL = 5    -- m/s^2: full-tilt accel/brake estimate for the
                             -- braking curve (v^2 <= 2*a*room)
 local AP_HOVER_BAND = 2     -- m/s: hysteresis band (coast between actions)
+local AP_APPROACH_TOL = 20  -- deg: bearing error the ship must be inside
+                            -- before apHoverDrive is allowed to thrust
+                            -- FORWARD. Thrusting across a large bearing is
+                            -- what carried the ship past the point while it
+                            -- was still turning; past the point the radial
+                            -- distance STARTS GROWING, so the v^2 braking
+                            -- profile asks for MORE thrust and the bearing
+                            -- flips ~180 deg — that is the orbit, and it is
+                            -- why phase 4 never arrived. Rotate first, close
+                            -- second.
 
 -- Auto-land roll strengthening (speed-diff only: A/D roll is pitch/yaw here)
 local LAND_ROLL_DEAD = 1    -- deg roll deadband while auto-landing (vs 2 normal)
@@ -740,6 +777,31 @@ function Flight:apBearingError(dist, dx, dz)
     return math.deg(atan2(cross, dot))
 end
 
+--- Signed angle from the ship's COURSE (its velocity vector) to the target, in
+--- the same convention as apBearingError. Returns nil when the ship is too slow
+--- for a course to mean anything, so the caller can fall back to nose heading.
+---
+--- A bank does not point the NOSE at the target: it tilts the lift vector,
+--- which curves the ship's path -- its COURSE. The nose only follows the course
+--- afterwards, via the fin weathervane, one step of lag later. Steering the bank
+--- on the nose-heading error therefore closes the loop on a variable the
+--- actuator does not control, with lag in front of it, and the loop diverges:
+--- bank -> sideslip -> fin yaws the nose -> nose-heading error grows -> more
+--- bank. That is the in-game "wiggle/wobble" and, with a large bank at low
+--- thrust margin, the runaway dive. Course error puts the controlled variable
+--- first, which is both correct and stable.
+function Flight:apCourseError(dist, dx, dz)
+    local v = self.state.velocity or {}
+    local vl = math.sqrt((v.x or 0) ^ 2 + (v.z or 0) ^ 2)
+    if vl < AP_COURSE_MIN_SPEED then return nil end
+    local ux, uz = (v.x or 0) / vl, (v.z or 0) / vl
+    local tl, tz = 0, 1
+    if dist > 0.001 then tl, tz = dx / dist, dz / dist end
+    local dot = ux * tl + uz * tz
+    local cross = uz * tl - ux * tz
+    return math.deg(atan2(cross, dot))
+end
+
 -- Yaw stick from a heading error (deg) + RATE FEEDBACK (PD): P maps the
 -- error to stick (gain = deg err for full stick), D subtracts the measured
 -- turn rate scaled to rotationControl's deg/s-per-stick, so the ship starts
@@ -919,13 +981,35 @@ end
 -- AP_HOVER_BAND hysteresis, coast in between so the ship does not surge
 -- (no drag: coasting holds speed). Braking compares the SIGNED speed along
 -- the nose, so backward drift gets forward tilt instead of runaway reverse.
-function Flight:apHoverDrive(dist)
+function Flight:apHoverDrive(dist, err)
     local v = self.state.velocity or {}
     local f = self.state.forward or {}
     local fwd_speed = (v.x or 0) * (f.x or 0) + (v.z or 0) * (f.z or 0)
+    local step = (self.config.limits or {}).hover_speed or 2
+
+    -- ROTATE FIRST, CLOSE SECOND. What says whether forward thrust points at
+    -- the waypoint is the BEARING, not the distance: `dist` is radial, so a
+    -- ship that has already passed the point and is receding has exactly the
+    -- same `room` as one still approaching, and the v^2 profile below then
+    -- asks for MORE thrust — driving it further past, where the bearing flips
+    -- ~180 deg, `correct` brakes to a crawl, and it orbits the point. That is
+    -- the reported overshoot-and-circle, and it is why phase 4 never arrived:
+    -- `align` needs dist <= 4 AND speed <= 0.6 in the same tick, which an
+    -- orbiting ship never satisfies. So forward thrust is only permitted once
+    -- the bearing is roughly on the point; outside that, brake the run-on once
+    -- and rotate in place. Coasting, not reversing — a sustained reverse tilt
+    -- would walk the ship backwards away from the point.
+    if err and math.abs(err) > AP_APPROACH_TOL then
+        if fwd_speed > AP_STOP_SPEED then
+            self.targets.move_forward = -step -- kill the run-on, once
+        else
+            self.targets.move_forward = 0     -- coast to a stop and rotate
+        end
+        return
+    end
+
     local room = math.max(dist - AP_ARRIVE_R, 0)
     local want = math.min(AP_HOVER_SPEED, math.sqrt(2 * AP_HOVER_ACCEL * room))
-    local step = (self.config.limits or {}).hover_speed or 2
     if fwd_speed > want + AP_HOVER_BAND
         or (want <= AP_STOP_SPEED and fwd_speed > AP_STOP_SPEED) then
         self.targets.move_forward = -step -- reverse tilt: brake / back off
@@ -985,6 +1069,31 @@ function Flight:updateAutopilot(dt)
     local function timedOut()
         return ap.pt > AP_PHASE_TIMEOUT
     end
+    -- Re-run the initial rotation from a travel leg. Before this the phase
+    -- machine had NO cruise/correct -> aim edge: `aim` was reachable only from
+    -- `idle`, so once a run handed over to phase 3 it could never re-aim and
+    -- a large heading error could only be chipped at by `correct`, which is a
+    -- brake-and-hold rather than a re-aim. That is the "once it's in phase 3
+    -- it can't go back to phase 2" report.
+    --
+    -- The climb is deliberately skipped: `needs_climb` is false and the step
+    -- goes straight to "turn", because the ship is already holding its cruise
+    -- altitude and re-running the climb would drop it out of the sky. MODE_HOVER
+    -- is required because the yaw steer is tilt-driven and cruise zeroes prop
+    -- tilt, so a rotation is not possible in cruise mode.
+    local function recourseToAim()
+        ap.phase = "aim"
+        ap.pt = 0
+        ap.needs_climb = false
+        ap.step = "turn"
+        ap.climb_demand = nil
+        ap.climb_brake = 0
+        ap.climb_rr = 0
+        ap.stop_hold = 0
+        ap.brake_reverse = false
+        self.targets.speed = 0
+        if self.mode ~= Flight.MODE_HOVER then self:setMode(Flight.MODE_HOVER) end
+    end
     -- Rear props spool at limits.cruise_ramp (level/s) instead of jumping to
     -- the target: an instant 0->15 kick at cruise entry pitches the nose over
     -- before the pitch stab can answer (the y260 -> y160 entry dive). Only
@@ -1019,7 +1128,7 @@ function Flight:updateAutopilot(dt)
         self.targets.altitude = ap.alt
         self.targets.yaw_cmd = clamp(
             self:apYawCmd(err, AP_YAW_GAIN, AP_AIM_DEADBAND), -1, 1)
-        self:apHoverDrive(dist)
+        self:apHoverDrive(dist, err)
         if ap.phase == "correct" and math.abs(err) <= AP_CORRECT_TOL then
             setPhase("cruise")
         end
@@ -1261,7 +1370,13 @@ function Flight:updateAutopilot(dt)
         -- stabAdapt's taper, neither of which switches the heading controller
         -- off. Slowing the rear ramp does not help; the ceiling is not the
         -- limiter.
-        if math.abs(err) > AP_OFFCOURSE then
+        if math.abs(err) > AP_RECOURSE then
+            -- Too far off to bank back: re-aim instead. Checked BEFORE the
+            -- off-course edge below, because at this error `correct` would
+            -- happily sit braking to a hover forever against AP_PHASE_TIMEOUT
+            -- and then resume cruise still 60 deg wrong.
+            recourseToAim()
+        elseif math.abs(err) > AP_OFFCOURSE then
             setPhase("correct")
         elseif dist <= AP_BRAKE_R then
             setPhase("arrive")
@@ -1276,6 +1391,16 @@ function Flight:updateAutopilot(dt)
         self.targets.yaw_cmd = 0
         self.targets.altitude = ap.alt
         local slow = speed <= AP_CORRECT_SPEED
+        -- NOTE: a revision removed this brake entirely (hold speed, never slow
+        -- to a crawl) on the theory that a bank needs airspeed, so braking to
+        -- correct cost the only steering authority available. It was reverted:
+        -- braking to ~1-2 m/s is what starves the fin weathervane (the plant
+        -- only couples yaw above 0.5 m/s of horizontal speed), and removing the
+        -- brake let the bearing error integrate away -- 26 correct->cruise
+        -- churns and a worse HOVER->CRUISE handover. The "banking while
+        -- stationary" harm is addressed at the bank command instead
+        -- (AP_BANK_MIN_SPEED), which is where it actually happens and which
+        -- leaves the throttle logic alone.
         if slow then
             self.targets.speed = 1 -- crawl so we can still turn
         else
@@ -1284,7 +1409,10 @@ function Flight:updateAutopilot(dt)
             -- level would otherwise ACCELERATE us on ships lacking it
             ap.brake_reverse = self:hasFeature("rear_reverse")
         end
-        if slow and math.abs(err) <= AP_CORRECT_TOL then
+        if math.abs(err) > AP_RECOURSE then
+            -- Banked correction is hopeless at this error; re-aim.
+            recourseToAim()
+        elseif slow and math.abs(err) <= AP_CORRECT_TOL then
             ap.brake_reverse = false
             rearRamp(AP_MAX_LEVEL) -- re-accelerate on the ramp, not a kick
             setPhase("cruise")
@@ -2338,14 +2466,38 @@ function Flight:updateCruise(dt)
         and (self.ap.phase == "cruise" or self.ap.phase == "correct"
              or self.ap.phase == "arrive") then
         local err = self.ap.err or 0
+        -- Steer on COURSE error, not nose-heading error (apCourseError).
+        -- Falls back to the heading error when the ship is too slow for a
+        -- course to mean anything -- where the bank is gated off anyway.
+        local apos = self.ap
+        local ppos = self.state.position or { x = 0, y = 0, z = 0 }
+        local cdx = apos.x - (ppos.x or 0)
+        local cdz = apos.z - (ppos.z or 0)
+        local cdist = math.sqrt(cdx * cdx + cdz * cdz)
+        local steer_err = self:apCourseError(cdist, cdx, cdz)
+        if steer_err == nil then steer_err = err end
         -- Rate lead: while the bank yaws the ship onto the bearing, subtract
         -- the ongoing yaw rate from the error so the command starts easing
         -- BEFORE the bearing is reached — no overshoot / coast-through.
-        local eff = err - AP_BANK_RATE_LEAD * (state.yaw_rate or 0)
+        local eff = steer_err - AP_BANK_RATE_LEAD * (state.yaw_rate or 0)
         local roll_target = 0
         if math.abs(eff) > AP_BANK_DEAD then
             roll_target = clamp(AP_BANK_KP * eff, -AP_BANK_MAX, AP_BANK_MAX) * AP_BANK_SIGN
         end
+        -- AIRSPEED GATE. A bank yaws a ship by tilting the lift vector, so it
+        -- needs the ship to be moving. Below AP_BANK_MIN_SPEED it produces NO
+        -- yaw at all while still costing mean thrust and rolling the hull —
+        -- strictly a loss. This is the "tries to roll and pitch to yaw while
+        -- stationary" report: in-game the bank is not what yaws the ship, so a
+        -- low-speed ship under bank just leans, loses vertical lift and
+        -- wanders. Note this plant has no bank->yaw coupling at all (cruise
+        -- zeroes tilt, so fz = 0 and the yaw couple is identically zero), so
+        -- this gate is NOT testable here — it is a physical precondition,
+        -- pinned by asserting the command goes to zero, not by measuring yaw.
+        local bank_speed = state.speed or 0
+        local bank_frac = clamp((bank_speed - AP_BANK_MIN_SPEED * 0.5)
+            / (AP_BANK_MIN_SPEED * 0.5), 0, 1)
+        roll_target = roll_target * bank_frac
         -- Bank-to-turn is a luxury the ship cannot always afford. A bank is
         -- paid for out of the MEAN thrust (the differential is reduce-only),
         -- so climbing while banked can stall: measured on the 0-15 model, the
@@ -2361,6 +2513,22 @@ function Flight:updateCruise(dt)
         local alt_err = math.abs((targets.altitude or 0) - (state.altitude or 0))
         if alt_err > 1e-6 then
             roll_target = roll_target * (1 - clamp(alt_err / AP_BANK_ALT_FADE, 0, 1))
+        end
+        -- RATE FADE, on top of the position fade above. The position term
+        -- alone does not damp, it closes: bank -> lift vector tilts -> vertical
+        -- lift drops -> the ship sinks -> |alt_err| grows -> bank fades -> the
+        -- ship climbs -> |alt_err| shrinks -> bank returns -> it sinks again.
+        -- That is a sustained limit cycle, and the reported -3..-30 m band
+        -- with a period of several seconds is its signature. It runs away
+        -- into the deep dive when the bank is large at low thrust margin,
+        -- because then the sink per degree of bank exceeds what the props can
+        -- win back. Keying an additional term to |climb_rate| breaks the loop
+        -- in the tick the sink begins instead of after the whole excursion has
+        -- developed, and it is a strictly larger fade than the position term
+        -- whenever the ship is actually moving vertically.
+        local rate_err = math.abs(state.climb_rate or 0)
+        if rate_err > 1e-6 then
+            roll_target = roll_target * (1 - clamp(rate_err / AP_BANK_RATE_FADE, 0, 1))
         end
         -- No headroom gate on the bank itself. A previous revision faded the
         -- bank out as (hmax - hover) shrank, on the theory that a bank is paid

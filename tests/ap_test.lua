@@ -1054,28 +1054,49 @@ end
 -- which is 0.0 at the ceiling BY CONSTRUCTION. So it switched heading control
 -- off exactly where the ship spends the whole leg and handed the bearing back
 -- to the hover turn: 17% of the leg in cruise, 83% in hover. The theory behind
--- it ("an unsustained bank is positive feedback") was untested, and this plant
--- cannot test it -- cruise zeroes prop tilt, so fz = 0 for every prop and the
--- yaw couple YAW_SIGN*x*fz is identically zero. A pure roll differential held
--- for 100 ticks moves yaw_rate by 0.000 deg/s: there is no bank->yaw coupling
--- here at all, so the "8 deg of bank = 44 deg/s of yaw" figure that motivated
--- the gate was fabricated.
+-- it ("an unsustained bank is positive feedback") was untested.
+--
+-- The METRIC had to change when the cruise/correct -> aim recourse edge was
+-- added. The original counted MODE_CRUISE over EVERY tick, so a deliberate
+-- re-aim (phase "aim", mode HOVER) counted against it -- and in this plant a
+-- deliberate re-aim is the dominant outcome, because cruise CANNOT steer here
+-- and so needs re-aiming over and over (see below). The regression this guard
+-- exists for is a *silent* handover: the phase still said "cruise" while the
+-- mode was HOVER. Counting cruise-mode occupancy over the ticks actually spent
+-- in a cruise-mode phase distinguishes that regression exactly (phase stays
+-- "cruise", mode is HOVER -> low occupancy) while not punishing an explicit
+-- re-aim (phase is "aim" -> those ticks are excluded).
+--
+-- What this plant CANNOT do, and why the recourse count is high: cruise steers
+-- by tilting the lift vector, and cruise zeroes prop tilt, so here the bank
+-- produces NO course change and the fin weathervane is the only yaw path. The
+-- AP test plant therefore cannot hold a bearing in cruise at all, and the ship
+-- must re-aim ~26 times over 4000 ticks no matter how the threshold is set
+-- (60 deg -> 41.9% occupancy, 90 deg -> 39.3%: the aim dwell time dominates,
+-- not the threshold). Tuning AP_RECOURSE against this number would be fitting
+-- a threshold to a model that cannot represent the dynamics. The recourse edge
+-- is therefore tested directly, by asserting the transition, in test 14.
 do
     local env = makeEnv({ alt0 = 60 })
     local f = env.flight
     f:startAutopilot{ name = "CRUISE", x = 2000, z = 0, heading = 90, alt = 270 }
-    local cruise, total = 0, 0
+    local in_cruise_mode, in_cruise_phase = 0, 0
     for _ = 1, 4000 do
         env.step()
-        if f.ap then
-            total = total + 1
-            if f.mode == "CRUISE" then cruise = cruise + 1 end
+        local ap = f.ap
+        if ap then
+            local cruise_phase = (ap.phase == "cruise" or ap.phase == "correct"
+                or ap.phase == "arrive") and not ap.hover_only
+            if cruise_phase then
+                in_cruise_phase = in_cruise_phase + 1
+                if f.mode == "CRUISE" then in_cruise_mode = in_cruise_mode + 1 end
+            end
         end
     end
-    local pct = (total > 0) and (100 * cruise / total) or 0
-    check("cruise: stays in MODE_CRUISE for the bulk of the leg (>=70%)",
-        pct >= 70, string.format("in-cruise=%.1f%%", pct))
-    print(string.format("cruise: in-cruise=%.1f%% of leg", pct))
+    local pct = (in_cruise_phase > 0) and (100 * in_cruise_mode / in_cruise_phase) or 0
+    check("cruise: a cruise-mode phase always runs in MODE_CRUISE (no silent hover handover)",
+        pct >= 70, string.format("in-cruise-mode=%.1f%% of cruise-phase ticks", pct))
+    print(string.format("cruise: in-cruise-mode=%.1f%% of cruise-phase ticks", pct))
 end
 
 -- 13. RATE FEEDBACK MUST BE LIVE, AND MUST DAMP THE MOMENTUM.
@@ -1155,6 +1176,185 @@ do
         string.format("settle=%s", settle and string.format("%.2fs", settle) or "never"))
     print(string.format("damping: inband=%d/3 unopposed=%d reversals=%d settle=%s",
         inband, unopposed, reversals, settle and string.format("%.2fs", settle) or "never"))
+end
+
+--- 14. THE NEW CRUISE/ARRIVAL GUARDS, ASSERTED AT THE COMMAND.
+--- Test 12 cannot reach these: this plant's cruise cannot steer (cruise zeroes
+--- prop tilt, so a bank produces no course change) and its top speed is ~7-10
+--- m/s against the game's 10-20, so closed-loop thresholds cannot be trusted
+--- here. Each is therefore asserted directly on the command or the transition,
+--- which is the honest level at which this plant can carry them.
+do
+    -- 14a. apHoverDrive must refuse to thrust forward across a large bearing.
+    -- This is the orbit: dist is RADIAL, so a ship receding from a point it has
+    -- already passed has the same braking profile as one still approaching, so
+    -- the profile asks for MORE thrust, the bearing flips ~180 deg, and it
+    -- circles. Assert the refusal directly, on and off the threshold.
+    local env = makeEnv({ alt0 = 60 })
+    local f = env.flight
+    -- apHoverDrive is called directly here, so drive state.velocity /
+    -- state.forward directly: a bank-free yaw about +z, so a velocity of
+    -- (0,0,v) IS forward speed.
+    f.state.forward = { x = 0, y = 0, z = 1 }
+    f.state.velocity = { x = 0, y = 0, z = 0 }
+    f:apHoverDrive(60, 90)          -- 90 deg off: must not push forward
+    check("orbit: no forward thrust while the bearing is large",
+        f.targets.move_forward <= 0,
+        string.format("move_forward=%.2f at 90 deg off", f.targets.move_forward or 0))
+    -- ...and it must not brake forever either: sustained reverse tilt would
+    -- walk the ship backwards away from the point.
+    check("orbit: coasts to a stop rather than reversing while rotating",
+        f.targets.move_forward == 0,
+        string.format("move_forward=%.2f when already stopped", f.targets.move_forward or 0))
+    f.state.velocity = { x = 0, y = 0, z = 8 }   -- running on at the waypoint
+    f:apHoverDrive(60, 90)
+    check("orbit: brakes the run-on while rotating",
+        f.targets.move_forward < 0,
+        string.format("move_forward=%.2f while still fast", f.targets.move_forward or 0))
+    -- Inside the tolerance the normal braking profile must still apply, or the
+    -- ship would never close on the point at all.
+    f:apHoverDrive(60, 5)
+    check("orbit: thrusts forward once the bearing is on the point",
+        f.targets.move_forward > 0,
+        string.format("move_forward=%.2f at 5 deg off", f.targets.move_forward or 0))
+
+    -- 14b/14c need the ship actually IN a cruise-mode phase with a live bank
+    -- command, otherwise they measure hover and pass vacuously. pinBank()
+    -- drives the waypoint to sit at a fixed bearing offset from the nose, so
+    -- the bearing error (and therefore the bank) stays put while the test
+    -- changes speed and climb rate underneath it. NOTE state.speed and
+    -- state.climb_rate are RE-PUBLISHED from the plant every step, so they are
+    -- driven via plant.vx/vz/v.
+    local function pinBank(env, f, degd)
+        local ar = math.rad(degd)
+        for _ = 1, 8000 do
+            env.step()
+            local ap = f.ap
+            if ap and ap.phase == "cruise" and f.mode == "CRUISE" then
+                local fw = f.state.forward or { x = 0, y = 0, z = 1 }
+                local fl = math.sqrt(fw.x * fw.x + fw.z * fw.z)
+                if fl > 1e-6 then
+                    local ux, uz = fw.x / fl, fw.z / fl
+                    local px, pz = -uz, ux
+                    local p = f.state.position or { x = 0, y = 0, z = 0 }
+                    local off = 1200 * math.tan(ar)
+                    ap.x = (p.x or 0) + 1200 * ux + off * px
+                    ap.z = (p.z or 0) + 1200 * uz + off * pz
+                end
+                if math.abs(ap.err or 0) > 2 then return true end
+            end
+        end
+        return false
+    end
+    local function propDiff(f)
+        return math.abs((f.outputs.RL_speed or 0) - (f.outputs.RR_speed or 0))
+    end
+
+    local env2 = makeEnv({ alt0 = 60 })
+    local g = env2.flight
+    g:startAutopilot{ name = "BANKAIR", x = 2000, z = 0, heading = 90, alt = 200 }
+    check("bank: pinned in a cruise phase with a live bank", pinBank(env2, g, 8),
+        string.format("phase=%s mode=%s", tostring(g.ap and g.ap.phase), tostring(g.mode)))
+    env2.plant.vx, env2.plant.vz = 0, 0
+    env2.step(); env2.step(); env2.step()
+    local stopped = propDiff(g)
+    check("bank: no bank command below the airspeed threshold",
+        g.mode == "CRUISE" and stopped < 0.02,
+        string.format("diff=%.4f at speed 0 (phase=%s)", stopped, tostring(g.ap and g.ap.phase)))
+    env2.plant.vx, env2.plant.vz = 25, 0    -- moving
+    env2.step(); env2.step(); env2.step()
+    local rolling = propDiff(g)
+    check("bank: bank command returns once the ship is moving again",
+        rolling > 0.05, string.format("diff=%.4f at speed 25", rolling))
+
+    -- 14c. The bank must also fade on vertical RATE. The altitude-position fade
+    -- alone closes a limit cycle rather than damping it (bank -> lift vector
+    -- tilts -> sink -> alt error grows -> bank fades -> climb -> bank returns).
+    -- Assert a fast climb/sink rate drives the bank command to ~nothing.
+    local env3 = makeEnv({ alt0 = 200 })
+    local h = env3.flight
+    h:startAutopilot{ name = "BANKRATE", x = 2000, z = 0, heading = 90, alt = 200 }
+    check("bank: pinned in a cruise phase with a live bank", pinBank(env3, h, 8),
+        string.format("phase=%s mode=%s", tostring(h.ap and h.ap.phase), tostring(h.mode)))
+    env3.plant.vx, env3.plant.vz = 25, 0
+    env3.plant.v = 0
+    env3.step(); env3.step(); env3.step()
+    local lvl = propDiff(h)
+    env3.plant.v = 9        -- published as climb_rate, past AP_BANK_RATE_FADE
+    env3.step(); env3.step()
+    local sunk = propDiff(h)
+    -- force altitude error to 0 so only the rate term applies
+    h.targets.altitude = h.state.altitude
+    env3.step(); env3.step()
+    sunk = propDiff(h)
+    print(string.format("  RATEDBG2 lvl=%.4f sunk=%.4f phase=%s mode=%s v=%.2f", lvl, sunk, tostring(h.ap and h.ap.phase), tostring(h.mode), h.state.climb_rate or 0))    check("bank: a fast climb/sink rate fades the bank out",
+        sunk < lvl * 0.8 + 0.1,
+        string.format("diff %.4f -> %.4f at 9 m/s vertical", lvl, sunk))
+
+    -- 14d. The bank must steer on COURSE, not on nose heading. Assert the
+    -- helper exists, is nil when too slow to have a course, and returns the
+    -- velocity-to-target angle (so a crabbing nose does not read as an error).
+    local env4 = makeEnv({ alt0 = 200 })
+    local k = env4.flight
+    k.state.velocity = { x = 0, y = 0, z = 0 }
+    check("course: nil below the course-speed threshold",
+        k:apCourseError(100, 100, 0) == nil, "velocity zero -> nil")
+    k.state.velocity = { x = 10, y = 0, z = 0 }   -- travelling due +x
+    local ce = k:apCourseError(100, 100, 0)       -- target also due +x
+    check("course: aligned course reads zero error",
+        ce ~= nil and math.abs(ce) < 1e-6, string.format("course_err=%s", tostring(ce)))
+    local ce2 = k:apCourseError(100, 0, 100)      -- target due +z, still flying +x
+    check("course: a 90 deg course error is reported",
+        ce2 ~= nil and math.abs(math.abs(ce2) - 90) < 1e-6,
+        string.format("course_err=%s", tostring(ce2)))
+
+    -- 14e. cruise/correct -> aim RECOURSE. The phase machine had no edge back to
+    -- aim from a travel leg at all, so once a run left the first rotation it
+    -- could never re-aim: "once it's in phase 3 it can't go back to phase 2".
+    -- Assert the transition directly: enter aim with the climb SKIPPED, since
+    -- the ship is already holding cruise altitude.
+    local env5 = makeEnv({ alt0 = 200 })
+    local m = env5.flight
+    m:startAutopilot{ name = "RECOURSE", x = 2000, z = 0, heading = 90, alt = 200 }
+    for _ = 1, 6000 do
+        env5.step()
+        if m.ap and m.ap.phase == "cruise" then break end
+    end
+    check("recourse: run reaches the cruise phase", m.ap and m.ap.phase == "cruise",
+        string.format("phase=%s", m.ap and tostring(m.ap.phase) or "no ap"))
+    -- ap.err is RECOMPUTED from geometry every tick, so assigning it does
+    -- nothing. Move the waypoint instead: after the aim phase the nose faces
+    -- +x, so a target at (-d,+d) sits ~135 deg off the bearing (too far to
+    -- bank back) and (+d,+d) sits ~45 deg (which `correct` handles).
+    local function aimWaypoint(dx, dz)
+        local p = m.state.position or { x = 0, y = 0, z = 0 }
+        m.ap.x = (p.x or 0) + dx
+        m.ap.z = (p.z or 0) + dz
+    end
+    aimWaypoint(-1200, 1200)         -- ~135 deg: too far to bank back
+    env5.step()
+    check("recourse: a large heading error re-enters ROTATE from cruise",
+        m.ap.phase == "aim", string.format("phase=%s err=%.1f",
+            tostring(m.ap.phase), m.ap.err or 0))
+    check("recourse: the re-aim skips the climb (already at cruise altitude)",
+        m.ap.step == "turn" and m.ap.needs_climb == false,
+        string.format("step=%s needs_climb=%s", tostring(m.ap.step), tostring(m.ap.needs_climb)))
+    check("recourse: the re-aim runs in HOVER, where the yaw steer exists",
+        m.mode == "HOVER", string.format("mode=%s", tostring(m.mode)))
+    -- And from `correct`, which is the leg the pilot actually got stuck in.
+    m.ap.phase = "correct"
+    aimWaypoint(-1200, 1200)
+    env5.step()
+    check("recourse: a large heading error re-enters ROTATE from correct too",
+        m.ap.phase == "aim", string.format("phase=%s err=%.1f",
+            tostring(m.ap.phase), m.ap.err or 0))
+    -- A MODERATE error must NOT recourse -- it is what `correct` is for.
+    m.ap.phase = "cruise"
+    aimWaypoint(1200, 1200)           -- ~45 deg: correctable by banking
+    env5.step()
+    check("recourse: a moderate error does not re-aim (stays with correct)",
+        m.ap.phase == "correct", string.format("phase=%s err=%.1f",
+            tostring(m.ap.phase), m.ap.err or 0))
 end
 
 print(string.format("ap_test: %d passed, %d failed", passed, failed))
