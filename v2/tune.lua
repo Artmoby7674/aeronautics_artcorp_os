@@ -154,6 +154,12 @@ return {
         speed_int = 0.15,
         turn_limit = 45,     -- deg off course in cruise: stop and turn
         arrive_r = 4,        -- m
+        -- Nudges: point still ahead but no progress for nudge_after s ->
+        -- rear thruster at level 1 for nudge_on s every nudge_period s
+        nudge_after = 3,     -- s
+        nudge_on = 1.5,      -- s
+        nudge_period = 4,    -- s
+        nudge_speed = 0.5,   -- m/s: slower than this = not making progress
         heading_tol = 4,     -- deg
         shutdown_on_land = true,
         phase_timeout = 240, -- s per phase

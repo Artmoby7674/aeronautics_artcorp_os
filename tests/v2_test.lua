@@ -493,5 +493,48 @@ do
     check("fly from ground: climbing within 15 s (> 25 m)", up > 25, f(up))
 end
 
+-- 20. Arrival (v2.30 flight): the fixed-speed hold settled 4.6 m under the
+--     travel altitude and the re-aim waited for "within 4 m" forever; and
+--     a ship that stops making progress short of the point gets level-1
+--     rear nudges until it arrives.
+do
+    -- hold settles ~6 m low (sim needs 6.15, the ship believes 6; learning off)
+    local w = World.new({ loop_ticks = 3, sim = { hover = 6.15 }, tune = { vertical = { hover_learn = false } } }):airborne(190, 0)
+    w.fl.ctl.roll_known, w.fl.ctl.pitch_known = 1, 1
+    w.fl.calib = nil
+    w:startAP({ name = "SIDE", x = 0, z = -800, heading = 0 })
+    local left_depart = w:run(120, function(w) return w.fl.ap and w.fl.ap.phase ~= "depart" end)
+    print(string.format("settled low: left depart=%s at t=%.0f (alt %.1f, goal %.1f)", tostring(left_depart), w.t,
+        w:truth().alt, w.fl.ap and w.fl.ap.goal_alt or -1))
+    check("settled low: depart does not hang", left_depart)
+
+    -- re-aim after a near miss goes straight to the turn
+    local w2 = World.new({ loop_ticks = 3 }):airborne(150, 0)
+    w2.fl.ctl.roll_known, w2.fl.ctl.pitch_known = 1, 1
+    w2.fl.calib = nil
+    local ap = w2:startAP({ name = "NEAR", x = 15, z = -10, heading = 0 })
+    ap.retries = 1
+    w2:run(1)
+    check("re-aim: no altitude wait", ap.phase ~= "depart", ap.phase)
+
+    -- no speed control at all near the point: only the nudges can move it
+    local w3 = World.new({ loop_ticks = 3, tune = { autopilot = { speed_gain = 0, speed_int = 0 } } }):airborne(150, 0)
+    w3.fl.ctl.roll_known, w3.fl.ctl.pitch_known = 1, 1
+    w3.fl.calib = nil
+    w3:startAP({ name = "AHEAD", x = 0, z = -45, heading = 0 })
+    local max_rear, nudged = 0, false
+    w3:run(300, function(w)
+        max_rear = math.max(max_rear, w.fl.rear or 0)
+        if w.fl.ap and w.fl.ap.nudging then nudged = true end
+        return w.fl.ap and (w.fl.ap.phase == "stop" or w.fl.ap.phase == "align" or w.fl.ap.phase == "land")
+    end)
+    local d = math.sqrt(w3:truth().x ^ 2 + (w3:truth().z + 45) ^ 2)
+    print(string.format("nudges: nudged=%s, %.1f m from the point, max rear level %.1f, phase %s", tostring(nudged), d,
+        max_rear, w3.fl.ap and w3.fl.ap.phase or "-"))
+    check("nudges: used", nudged)
+    check("nudges: get it to the point (< 8 m)", d < 8, f(d))
+    check("nudges: only level 1", max_rear <= 1.01, f(max_rear))
+end
+
 print(string.format("v2_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("v2_test FAILED", 0) end

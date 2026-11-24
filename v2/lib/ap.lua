@@ -120,7 +120,19 @@ function AP:update(fl, s, dt)
         -- climb straight up first, heading left alone (rotation only braked):
         -- turning happens up at the travel altitude, never near the ground
         fl:setMode("hover")
-        if math.abs(s.alt - self.goal_alt) < 4 and math.abs(s.vs) < 1.2 then
+        local at_alt = math.abs(s.alt - self.goal_alt) < 4 and math.abs(s.vs) < 1.2
+        -- the fixed-speed altitude hold can settle a few metres off its
+        -- target: holding steady near it for 6 s counts as there (v2.30
+        -- flight: it hung 4.6 m low and never turned, for minutes)
+        if math.abs(s.vs) < 0.3 and math.abs(s.alt - self.goal_alt) < 12 then
+            self.settle_t = (self.settle_t or 0) + dt
+        else
+            self.settle_t = 0
+        end
+        if self.settle_t > 6 then at_alt = true end
+        -- re-aiming after a near miss: it is already up at travel height
+        if self.retries > 0 then at_alt = true end
+        if at_alt then
             -- Up at the planned altitude. If the plan was cut short by the
             -- ceiling the air model PREDICTS, check it: hang here until the
             -- air at this height is measured, then predict again. A world
@@ -198,8 +210,26 @@ function AP:update(fl, s, dt)
             self.level_i = U.clamp(self.level_i + a.speed_int * e * dt, 0, 15)
             cmd.rear = U.clamp(self.level_i + a.speed_gain * e, 0, 15)
         end
+        -- Nudge: the point is still ahead but the ship has stopped getting
+        -- closer (the speed plan asks for less than one rear level, which
+        -- the relay rounds to nothing). Pulse the rear thruster at level 1,
+        -- 1.5 s on then a coast, until it moves again.
+        local stalled = df > a.arrive_r and dist > a.arrive_r and not cmd.rear_rev
+            and s.u < (a.nudge_speed or 0.5) and (cmd.rear or 0) < 1
+        self.stuck_t = stalled and (self.stuck_t or 0) + dt or 0
+        if self.stuck_t > (a.nudge_after or 3) then
+            self.nudge_t = (self.nudge_t or 0) + dt
+            if self.nudge_t % (a.nudge_period or 4) < (a.nudge_on or 1.5) then
+                cmd.rear = math.max(cmd.rear or 0, 1)
+                self.nudging = true
+            else
+                self.nudging = false
+            end
+        else
+            self.nudge_t, self.nudging = 0, false
+        end
         -- at (or past) the point, or planned to a standstill: stop
-        if (dist < a.face_r and (v_sp < 0.5 or df < 0)) or dist < a.arrive_r then
+        if (dist < a.face_r and ((v_sp < 0.5 and df <= a.arrive_r + a.stop_margin) or df < 0)) or dist < a.arrive_r then
             fl:setMode("hover")
             self:setPhase("stop")
             self.still = 0
