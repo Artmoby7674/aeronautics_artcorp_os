@@ -258,7 +258,7 @@ check("screen kept refreshing (frame 50 reached)", log:find("frame 50 drawn") ~=
 -- ---------------------------------------------------------------- airborne start
 -- A restart in the air (error, chunk reload) must take control at once:
 -- clutch held, props driven, altitude kept. No splash, no cut props.
-for _, m in ipairs({ "main", "config", "nav", "link", "rec", "draw", "ui", "font", "flight", "ctl", "est", "atmos", "ap", "shipdisk" }) do
+for _, m in ipairs({ "main", "config", "nav", "link", "rec", "draw", "ui", "font", "flight", "ctl", "est", "atmos", "ap", "shipdisk", "remote" }) do
     package.loaded[m] = nil
 end
 w:airborne(120, 0)

@@ -11,6 +11,7 @@ local D = require("draw")
 local UI = require("ui")
 local V = require("version")
 local ShipDisk = require("shipdisk")
+local Remote = require("remote")
 
 local Main = {}
 
@@ -209,6 +210,7 @@ local function act(a)
     if a == "wp:fly" then
         local w = Nav.list[ui.sel]
         if not w then return end
+        if fl.lock and fl.lock.mode == "grounded" then return say("LOCKED BY ARTCORP", D.C.bad) end
         if fl.phase == "estop" or fl.phase == "unflip" then return say("NOT NOW: " .. fl.phase:upper(), D.C.bad) end
         if fl.phase == "landing" then fl:cancelLanding("") end
         fl.ap = AP.new(fl, w)
@@ -316,6 +318,80 @@ local function act(a)
     end
 end
 
+-- ------------------------------------------------------------ ArtCorp remote
+
+-- The ArtCorp lock, on disk so a shut-down ship stays shut down across a
+-- reboot. mode = "grounded" (won't take off) or "summon" (flying to the CEO).
+local LOCK_PATH = ROOT .. "/data/artcorp_lock.lua"
+
+local function saveLock()
+    if app.lock then U.saveTable(LOCK_PATH, app.lock) else pcall(fs.delete, LOCK_PATH) end
+end
+
+local function setLock(mode, reason, x, z, by)
+    app.lock = { mode = mode, reason = reason, x = x, z = z, by = by, day = os.day and os.day() or 0 }
+    app.fl.lock = app.lock
+    saveLock()
+end
+
+local function clearLock()
+    app.lock, app.fl.lock, app.pending_summon = nil, nil, nil
+    saveLock()
+end
+
+-- Carry out one remote command. Returns the ship name on success (so the
+-- remote's ack can show which ship obeyed), or false to refuse.
+local function doRemote(cmd)
+    local fl = app.fl
+    if cmd.cmd == "unlock" then
+        if fl.ap and fl.ap.locked then fl.ap:cancel("RELEASED") fl.ap = nil fl:holdHere() end
+        clearLock()
+        say("ARTCORP LOCK RELEASED", D.C.good)
+        U.log("artcorp: unlocked by remote %s", tostring(cmd.by))
+    elseif cmd.cmd == "estop" then
+        if app.power == "on" and fl.phase ~= "parked" and fl.phase ~= "estop" then fl:setEstop(true) end
+        setLock("grounded", "estop", nil, nil, cmd.by)
+        say("ARTCORP OVERRIDE: E-STOP", D.C.bad)
+        U.log("artcorp: E-STOP by remote %s", tostring(cmd.by))
+    elseif cmd.cmd == "land" then
+        setLock("grounded", "land", nil, nil, cmd.by)
+        if app.power == "on" and fl.phase ~= "parked" and fl.phase ~= "estop" then
+            fl:beginLanding({ shutdown = true, from_ap = true })
+        end
+        say("ARTCORP OVERRIDE: FORCED LANDING", D.C.bad)
+        U.log("artcorp: force-land by remote %s", tostring(cmd.by))
+    elseif cmd.cmd == "summon" then
+        if not (cmd.x and cmd.z) then return false end
+        setLock("summon", "summon", cmd.x, cmd.z, cmd.by)
+        if app.power == "on" and fl.phase ~= "parked" then
+            fl:remoteSummon(cmd.x, cmd.z)
+        else
+            app.pending_summon = { x = cmd.x, z = cmd.z } -- auto-boot and fly (below)
+        end
+        say(string.format("ARTCORP SUMMON: EN ROUTE TO %d, %d", cmd.x, cmd.z), D.C.bad)
+        U.log("artcorp: summon to %s,%s by remote %s", tostring(cmd.x), tostring(cmd.z), tostring(cmd.by))
+    else
+        return false
+    end
+    app.ui:invalidate()
+    return app.cfg.name
+end
+
+local function initRemote()
+    Remote.init({
+        snapshot = function()
+            local s = app.fl.est.s
+            return {
+                name = app.cfg.name, slot = app.cfg.slot, os = V.label,
+                phase = (app.power == "on") and app.fl.phase or app.power,
+                locked = app.lock and app.lock.reason or false,
+                x = s and s.x, y = s and s.alt, z = s and s.z,
+            }
+        end,
+        onCommand = doRemote,
+    })
+end
+
 -- ------------------------------------------------------------ alerts
 
 local function alerts()
@@ -324,6 +400,7 @@ local function alerts()
         out[#out + 1] = { level = level, text = text, hint = hint }
         if level == "bad" then bad = true end
     end
+    if app.lock then add("bad", "LOCKED BY ARTCORP", (tostring(app.lock.reason)):upper() .. " / REMOTE") end
     if fl.phase == "estop" then add("bad", "E-STOP: ALL LIFT CUT", "SPACE RESETS") end
     if fl.phase == "unflip" then add("bad", "UPSIDE DOWN: AUTO-UNFLIP", "HANDS OFF") end
     if not s.valid then add("bad", "NO SHIP TELEMETRY (CC:SABLE)", s.err and s.err:sub(1, 20)) end
@@ -432,6 +509,16 @@ local function controlTick()
         U.bbFlush(os.clock())
         os.reboot()
     end
+    -- ArtCorp summon in progress: start the engine and fly to the CEO on our
+    -- own, even straight out of a reboot. Nothing the pilot can do stops it.
+    if app.pending_summon then
+        if app.power == "off" then
+            beginBoot()
+        elseif app.power == "on" and app.fl.phase == "parked" and not app.fl.ap then
+            app.fl:remoteSummon(app.pending_summon.x, app.pending_summon.z)
+            app.pending_summon = nil
+        end
+    end
     local tick_t0 = HW.now_ms()
     HW.resetStats()
     app.prev, app.keys = app.keys, HW.inputs()
@@ -457,6 +544,11 @@ local function controlTick()
     for _, e in ipairs(app.fl.events) do
         if e.kind == "landed" then
             if e.ap then app.last_ap = "LAST ROUTE: ARRIVED AT " .. e.ap end
+            if app.lock and app.lock.mode == "summon" then
+                app.lock.mode = "grounded"
+                saveLock()
+                say("ARTCORP: SHIP DELIVERED AND LOCKED", D.C.bad)
+            end
             if e.shutdown then powerOff("landed") end
         end
     end
@@ -601,6 +693,13 @@ function Main.run(opts)
     loadLearned(app.fl.ctl)
     app.fl.atmos.base_hover = app.fl.ctl.hover
     loadAtmos(app.fl.atmos)
+    app.lock = U.loadTable(LOCK_PATH)
+    app.fl.lock = app.lock
+    if app.lock then
+        U.log("artcorp: ship is LOCKED (%s) by remote %s", tostring(app.lock.reason), tostring(app.lock.by))
+        if app.lock.mode == "summon" then app.pending_summon = { x = app.lock.x, z = app.lock.z } end
+    end
+    initRemote()
     Nav.init(ROOT, cfg.slot)
     Link.open()
     app.ui = UI.new()
@@ -737,6 +836,7 @@ function Main.run(opts)
                 if mon2 and initScreen(mon2) then app.ui:invalidate() end
             elseif e == "rednet_message" then
                 pcall(Link.onRednet, ev[2], ev[3])
+                pcall(Remote.onRednet, ev[2], ev[3])
             elseif e == "modem_message" then
                 pcall(Link.onModem, ev[3], ev[4], ev[5])
             elseif e == "peripheral" or e == "peripheral_detach" then

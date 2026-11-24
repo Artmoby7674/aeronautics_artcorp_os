@@ -5,6 +5,7 @@
 -- start-up, in the log and on the error screen; the cockpit screen (start
 -- screen, SHIP tab) shows the number only. Newest first.
 local history = {
+    { "2.30", "FLEET LINK", "ArtCorp remote can scan, E-STOP, force-land, summon and lock this ship over rednet" },
     { "2.29", "TAKE OFF", "TAKE OFF button: title only (no stale \"LIFT TO 6 M\")" },
     { "2.28", "SHIP DISK", "save / load the ship (wiring, learned, air, waypoints) to a floppy" },
     { "2.27", "QUICK START", "A/P climbs at once (no wait for the direction check); take-off +20 m" },
@@ -34,6 +35,6 @@ return {
     note = latest[3],
     date = "2026-11-24",
     history = history,
-    -- "v2.29 TAKE OFF"
+    -- "v2.30 FLEET LINK"
     label = "v" .. latest[1] .. " " .. latest[2],
 }

@@ -11,6 +11,7 @@ local U = require("util")
 local Ctl = require("ctl")
 local Est = require("est")
 local Atmos = require("atmos")
+local AP = require("ap")
 
 local Flight = {}
 Flight.__index = Flight
@@ -105,6 +106,12 @@ end
 
 function Flight:takeoff()
     if self.phase ~= "parked" then return end
+    -- ArtCorp lock: a grounded ship stays grounded until the remote releases
+    -- it (a summon lock is NOT grounded -- it needs to fly to the CEO)
+    if self.lock and self.lock.mode == "grounded" then
+        self:notify("LOCKED BY ARTCORP")
+        return
+    end
     self.phase = "flying"
     self:holdHere()
     self.alt_target = self.est.s.alt + (self.t.vertical.takeoff_climb or 20)
@@ -134,6 +141,19 @@ function Flight:setEstop(on)
         self.ctl:softReset()
         self:notify("E-STOP CLEARED")
     end
+end
+
+-- ArtCorp remote takeover ---------------------------------------------------
+
+-- Uncancelable autopilot to the CEO's coordinates. If parked, the autopilot
+-- takes off by itself (the summon lock lets takeoff through).
+function Flight:remoteSummon(x, z)
+    if self.phase == "estop" then self:setEstop(false) end
+    if self.phase == "landing" then self.phase = "flying" self.land = nil end
+    local wp = { name = "ARTCORP", x = x, z = z, heading = self.est.s.heading }
+    self.ap = AP.new(self, wp)
+    self.ap.locked = true      -- pilot inputs can't cancel it
+    self:notify("ARTCORP SUMMON")
 end
 
 -- opts: { x, z, heading, shutdown = bool, from_ap = bool }
@@ -360,6 +380,7 @@ function Flight:update(dt, keys)
         if self.ap then
             local override = edge(self, "SPACE") or edge(self, "CTRL") or edge(self, "W")
                 or edge(self, "S") or edge(self, "Q") or edge(self, "E")
+            if override and self.ap.locked then override = false end -- ArtCorp hold
             if override then
                 self.ap:cancel("PILOT OVERRIDE")
                 self.ap = nil

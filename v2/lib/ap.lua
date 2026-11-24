@@ -93,7 +93,7 @@ end
 function AP:update(fl, s, dt)
     local a = self.t.autopilot
     self.pt = self.pt + dt
-    if self.pt > a.phase_timeout then
+    if self.pt > a.phase_timeout and not self.locked then
         fl:notify("A/P TIMEOUT IN " .. self.phase:upper())
         self:cancel("TIMEOUT")
         fl.ap = nil
