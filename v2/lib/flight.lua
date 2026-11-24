@@ -501,21 +501,27 @@ function Flight:write(out)
 end
 
 -- Fresh start after boot: decide parked vs flying from the sensor.
-function Flight:boot()
+-- Fresh start after power-on. `where` is decided by the caller:
+--   "ground" (engines started from the start screen): parked, gear down, props
+--            idle; the pilot takes off (SPACE / TAKE OFF / autopilot).
+--   "air"    (the OS was flying when it stopped): take control at once.
+-- The ground sensor alone cannot decide this: on this ship it reads 0 while
+-- parked, which looks exactly like "nothing below".
+function Flight:boot(where, gear)
     local s = self.est:update(self.hw.ship(), 0.05)
     self.prox = self.hw.proximity()
-    local thr = (self.shipcfg.proximity or {}).landed_threshold or 15
     self.ctl:reset()
     self.ap, self.land, self.unflip = nil, nil, nil
     self.mode = "hover"
     self.rear_target, self.rear = 0, 0
-    if self.prox >= thr or not s.valid then
-        self.phase = "parked"
-    else
+    if where == "air" and s.valid then
         self.phase = "flying"
+        self.gear_down = (gear == nil) and (self.prox > 0) or gear
+    else
+        self.phase = "parked"
+        self.gear_down = true
     end
     self:holdHere()
-    self.gear_down = self.prox > 0
 end
 
 return Flight

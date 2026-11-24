@@ -133,6 +133,11 @@ at(1.5, function()
     states.clutch_mid = r.out[e.clutch_side] or 0
 end)
 -- 6 s: powered on, parked -> press SPACE to take off
+at(5.9, function()
+    -- engines just started from the start screen: parked, no tilt, gear down
+    local o = sim:readOutputs()
+    states.boot_tilt = o.FL_tilt ~= 0 or o.FR_tilt ~= 0 or o.RL_tilt ~= 0 or o.RR_tilt ~= 0
+end)
 at(6, function()
     local e = cfg.engine
     local r = sim:relay(cfg.peripherals[e.relay_key])
@@ -230,6 +235,7 @@ check("boot: starter on during start", states.starter_mid == 15, states.starter_
 check("boot: clutch still out during start", states.clutch_mid == 0, states.clutch_mid)
 check("boot: clutch engaged after boot", states.clutch_on == 15, states.clutch_on)
 check("boot: starter released after boot", states.starter_after == 0, states.starter_after)
+check("engine start: no prop tilt on the ground", states.boot_tilt == false, tostring(states.boot_tilt))
 check("takeoff: climbed after SPACE", (states.alt20 or 0) > 68, states.alt20)
 check("waypoints: imported from the old OS", files["v2/data/waypoints.lua"] and files["v2/data/waypoints.lua"]:find("REACTOR") ~= nil)
 local miss = math.sqrt((sim.pos.x - 40) ^ 2 + (sim.pos.z + 30) ^ 2)
@@ -242,6 +248,7 @@ local errs = 0
 for _, l in ipairs(printed) do if l:find("ERROR") or l:find("%[UI%]") then errs = errs + 1 print("  log: " .. l) end end
 check("no runtime errors logged", errs == 0, errs)
 check("no draw errors", #mon.errors == 0, mon.errors[1])
+check("state: saved as ground after the landed power-off", (files["v2/data/state"] or ""):find("ground") ~= nil, files["v2/data/state"])
 local log = files["v2/data/log.txt"] or ""
 check("log: screen setup recorded", log:find("screen main_monitor: 348x216 px") ~= nil, log:sub(1, 300))
 check("log: taps recorded", log:find("touch main_monitor") ~= nil)
@@ -255,6 +262,7 @@ for _, m in ipairs({ "main", "config", "nav", "link", "rec", "draw", "ui", "font
     package.loaded[m] = nil
 end
 w:airborne(120, 0)
+files["v2/data/state"] = "return { where = \"air\", gear = false }" -- it was flying
 mon.errors = {}
 timers, script, si = {}, {}, 1
 local t0 = sim.t

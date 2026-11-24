@@ -215,7 +215,7 @@ do
     w.sim.q = Sim.quatFromHeading(0, 0, 175)
     w.sim.history = {}
     w.sim:snapshot()
-    w.fl:boot()
+    w.fl:boot("air")
     local upright_at, reversed_at
     w:run(40, function(w)
         local _, _, r, up = w.sim:attitude()

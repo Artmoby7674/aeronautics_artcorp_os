@@ -71,7 +71,7 @@ function World:airborne(alt, heading)
     for _, p in ipairs({ "FL", "FR", "RL", "RR" }) do
         s.prop[p] = self.tune.ship.hover_throttle / math.exp(-0.004 * (alt - 63))
     end
-    self.fl:boot()
+    self.fl:boot("air")
     return self
 end
 

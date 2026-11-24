@@ -649,7 +649,9 @@ function UI:ctrl(m, static)
     local bh = math.floor((H - TAB_H - gy - 6 - (rowsN - 1) * 6) / rowsN)
     local landing = fl.phase == "landing"
     local items = {
-        { "ctl:land", landing and "LANDING" or "AUTO-LAND", landing and "TAP TO CANCEL" or "DESCEND HERE", landing and "active" or (fl.phase == "flying" and "primary" or "off") },
+        fl.phase == "parked"
+            and { "ctl:land", "TAKE OFF", "LIFT TO 6 M", "primary" }
+            or { "ctl:land", landing and "LANDING" or "AUTO-LAND", landing and "TAP TO CANCEL" or "DESCEND HERE", landing and "active" or (fl.phase == "flying" and "primary" or "off") },
         { "ctl:gear", "GEAR " .. (fl.gear_down and "DOWN" or "UP"), "TAP TO " .. (fl.gear_down and "RAISE" or "LOWER"), fl:feature("gear") and "normal" or "off" },
         { "ctl:mode", fl.mode:upper(), "SHIFT TOGGLES", (fl.phase == "flying" and not fl.ap and fl:feature("cruise_mode")) and "normal" or "off" },
         { "ctl:estop", fl.phase == "estop" and "RESET E-STOP" or "E-STOP", fl.phase == "estop" and "OR PRESS SPACE" or "CUTS ALL LIFT", fl.phase == "estop" and "warn" or "danger" },

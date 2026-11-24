@@ -26,6 +26,22 @@ local function say(text, color)
     print("[" .. string.format("%6.1f", os.clock()) .. "] " .. text)
 end
 
+-- ------------------------------------------------------------ air/ground state
+-- Written whenever it changes, so a restart knows whether the OS was flying
+-- (take control at once) or the ship was on the ground (start screen).
+local STATE_PATH = ROOT .. "/data/state"
+
+local function readState()
+    local t = U.loadTable(STATE_PATH)
+    return t or { where = "ground", gear = true }
+end
+
+local function writeState(where, gear)
+    if app.state_where == where and app.state_gear == gear then return end
+    app.state_where, app.state_gear = where, gear
+    U.saveTable(STATE_PATH, { where = where, gear = gear })
+end
+
 -- ------------------------------------------------------------ learned values
 
 local LEARN_PATH = ROOT .. "/data/learned.lua"
@@ -69,6 +85,7 @@ local function powerOff(why)
     HW.setStarter(false)
     app.power = "off"
     fl.phase = "parked"
+    writeState("ground", fl.gear_down)
     saveLearned(fl.ctl)
     app.ui:invalidate()
     say("POWER OFF" .. (why and (" (" .. why .. ")") or ""))
@@ -88,9 +105,10 @@ local function bootTick(dt)
     if app.boot_t >= total then
         HW.setStarter(false)
         app.power = "on"
-        app.fl:boot()
+        app.fl:boot("ground")
         app.ui:invalidate()
-        say(app.fl.phase == "parked" and "READY ON THE GROUND (SPACE = TAKE OFF)" or "READY, HOLDING POSITION", D.C.good)
+        say("ENGINES RUNNING: TAKE OFF WHEN READY", D.C.good)
+        U.log("engines running, parked")
     end
 end
 
@@ -200,6 +218,7 @@ local function act(a)
         return
     end
     if a == "ctl:land" then
+        if fl.phase == "parked" then fl:takeoff() return end
         if fl.phase == "landing" then return fl:cancelLanding() end
         if fl.ap then fl.ap:cancel("AUTO-LAND") fl.ap = nil end
         local ok, why = fl:beginLanding({})
@@ -310,6 +329,8 @@ local function controlTick()
     HW.setClutch(true) -- held while the OS is on: this is what couples the props
     HW.setStarter(false)
     app.fl:update(DT, app.keys)
+    local ph = app.fl.phase
+    writeState((ph == "flying" or ph == "landing" or ph == "unflip") and "air" or "ground", app.fl.gear_down)
     for _, e in ipairs(app.fl.events) do
         if e.kind == "landed" then
             if e.ap then app.last_ap = "LAST ROUTE: ARRIVED AT " .. e.ap end
@@ -416,19 +437,17 @@ function Main.run(opts)
     -- Already in the air (restart after an error, chunk reload, reboot):
     -- take control at once instead of sitting on the splash with the props
     -- cut. On the ground the pilot starts the engines from the screen.
-    local thr = (cfg.ship.proximity or {}).landed_threshold or 15
+    -- Was the OS flying when it last stopped (error restart, chunk reload,
+    -- reboot in the air)? Then take control at once instead of sitting on the
+    -- start screen with the props cut. Otherwise the pilot starts the engines.
     local raw = HW.ship()
-    local prox0 = HW.proximity()
-    local sensor = HW.device((cfg.ship.proximity or {}).input_key or "aux_relay") ~= nil
-    U.log("start: telemetry %s, ground sensor %s", raw.ok and "ok" or tostring(raw.err),
-        sensor and tostring(prox0) or "NOT CONNECTED")
-    -- airborne = the sensor sees nothing or the ground is several blocks
-    -- down; a parked ship whose sensor reads 13-14 is still on the ground.
-    -- Without a connected sensor there is no way to tell: stay on the
-    -- start screen (it read 0 = "airborne" while the relays were missing).
-    if raw.ok and sensor and prox0 <= thr - 3 then
+    local last = readState()
+    app.state_where, app.state_gear = last.where, last.gear
+    U.log("start: telemetry %s, ground sensor %d, last state %s", raw.ok and "ok" or tostring(raw.err),
+        HW.proximity(), tostring(last.where))
+    if raw.ok and last.where == "air" then
         app.power = "on"
-        app.fl:boot()
+        app.fl:boot("air", last.gear)
         HW.setClutch(true)
         say("AIRBORNE START: CONTROL RESUMED", D.C.warn)
         U.log("airborne start: control resumed")
