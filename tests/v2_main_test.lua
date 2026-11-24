@@ -294,6 +294,55 @@ check("old learned values: direction check starts over", (L.roll_known or 0) == 
     tostring(L.roll_known) .. "/" .. tostring(L.roll_sign))
 check("old learned values: yaw braking kept", math.abs((L.yaw_brake or 0) - 0.7) < 0.2, L.yaw_brake)
 
+-- ---------------------------------------------------------------- ArtCorp summon
+-- A ship under an ArtCorp summon lock: the pilot taps every way out
+-- (E-STOP, POWER OFF, CANCEL A/P). None may stop it flying to the CEO.
+for _, m in ipairs({ "main", "config", "nav", "link", "rec", "draw", "ui", "font", "flight", "ctl", "est", "atmos", "ap", "shipdisk", "remote" }) do
+    package.loaded[m] = nil
+end
+w:airborne(150, 0)
+local tx, tz = math.floor(sim.pos.x + 300), math.floor(sim.pos.z - 300)
+files["v2/data/state"] = "return { where = \"air\", gear = false }"
+files["v2/data/artcorp_lock.lua"] = string.format(
+    "return { mode = \"summon\", reason = \"summon\", x = %d, z = %d, by = 11 }", tx, tz)
+local function dist() return math.sqrt((sim.pos.x - tx) ^ 2 + (sim.pos.z - tz) ^ 2) end
+local UI3 = require("ui") -- the fresh UI module main will use: hook it for hit lookup
+local render3 = UI3.render
+UI3.render = function(self, m) UI3._last = self return render3(self, m) end
+local function tapAction(action)
+    for _, h in ipairs(UI3._last and UI3._last.hits or {}) do
+        if h.action == action then return touchCell(h.x + 5, h.y + 5) end
+    end
+    states.missing_hit = (states.missing_hit or "") .. action .. " "
+end
+mon.errors = {}
+timers, script, si = {}, {}, 1
+t0 = sim.t
+states.d0 = dist()
+at(t0 + 3, function() return tapAction("tab:ctrl") end)
+at(t0 + 5, function() return tapAction("ctl:estop") end)
+at(t0 + 7, function() return tapAction("ctl:power") end)
+at(t0 + 8, function() return tapAction("ctl:power") end) -- the "tap again" confirm
+at(t0 + 10, function() return tapAction("tab:auto") end)
+at(t0 + 12, function() return tapAction("ap:cancel") end)
+at(t0 + 60, function()
+    states.d60 = dist()
+    return { "terminate" }
+end)
+printed = {}
+_G.print = function(...) printed[#printed + 1] = table.concat({ ... }, " ") end
+local ok3, err3 = pcall(require("main").run, { runs = 3 })
+_G.print = real_print
+local refused = 0
+for _, l in ipairs(printed) do if l:find("LOCKED BY ARTCORP") then refused = refused + 1 end end
+print(string.format("summon lock: %.0f m -> %.0f m from the CEO, %d taps refused, missing hits: %s",
+    states.d0 or -1, states.d60 or -1, refused, tostring(states.missing_hit)))
+check("summon lock: ran", ok3, err3)
+check("summon lock: the pilot's taps were refused", refused >= 3, refused)
+check("summon lock: still flying to the CEO", (states.d60 or 1e9) < (states.d0 or 0) - 100,
+    string.format("%.0f -> %.0f", states.d0 or -1, states.d60 or -1))
+check("summon lock: lock still on disk", (files["v2/data/artcorp_lock.lua"] or ""):find("summon") ~= nil)
+
 _G.loadfile, _G.dofile, _G.fs = saved.loadfile, saved.dofile, saved.fs
 print(string.format("v2_main_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("v2_main_test FAILED", 0) end

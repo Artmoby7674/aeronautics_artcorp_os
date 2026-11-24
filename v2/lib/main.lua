@@ -113,6 +113,8 @@ end
 local function powerOff(why)
     local fl = app.fl
     if fl.ap then fl.ap:cancel("POWER OFF") fl.ap = nil end
+    -- a summon survives a power cut: the engines start again and it carries on
+    if app.lock and app.lock.mode == "summon" then app.pending_summon = { x = app.lock.x, z = app.lock.z } end
     HW.cutAll()
     HW.setClutch(false)
     HW.setStarter(false)
@@ -150,6 +152,7 @@ end
 local function offRequest()
     local fl = app.fl
     if app.power ~= "on" then return end
+    if app.lock and app.lock.mode == "summon" then return say("LOCKED BY ARTCORP", D.C.bad) end
     if fl.phase == "parked" or fl.phase == "estop" then return powerOff("button") end
     if app.off_armed and os.clock() - app.off_armed < 3 then
         app.off_armed = nil
@@ -185,11 +188,24 @@ local function saveHere(name)
     end
 end
 
+-- Pilot controls that would end, replace or land an ArtCorp summon.
+local SUMMON_BLOCKED = { ["ap:cancel"] = true, ["ctl:land"] = true, ["ctl:landoff"] = true,
+    ["ctl:estop"] = true, ["ctl:power"] = true, ["wp:fly"] = true }
+
 local function act(a)
     if not a then return end
     local fl, ui = app.fl, app.ui
     if a == "boot" then return beginBoot() end
     if app.power ~= "on" then return end
+    -- ArtCorp lock: a summoned ship can't be cancelled, landed, E-STOPped,
+    -- switched off or sent elsewhere by the pilot; a grounded ship's E-STOP
+    -- can't be cleared (only an ArtCorp remote RELEASE does that)
+    if app.lock and app.lock.mode == "summon" and SUMMON_BLOCKED[a] then
+        return say("LOCKED BY ARTCORP", D.C.bad)
+    end
+    if app.lock and app.lock.mode == "grounded" and a == "ctl:estop" and fl.phase == "estop" then
+        return say("LOCKED BY ARTCORP", D.C.bad)
+    end
     local tab = a:match("^tab:(.+)")
     if tab then return ui:setTab(tab) end
 
@@ -514,7 +530,7 @@ local function controlTick()
     if app.pending_summon then
         if app.power == "off" then
             beginBoot()
-        elseif app.power == "on" and app.fl.phase == "parked" and not app.fl.ap then
+        elseif app.power == "on" and app.fl.phase ~= "unflip" and not (app.fl.ap and app.fl.ap.locked) then
             app.fl:remoteSummon(app.pending_summon.x, app.pending_summon.z)
             app.pending_summon = nil
         end
@@ -556,6 +572,14 @@ local function controlTick()
     if app.fl.ap and app.fl.ap.done then
         app.last_ap = "LAST ROUTE: " .. app.fl.ap.done
         app.fl.ap = nil
+    end
+    -- ArtCorp watchdog: while summoned, if the summon autopilot is not
+    -- running (anything at all dropped it), start it again. Not during an
+    -- unflip -- righting the ship comes first, the summon resumes after.
+    if app.lock and app.lock.mode == "summon" and not app.pending_summon
+        and not (app.fl.ap and app.fl.ap.locked) and app.fl.phase ~= "unflip" then
+        U.log("artcorp: summon interrupted (phase %s): resuming", app.fl.phase)
+        app.pending_summon = { x = app.lock.x, z = app.lock.z }
     end
     if app.fl.msg then
         say(app.fl.msg.text)

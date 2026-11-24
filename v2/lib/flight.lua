@@ -354,7 +354,14 @@ function Flight:update(dt, keys)
 
     local cmd
     if self.phase == "estop" then
-        if edge(self, "SPACE") then self:setEstop(false) end
+        if edge(self, "SPACE") then
+            -- an ArtCorp E-STOP stays on until the remote releases the ship
+            if self.lock and self.lock.mode == "grounded" then
+                self:notify("LOCKED BY ARTCORP")
+            else
+                self:setEstop(false)
+            end
+        end
     elseif self.phase == "parked" then
         if self.ap then
             -- autopilot asked for takeoff

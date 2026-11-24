@@ -97,5 +97,19 @@ do
     check("estop: lift props cut", (o.FL or 0) == 0 and (o.FR or 0) == 0, o.FL)
 end
 
+-- ---------------------------------------------------------------- locked E-STOP
+do
+    local w = World.new():airborne(120, 0)
+    w.fl:setEstop(true)
+    w.fl.lock = { mode = "grounded", reason = "estop" }
+    w:tap("SPACE")
+    w:run(0.5)
+    check("ArtCorp E-STOP: SPACE can't clear it", w.fl.phase == "estop", w.fl.phase)
+    w.fl.lock = nil -- released by the remote
+    w:tap("SPACE")
+    w:run(0.5)
+    check("released: SPACE clears the E-STOP", w.fl.phase == "flying", w.fl.phase)
+end
+
 print(string.format("v2_remote_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("v2_remote_test FAILED", 0) end
