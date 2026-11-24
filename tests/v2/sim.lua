@@ -74,6 +74,9 @@ local DEFAULTS = {
     hull_pitch = 0,                -- deg/s^2 constant disturbances
     hull_roll = 0,
     hull_yaw = 0,
+    self_level = 0.1,              -- deg/s^2 per deg: natural righting (the real
+                                   -- hull is steady and resists roll)
+    self_level_roll = 0.15,
     fin = 0.4,                     -- deg/s^2 of turn toward sideways motion per m/s
                                    -- (the arrow-shaped tail fin weathervanes)
     ground = 64,
@@ -233,6 +236,15 @@ function Sim:step(dt)
         local w = self.w
         local I = p.inertia
         local dist = { math.rad(p.hull_roll), math.rad(-p.hull_yaw), math.rad(p.hull_pitch) }
+        -- natural self-levelling: the hull rights itself in pitch and roll
+        if p.self_level ~= 0 then
+            local _, ry0 = rot(self.q, 0, 0, 1)
+            local _, fy0 = rot(self.q, 1, 0, 0)
+            local kr = p.self_level_roll or p.self_level
+            -- roll + (right down) has right.y < 0: restoring = toward -roll
+            dist[1] = dist[1] + math.rad(kr) * math.deg(math.asin(math.max(-1, math.min(1, ry0))))
+            dist[3] = dist[3] - math.rad(p.self_level) * math.deg(math.asin(math.max(-1, math.min(1, fy0))))
+        end
         -- tail fin: sideways speed (body +z = right) turns the nose toward the
         -- motion; moving right turns right = negative body-y rotation
         local _, _, vz_body = irot(self.q, self.vel.x, self.vel.y, self.vel.z)

@@ -30,17 +30,18 @@ return {
     -- Pitch/roll stabiliser: prop speed DIFFERENCES, applied symmetrically
     -- (one side up, the other down) so a correction never costs lift.
     attitude = {
-        kp = 0.20,           -- prop units per degree
-        kd = 1.5,            -- prop units per deg/s (heavy damping: a big hull
-                             -- carries momentum, so brake the swing early)
-        ki = 0.03,           -- prop units per degree-second (hull trim)
+        kp = 0.12,           -- prop units per degree (gentle: the hull is
+                             -- naturally steady and rights itself)
+        kd = 0.8,            -- prop units per deg/s (damps the swing early)
+        ki = 0.03,           -- prop units per degree-second (hull trim: holds
+                             -- off the natural slight nose-down pitch)
         -- ROLL has its own gains: the hull is long and narrow, so it rolls
         -- much more easily than it pitches; pitch-level damping (kd 1.5) made
         -- the roll axis oscillate in the sim when it is 4-8x lighter.
-        roll = { kp = 0.20, kd = 0.6 },
+        roll = { kp = 0.10, kd = 0.4 },
         int_limit = 3,
         max_corr = 5,        -- prop units per axis
-        deadband = 0.3,      -- degrees (P term only)
+        deadband = 1.0,      -- degrees (P term only): leave a steady hull alone
         rate_tau = 0.08,     -- s smoothing on the measured rates
         reserve = 2,         -- prop units of lift the stabiliser may borrow
         slew = 8,            -- prop units per second a prop speed may change
