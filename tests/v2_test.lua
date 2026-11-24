@@ -269,5 +269,44 @@ do
     print(string.format("robustness: worst steady attitude %.2f deg", worst))
 end
 
+-- 13. Direction self-check at take-off. A correction that pushes the wrong
+--     way makes a self-righting hull swing wider every time (the reported
+--     roll); the take-off check must detect it and fix it, and must leave a
+--     correctly wired ship alone.
+do
+    local function flight(swap_lr, swap_fb)
+        local w = World.new({ sim = { inertia = { 150, 1600, 3000 }, prop_tau = 0.4,
+            self_level = 0.5, self_level_roll = 0.5 } })
+        if swap_lr or swap_fb then
+            local raw = w.sim.readOutputs
+            w.sim.readOutputs = function(self)
+                local o = raw(self)
+                if swap_lr then o.FL, o.FR, o.RL, o.RR = o.FR, o.FL, o.RR, o.RL end
+                if swap_fb then o.FL, o.RL, o.FR, o.RR = o.RL, o.FL, o.RR, o.FR end
+                return o
+            end
+        end
+        w:tap("SPACE")
+        w:run(40)
+        w.sim.w.x = math.rad(2) -- a roll kick after the check
+        local late = 0
+        w:run(60, function(w) if w.t > 70 then local _, p, r = w.sim:attitude(); late = math.max(late, math.abs(r), math.abs(p)) end end)
+        return w.fl.ctl, late
+    end
+    local c, late = flight(false, false)
+    print(string.format("dircheck correct: roll %+d pitch %+d known %s/%s late %.2f", c.roll_sign, c.pitch_sign, tostring(c.roll_known), tostring(c.pitch_known), late))
+    check("dircheck: correct wiring kept", c.roll_sign == 1 and c.pitch_sign == 1)
+    check("dircheck: both axes checked", (c.roll_known or 0) > 0 and (c.pitch_known or 0) > 0)
+    check("dircheck: steady after", late < 3, f(late))
+    c, late = flight(true, false)
+    print(string.format("dircheck L/R swapped: roll %+d pitch %+d late %.2f", c.roll_sign, c.pitch_sign, late))
+    check("dircheck: reversed roll detected", c.roll_sign == -1 and c.pitch_sign == 1)
+    check("dircheck: steady after fixing roll", late < 3, f(late))
+    c, late = flight(false, true)
+    print(string.format("dircheck F/B swapped: roll %+d pitch %+d late %.2f", c.roll_sign, c.pitch_sign, late))
+    check("dircheck: reversed pitch detected", c.pitch_sign == -1 and c.roll_sign == 1)
+    check("dircheck: steady after fixing pitch", late < 3, f(late))
+end
+
 print(string.format("v2_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("v2_test FAILED", 0) end

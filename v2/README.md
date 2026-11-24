@@ -89,6 +89,13 @@ that depend on how the real ship behaves:
   positioning: with long pulses, autopilot landings end within about 10 m
   of the waypoint.
 - `attitude.slew`: how fast a prop's speed may change (units/s).
+- **Direction check:** on the first take-off (and after RESET LEARNED
+  VALUES) the ship nudges itself a little in roll, then pitch, to measure
+  which way a correction really moves the hull, and fixes the direction if
+  the wiring is the other way round (a reversed correction makes a steady
+  hull swing wider and wider). The result is in the log and on the SHIP tab
+  (DIRECTIONS). Flight data, one line a second, goes to
+  `v2/data/flight.txt`.
 - `yaw.sign`: flip it if Q and E turn the wrong way.
 - `hover.tilt_sign`: flip it if W moves the ship backwards.
 - `attitude.kp / kd`: lower `kp` if the hull rocks; raise `kd` if it overshoots.

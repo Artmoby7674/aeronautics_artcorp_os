@@ -109,13 +109,12 @@ end
 -- rotated to log.old). The ship computer is out of reach in flight, so this
 -- is how a problem gets seen afterwards. Never raises.
 U.LOG_PATH = "v2/data/log.txt"
+U.FLIGHT_PATH = "v2/data/flight.txt"
 local LOG_MAX = 32 * 1024
-function U.log(fmt, ...)
-    local okf, msg = pcall(string.format, tostring(fmt), ...)
-    if not okf then msg = tostring(fmt) end
+
+local function append(p, max, msg)
     pcall(function()
-        local p = U.LOG_PATH
-        if fs.exists(p) and fs.getSize(p) > LOG_MAX then
+        if fs.exists(p) and fs.getSize(p) > max then
             pcall(fs.delete, p .. ".old")
             pcall(fs.move, p, p .. ".old")
         end
@@ -125,6 +124,17 @@ function U.log(fmt, ...)
         f.writeLine(string.format("[%s d%d %8.2f] %s", textutils.formatTime(os.time(), true), day, os.clock(), msg))
         f.close()
     end)
+end
+
+function U.log(fmt, ...)
+    local okf, msg = pcall(string.format, tostring(fmt), ...)
+    if not okf then msg = tostring(fmt) end
+    append(U.LOG_PATH, LOG_MAX, msg)
+end
+
+-- Flight data (one line a second while flying), its own rotating file.
+function U.flightLog(msg)
+    append(U.FLIGHT_PATH, 48 * 1024, msg)
 end
 
 return U

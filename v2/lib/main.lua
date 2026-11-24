@@ -46,7 +46,8 @@ end
 -- ------------------------------------------------------------ learned values
 
 local LEARN_PATH = ROOT .. "/data/learned.lua"
-local LEARN_KEYS = { "hover", "pi_", "ri", "yi", "rear_pk", "rear_yk", "yaw_brake" }
+local LEARN_KEYS = { "hover", "pi_", "ri", "yi", "rear_pk", "rear_yk", "yaw_brake",
+    "roll_sign", "pitch_sign", "roll_known", "pitch_known" }
 
 local function loadLearned(ctl)
     local t = U.loadTable(LEARN_PATH)
@@ -256,6 +257,7 @@ local function act(a)
         local c = fl.ctl
         c.hover = fl.t.ship.hover_throttle
         c.pi_, c.ri, c.yi, c.rear_pk, c.rear_yk, c.yaw_brake = 0, 0, 0, 0, 0, nil
+        c.roll_sign, c.pitch_sign, c.roll_known, c.pitch_known = 1, 1, 0, 0 -- re-checked at next take-off
         saveLearned(c)
         return say("LEARNED VALUES RESET")
     end
@@ -348,6 +350,25 @@ local function controlTick()
         app.fl.msg = nil
     end
     Rec.tick(os.clock(), app.fl.est.s)
+    -- flight data, once a second while not parked: what the stabiliser saw
+    -- and did (dp/dr = pitch/roll correction, prop units)
+    local fl = app.fl
+    if fl.phase ~= "parked" then
+        local now = os.clock()
+        if not app.fdr_t or now - app.fdr_t >= 1 then
+            app.fdr_t = now
+            local s, o, c = fl.est.s, fl.out, fl.ctl
+            U.flightLog(string.format(
+                "%s %s alt=%.1f vs=%.1f p=%.1f r=%.1f pr=%.1f rr=%.1f hdg=%.0f yr=%.1f u=%.1f w=%.1f "
+                .. "dp=%.2f dr=%.2f FL=%.1f FR=%.1f RL=%.1f RR=%.1f tilt=%d%d%d%d rear=%.0f%s sign=%d/%d%s",
+                fl.phase, fl.mode, s.alt or 0, s.vs or 0, s.pitch or 0, s.roll or 0, s.pitch_rate or 0,
+                s.roll_rate or 0, s.heading or 0, s.yaw_rate or 0, s.u or 0, s.w or 0,
+                fl.last_dp or 0, fl.last_dr or 0, o.FL or 0, o.FR or 0, o.RL or 0, o.RR or 0,
+                o.tilt and o.tilt.FL or 0, o.tilt and o.tilt.FR or 0, o.tilt and o.tilt.RL or 0,
+                o.tilt and o.tilt.RR or 0, o.rear or 0, o.rear_rev and "R" or "",
+                c.pitch_sign or 1, c.roll_sign or 1, fl.calib and (" cal:" .. tostring(fl.calib.stage)) or ""))
+        end
+    end
 end
 
 -- The cockpit screen: the configured monitor, unless another attached

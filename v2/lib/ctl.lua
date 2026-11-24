@@ -39,6 +39,11 @@ function Ctl:reset()
     self.yi = 0
     -- learned per-rear-level feedforwards (pitch units, yaw duty)
     self.rear_pk = self.rear_pk or 0
+    -- which way a correction actually moves the hull: +1 as designed, -1 if
+    -- the ship is wired/oriented the other way. Measured at take-off (see
+    -- Flight:calibStep) and kept with the learned values.
+    self.roll_sign = self.roll_sign or 1
+    self.pitch_sign = self.pitch_sign or 1
     self.rear_yk = self.rear_yk or 0
     self.rear_level = 0
     self.sd = { L = { frac = 0 }, R = { frac = 0 }, Y = { out = 0, t = 99 }, F = { out = 0, t = 99 } }
@@ -130,7 +135,8 @@ function Ctl:attitude(s, dt, pitch_sp, roll_sp)
     end
     dp = U.clamp(dp, -a.max_corr, a.max_corr) * scale
     dr = U.clamp(dr, -a.max_corr, a.max_corr) * scale
-    return dp, dr
+    self.att_scale = scale
+    return dp * self.pitch_sign, dr * self.roll_sign
 end
 
 -- ------------------------------------------------------------ yaw

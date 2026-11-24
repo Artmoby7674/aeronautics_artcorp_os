@@ -99,6 +99,10 @@ function Flight:takeoff()
     self.alt_target = self.est.s.alt + 6
     self.ctl:softReset()
     self:notify("TAKEOFF")
+    -- check which way pitch/roll corrections really move the hull, once
+    if not ((self.ctl.roll_known or 0) > 0 and (self.ctl.pitch_known or 0) > 0) then
+        self.calib = { stage = "wait", t = 0, alt0 = self.est.s.alt }
+    end
 end
 
 function Flight:setGear(down)
@@ -423,6 +427,8 @@ function Flight:run(cmd, dt)
         roll_sp = ctl:lateral(s, cmd.w_sp, cmd.fine)
     end
     local dp, dr = ctl:attitude(s, dt, cmd.pitch or 0, roll_sp)
+    if self.calib and self.phase == "flying" then dp, dr = self:calibStep(s, dt, dp, dr) end
+    self.last_dp, self.last_dr = dp, dr
     if cmd.reverse then
         -- righting: a hard, simple PD push on whichever way is shorter
         local a, drive = t.attitude, t.unflip.drive
@@ -472,6 +478,80 @@ function Flight:run(cmd, dt)
     self.cmd = cmd
     self.rate_sp, self.roll_sp = rate_sp, roll_sp
     self:write(out)
+end
+
+-- Direction check, run once after a take-off (until both axes are known).
+-- A correction that pushes the wrong way turns the stabiliser into an
+-- amplifier: on a self-righting hull that shows as roll swings that grow
+-- every time. So the ship nudges itself: +D for 1 s, then -D for 1 s, on
+-- roll then pitch, and compares how the turn rate changed. The ship being
+-- steady, a 1-2 deg nudge is all it takes.
+-- Nudges get longer and firmer while the answer stays unclear (a heavy
+-- pitch axis barely reacts to a short one): {prop units, seconds}.
+local CAL_STEPS = { { 2.0, 1.0 }, { 3.0, 2.0 }, { 4.0, 3.0 } }
+local CAL_MIN = 0.3 -- deg/s of rate difference that counts as an answer
+
+function Flight:calibStep(s, dt, dp, dr)
+    local c, ctl = self.calib, self.ctl
+    c.t = c.t + dt
+    local function rate(axis) return axis == "roll" and s.roll_rate or s.pitch_rate end
+    local function nextAxis()
+        if (ctl.roll_known or 0) == 0 and not c.done_roll then return "roll" end
+        if (ctl.pitch_known or 0) == 0 and not c.done_pitch then return "pitch" end
+    end
+    if c.stage == "wait" or c.stage == "settle" then
+        local steady = math.abs(s.vs) < 1.5 and math.abs(s.roll) < 5 and math.abs(s.pitch) < 5
+            and s.alt > c.alt0 + 3
+        if c.t > (c.stage == "wait" and 3 or 3) and steady then
+            local ax = nextAxis()
+            if not ax then self.calib = nil return dp, dr end
+            if ax ~= c.axis then c.axis, c.try = ax, 1 end
+            c.stage, c.t, c.r0 = "plus", 0, rate(c.axis)
+        elseif c.t > 25 then
+            U.log("direction check: ship never steady enough, skipped")
+            self.calib = nil
+        end
+        return dp, dr
+    end
+    local step = CAL_STEPS[c.try or 1]
+    local D = step[1] * (ctl.att_scale or 1)
+    local push = (c.stage == "plus") and D or -D
+    if c.t >= step[2] then
+        if c.stage == "plus" then
+            c.d1 = rate(c.axis) - c.r0
+            c.stage, c.t, c.r0 = "minus", 0, rate(c.axis)
+        else
+            local effect = c.d1 - (rate(c.axis) - c.r0) -- deg/s, + = as designed
+            local key = c.axis .. "_sign"
+            local msg
+            if math.abs(effect) < CAL_MIN then
+                msg = string.format("%s direction check: unclear (%.2f deg/s) at nudge %d", c.axis, effect, c.try or 1)
+                if (c.try or 1) < #CAL_STEPS then
+                    c.try = (c.try or 1) + 1
+                    U.log(msg .. ", trying a firmer one")
+                    c.stage, c.t = "settle", 0
+                    return dp, dr
+                end
+                msg = msg .. ", giving up until next take-off"
+            else
+                local sign = effect > 0 and 1 or -1
+                local flipped = sign ~= ctl[key]
+                ctl[key] = sign
+                ctl[c.axis .. "_known"] = 1
+                if flipped then
+                    if c.axis == "roll" then ctl.ri = 0 else ctl.pi_ = 0 end
+                end
+                msg = string.format("%s direction check: %s (%.2f deg/s)", c.axis,
+                    sign == 1 and "as designed" or "REVERSED, corrected", effect)
+                self:notify((c.axis .. (sign == 1 and " direction OK" or " direction reversed: fixed")):upper())
+            end
+            U.log(msg)
+            c["done_" .. c.axis] = true
+            c.stage, c.t = "settle", 0
+        end
+    end
+    if c.axis == "roll" then return dp, push end
+    return push, dr
 end
 
 -- Fore/aft speed hold with the REAR thruster (forward thrust, or reverse
