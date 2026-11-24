@@ -67,13 +67,18 @@ return {
         min_off = 1.5,       -- s a side stays level before tilting again
     },
 
-    -- Fore/aft and sideways in HOVER.
+    -- HOVER, hands off: stay level, and the REAR thruster cancels fore/aft
+    -- drift. No position or heading hold: the ship cannot strafe.
     hover = {
-        brake = true,        -- hands off = hold position (tilt + bank damping)
-        fwd_gain = 0.3,      -- tilt duty per m/s of fore/aft speed error
+        brake = true,        -- rear-thruster braking when hands off (AUTO BRAKE)
+        rear_on = 0.5,       -- m/s of fore/aft drift that starts the braking
+        rear_off = 0.15,     -- m/s under which it stops
+        rear_gain = 3,       -- rear levels per m/s of drift
+        rear_max = 10,       -- rear level cap while braking
+        fwd_gain = 0.3,      -- tilt demand per m/s (autopilot hover travel)
         fwd_dead = 0.25,     -- m/s
-        lat_gain = 0.12,     -- degrees of bank per m/s of sideways drift
-        lat_max = 2,         -- degrees (small: banking a big hull is a big move)
+        lat_gain = 0.12,     -- (unused by default: no sideways correction)
+        lat_max = 2,
         tilt_sign = 1,       -- flip if W moves the ship backwards
     },
 
@@ -98,18 +103,20 @@ return {
     autopilot = {
         cruise_alt = 230,    -- preferred travel altitude (capped by lift)
         lift_margin = 3.5,   -- prop units kept free at cruise altitude
-        hop_range = 400,     -- m: closer than this = hover travel only
-        hop_climb = 20,      -- m above start altitude for hover hops
-        approach_r = 90,     -- m: cruise hands over to hover approach
+        hop_range = 400,     -- m: closer than this = slow, low hop
+        hop_climb = 20,      -- m above start altitude for hops
         cruise_speed = 40,   -- m/s cap
-        cruise_brake = 1.2,  -- m/s^2 assumed when planning the slow-down
-        hover_speed = 12,    -- m/s cap for hover travel/approach
-        hover_brake = 1.5,   -- m/s^2 assumed for tilt braking
+        hop_speed = 8,       -- m/s cap for hops
+        creep_speed = 3,     -- m/s cap when creeping back after a miss
+        cruise_brake = 1.0,  -- m/s^2 assumed when planning the stop (rear reverse)
+        stop_margin = 2,     -- m: plan to stop this short of the point
+        face_r = 40,         -- m: closer than this, no more steering (straight in)
+        retry_r = 10,        -- m: stopped further than this = re-aim and creep
+        retries = 2,
         speed_gain = 0.8,    -- rear levels per m/s of speed error
         speed_int = 0.15,
         turn_limit = 45,     -- deg off course in cruise: stop and turn
-        arrive_r = 4,        -- m (landing then holds the exact spot)
-        arrive_speed = 1.0,  -- m/s
+        arrive_r = 4,        -- m
         heading_tol = 4,     -- deg
         shutdown_on_land = true,
         phase_timeout = 240, -- s per phase

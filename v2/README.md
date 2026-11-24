@@ -29,8 +29,8 @@ v2 keeps its own state in `v2/data/`:
 
 | Input | Hover | Cruise |
 | --- | --- | --- |
-| W / S | Tilt forward / back while held. Letting go brakes to a stop (position hold). | Rear thrust level +1 / −1, repeating while held. |
-| Q / E | Turn left / right. Letting go holds the heading it coasts to. | Steer the heading (banked turn). |
+| W / S | Tilt forward / back while held. Let go: the rear thruster cancels fore/aft drift (AUTO BRAKE). | Rear thrust level +1 / −1, repeating while held. |
+| Q / E | Turn left / right. Let go: the rotation is braked to a stop, then the tilts are left alone. | Steer the heading (banked turn). |
 | SPACE / CTRL | Tap: altitude goal +5 / −5 m. Hold: climb / descend smoothly. | Same. |
 | SHIFT | Switch HOVER ↔ CRUISE. | Same. |
 | SPACE while parked | Take off (to 6 m). | – |
@@ -51,12 +51,12 @@ Any stick or altitude input during an autopilot run cancels the run
   **FLY >**, **DELETE** (tap twice), **SAVE HERE** (asks for a name on the
   keyboard if it's online, otherwise numbers it), **NEW (KBD)** (X, Z,
   heading, name).
-- **AUTO**: route progress (DEPART → CRUISE → APPROACH → LAND), distance,
+- **AUTO**: route progress (DEPART → CRUISE → STOP + ALIGN → LAND), distance,
   ETA, speed against target, altitude against goal, course error, cancel.
 - **SHIP**: hardware state, loop timing, disk, and everything learned in
   flight, with a reset button.
 - **ALERT**: only what is active right now.
-- **CTRL**: AUTO-LAND, GEAR, MODE, E-STOP, POSITION HOLD, RECORD, PRINT LOG,
+- **CTRL**: TAKE OFF / AUTO-LAND, GEAR, MODE, E-STOP, AUTO BRAKE, RECORD, PRINT LOG,
   LAND + OFF, POWER OFF. In the air, POWER OFF needs a second tap.
 
 ## How it flies (and what is different from the original)
@@ -70,9 +70,9 @@ Any stick or altitude input during an autopilot run cancels the run
 | Rotation rates | Angular velocity read on assumed body axes. | Derived from the attitude itself, so they're right whichever frame Sable reports in. |
 | Steady disturbances | Some trims. | Learned: pitch, roll and yaw trims, hover throttle, and feedforwards that scale with rear power (rear pitch and rear yaw). The last one cancels a "keeps turning right in cruise" torque in proportion to thrust. |
 | Rear thruster vs pitch | Rear pitch torque could pin the props: lift and pitch both run out (the step 2→3 drop). | A rear cap backs the thrust off whenever the stabiliser saturates. |
-| Autopilot | Climb first, then turn, at a ceiling learned where props reach 13/15. | Turn first at the current (low) altitude, then climb to a travel altitude that leaves 3.5 units spare (about y230 for this ship). The speed profile plans its own stop. |
-| Landing | Walking target down to the ground. | Sink-rate profile on the gear sensor, position hold over the touchdown point, aligned to the waypoint heading while descending. |
-| Hover hands-off | Coasts. | Brakes to a stop and damps sideways drift by banking (POSITION HOLD can be turned off). |
+| Autopilot | Climb first, then turn, at a ceiling learned where props reach 13/15. | Straight lines and turns made while stopped: turn at the current (low) altitude, climb, fly straight on the rear thruster with a speed profile that plans its stop (no steering in the last 40 m), brake to rest, re-aim and creep back if more than 10 m off, turn in place onto the saved heading, descend. Lands within roughly 5–15 m of the waypoint. |
+| Landing | Walking target down to the ground. | Sink-rate profile on the gear sensor; level, rear thruster cancels fore/aft drift; no position or heading hold. |
+| Hover hands-off | Coasts. | Stays level; the rear thruster cancels fore/aft drift. No position or heading hold: the ship cannot strafe, and rolling to slide makes the tail fin turn it (a correction loop). |
 | OFF in the air | Ship falls. | Lands, then powers off. A second press forces it. |
 | Screen | Tabbed, 16 stock colours. | Tabbed, its own 16-colour palette (falls back to stock if the monitor refuses), attitude indicator, map. |
 
@@ -94,7 +94,9 @@ that depend on how the real ship behaves:
 - `attitude.kp / kd`: lower `kp` if the hull rocks; raise `kd` if it overshoots.
 - `physics.tilt_lag`: how long the tilt mechanism takes to swing.
 - `autopilot.cruise_alt`, `lift_margin`: travel altitude and spare lift.
-- `autopilot.hop_range`: below this distance the trip is hover-only.
+- `hover.rear_on / rear_off / rear_gain / rear_max`: when and how hard the rear thruster cancels fore/aft drift.
+- `autopilot.hop_range / hop_speed`: trips shorter than this fly at the slow hop speed.
+- `autopilot.face_r / retry_r`: no steering inside this distance; stopping further than `retry_r` from the waypoint re-aims and creeps back.
 
 ## Tested in simulation only
 

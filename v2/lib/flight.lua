@@ -191,36 +191,16 @@ function Flight:pilot(dt)
     local fwd = (pressed(self, "W") and 1 or 0) - (pressed(self, "S") and 1 or 0)
 
     if self.mode == "hover" then
-        if yaw ~= 0 then
-            cmd.yaw_rate = yaw * t.yaw.manual_rate
-            self.turning = true
-        else
-            if self.turning then
-                -- predict where the turn coasts to and hold that heading
-                local r = s.yaw_rate
-                self.heading_target = s.heading + U.sign(r) * r * r / (2 * t.yaw.brake_accel)
-                self.turning = false
-            end
-            cmd.heading = self.heading_target
-        end
+        -- Hands off = stay level and stop moving fore/aft, nothing more. The
+        -- ship cannot strafe (rolling to slide makes the tail fin turn it,
+        -- which then needs correcting: a loop), so there is no position or
+        -- heading hold. Q/E turn with the tilts; let go and the rotation is
+        -- braked to a stop, then the tilts are left alone.
+        if yaw ~= 0 then cmd.yaw_rate = yaw * t.yaw.manual_rate end
         if fwd ~= 0 then
-            cmd.fwd = fwd
-            self.hold_pt = nil
+            cmd.fwd = fwd               -- W/S: tilt to travel (pilot)
         elseif t.hover.brake then
-            -- hold the point where the stick was let go (speed-only damping
-            -- lets a frictionless hull creep forever under the pulse
-            -- threshold); gentle gains: tilt pulses, then coast back
-            -- brake to a stop first, then hold the point where it stopped
-            if not self.hold_pt and s.hspeed < 0.5 then self.hold_pt = { s.x, s.z } end
-            if self.hold_pt then
-                local dx, dz = self.hold_pt[1] - s.x, self.hold_pt[2] - s.z
-                local df = dx * s.fwd_x + dz * s.fwd_z
-                local dl = dx * -s.fwd_z + dz * s.fwd_x
-                cmd.u_sp = U.clamp(0.1 * df, -1.5, 1.5)
-                cmd.w_sp = U.clamp(0.1 * dl, -1.5, 1.5)
-            else
-                cmd.u_sp, cmd.w_sp = 0, 0
-            end
+            cmd.damp_u = 0              -- rear thruster cancels fore/aft drift
         end
     else -- cruise
         if yaw ~= 0 then
@@ -250,7 +230,11 @@ end
 
 function Flight:landingCmd(dt)
     local s, l, lt = self.est.s, self.land, self.t.landing
-    local cmd = { heading = l.heading }
+    -- No position or heading hold on the way down (the ship cannot strafe):
+    -- stay level, the rear thruster cancels fore/aft drift, a rotation is
+    -- braked to a stop. The autopilot turns onto the waypoint heading BEFORE
+    -- starting the descent.
+    local cmd = { damp_u = 0, tight = true }
 
     -- wait for the gear to settle (its sensor jumps while it swings down)
     if self.gear_settle > 0 then
@@ -260,14 +244,6 @@ function Flight:landingCmd(dt)
         l.rate = math.min(want, l.rate + lt.sink_accel * dt)
         cmd.vs = -l.rate
     end
-
-    -- hold the touchdown point: speed setpoints toward it, body frame
-    local dx, dz = l.x - s.x, l.z - s.z
-    local df = dx * s.fwd_x + dz * s.fwd_z
-    local dl = dx * -s.fwd_z + dz * s.fwd_x
-    cmd.u_sp = U.clamp(0.4 * df, -3, 3)
-    cmd.w_sp = U.clamp(0.4 * dl, -3, 3)
-    cmd.fine = true -- firmer speed/drift correction for the last metres
 
     -- touchdown: the sensor says ground, or the ship stopped moving while it
     -- was being asked to sink (resting on something the sensor can't see)
@@ -417,13 +393,23 @@ function Flight:run(cmd, dt)
     local lift = ctl:lift(s, dt, vs_sp)
 
     ctl.rear_level = self.rear
+    -- Heading: a commanded turn rate (Q/E), a heading to hold (autopilot),
+    -- or neither: then a rotation is only braked to a stop (hysteresis
+    -- 1.5 / 0.5 deg/s) and the tilts are otherwise left alone.
     local rate_sp = cmd.yaw_rate
     local herr = 0
-    if not rate_sp then
-        herr = U.wrap180((cmd.heading or s.heading) - s.heading)
+    if not rate_sp and cmd.heading then
+        herr = U.wrap180(cmd.heading - s.heading)
         rate_sp = ctl:yawRateFor(herr)
     end
-    local yaw = ctl:yaw(s, dt, rate_sp)
+    if rate_sp then
+        self.yaw_brk = false
+    else
+        local r = math.abs(s.yaw_rate or 0)
+        if r > 1.5 then self.yaw_brk = true elseif r < 0.5 then self.yaw_brk = false end
+        if self.yaw_brk then rate_sp = 0 end
+    end
+    local yaw = rate_sp and ctl:yaw(s, dt, rate_sp) or 0
 
     local fwd = 0
     if self.mode == "hover" then
@@ -465,20 +451,49 @@ function Flight:run(cmd, dt)
     else
         self.rear_cap = math.min(15, (self.rear_cap or 15) + 0.5 * dt)
     end
-    local want = (self.mode == "cruise") and (cmd.rear or self.rear_target) or 0
+    local want, rev = 0, false
+    if cmd.damp_u ~= nil then
+        want, rev = self:rearBrake(s, cmd.damp_u, cmd.tight)
+    elseif self.mode == "cruise" then
+        want = cmd.rear or self.rear_target
+        rev = (cmd.rear_rev and self:feature("rear_reverse")) or false
+    end
     want = math.min(want, self.rear_cap)
+    if rev ~= (self.rear_rev or false) then self.rear = 0 end -- respool in the new direction
+    self.rear_rev = rev
     if want > self.rear then
         self.rear = math.min(want, self.rear + t.cruise.ramp * dt)
     else
         self.rear = want
     end
     out.rear = self.rear
-    out.rear_rev = cmd.rear_rev and self:feature("rear_reverse") or false
-    if cmd.rear_rev and self:feature("rear_reverse") then out.rear = cmd.rear or 0 end
+    out.rear_rev = rev
     out.reverse = cmd.reverse
     self.cmd = cmd
     self.rate_sp, self.roll_sp = rate_sp, roll_sp
     self:write(out)
+end
+
+-- Fore/aft speed hold with the REAR thruster (forward thrust, or reverse
+-- to push back). Hysteresis: starts when the speed error passes `rear_on`,
+-- stops under `rear_off`, so it is not toggling all the time.
+function Flight:rearBrake(s, u_sp, tight)
+    local h = self.t.hover
+    local e = u_sp - (s.u or 0)
+    local a = math.abs(e)
+    -- tight: turning in place / descending onto a spot, where a slow creep
+    -- adds up; the rear only nudges, so a lower threshold stays smooth
+    local on, off = h.rear_on, h.rear_off
+    if tight then on, off = on * 0.5, off * 0.5 end
+    if self.rb_on then
+        if a < off then self.rb_on = false end
+    elseif a > on then
+        self.rb_on = true
+    end
+    if not self.rb_on then return 0, false end
+    local rev = e < 0 -- moving forward faster than wanted: push back
+    if rev and not self:feature("rear_reverse") then return 0, false end
+    return U.clamp(h.rear_gain * a, 1, h.rear_max), rev
 end
 
 -- Push outputs to the hardware. nil = parked/estop/no telemetry.
@@ -500,7 +515,6 @@ function Flight:write(out)
     self.out = out
 end
 
--- Fresh start after boot: decide parked vs flying from the sensor.
 -- Fresh start after power-on. `where` is decided by the caller:
 --   "ground" (engines started from the start screen): parked, gear down, props
 --            idle; the pilot takes off (SPACE / TAKE OFF / autopilot).

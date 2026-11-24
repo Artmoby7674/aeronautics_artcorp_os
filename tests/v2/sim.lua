@@ -73,6 +73,8 @@ local DEFAULTS = {
     hull_pitch = 0,                -- deg/s^2 constant disturbances
     hull_roll = 0,
     hull_yaw = 0,
+    fin = 0.4,                     -- deg/s^2 of turn toward sideways motion per m/s
+                                   -- (the arrow-shaped tail fin weathervanes)
     ground = 64,
     delay_ticks = 1,
     arm = 3,
@@ -230,6 +232,10 @@ function Sim:step(dt)
         local w = self.w
         local I = p.inertia
         local dist = { math.rad(p.hull_roll), math.rad(-p.hull_yaw), math.rad(p.hull_pitch) }
+        -- tail fin: sideways speed (body +z = right) turns the nose toward the
+        -- motion; moving right turns right = negative body-y rotation
+        local _, _, vz_body = irot(self.q, self.vel.x, self.vel.y, self.vel.z)
+        dist[2] = dist[2] - math.rad(p.fin) * vz_body
         w.x = w.x + (Tq[1] / I[1] + dist[1] - p.ang_damp * w.x) * h
         w.y = w.y + (Tq[2] / I[2] + dist[2] - p.ang_damp * w.y) * h
         w.z = w.z + (Tq[3] / I[3] + dist[3] - p.ang_damp * w.z) * h

@@ -1,22 +1,26 @@
--- v2 waypoint autopilot.
+-- v2 waypoint autopilot. The ship can only push itself forward and back
+-- (rear thruster) and turn (tilt); it cannot strafe. So the whole trip is
+-- built from straight lines and turns made while stopped:
 --
---   depart    turn toward the waypoint at the CURRENT altitude first (plenty
---             of spare lift low down), then climb to the travel altitude
---   cruise    rear thruster on a speed profile that plans its own slow-down,
---             heading held by tilt + bank (+ the learned yaw trim)
---   turn      cruise drifted > turn_limit off course: stop the rear, turn in
---             hover, resume
---   approach  hover travel onto the point (also the whole leg for short hops)
---   land      flight.lua's landing sequence, on the waypoint's heading
+--   depart  turn toward the waypoint at the current (low) altitude, then
+--           climb to the travel altitude; the rear thruster keeps it still
+--   cruise  rear thruster on a speed profile that plans its own stop (rear
+--           reverse brakes); heading held toward the waypoint while far out,
+--           then left alone for the last `face_r` metres (no sideways fixes)
+--   turn    drifted > turn_limit off course: stop, turn in place, resume
+--   stop    rear thruster brings it to rest; if it ended far from the
+--           waypoint it re-aims and creeps back (a couple of times at most)
+--   align   turn in place onto the waypoint's saved heading
+--   land    descend where it is: level, rear cancels fore/aft drift
 --
--- The travel altitude is chosen so the props keep `lift_margin` units spare:
--- turning and stabilising up there never runs out of lift.
+-- The travel altitude keeps `lift_margin` prop units spare, so turning and
+-- stabilising up there never runs out of lift.
 local U = require("util")
 
 local AP = {}
 AP.__index = AP
 
-AP.PHASES = { "depart", "cruise", "approach", "land" }
+AP.PHASES = { "depart", "cruise", "stop", "land" }
 
 function AP.new(fl, wp)
     local s = fl.est.s
@@ -31,6 +35,7 @@ function AP.new(fl, wp)
     self.hop = dist < fl.t.autopilot.hop_range
     self.start_alt = s.alt
     self.level_i = 0
+    self.retries = 0
     self.dist = dist
     self:planAltitude(fl)
     return self
@@ -100,9 +105,11 @@ function AP:update(fl, s, dt)
     self.herr = herr
     self.eta = dist / math.max(s.hspeed, 1)
 
+    local df = dx * s.fwd_x + dz * s.fwd_z -- waypoint distance along the nose
+
     if self.phase == "depart" then
         fl:setMode("hover")
-        local cmd = { heading = brg, u_sp = 0, w_sp = 0 }
+        local cmd = { heading = brg, damp_u = 0 }
         -- turn first, low; climb once roughly on the bearing
         if math.abs(herr) > 30 then
             if not self.turn_alt then self.turn_alt = s.alt end
@@ -111,77 +118,83 @@ function AP:update(fl, s, dt)
             cmd.alt = self.goal_alt
         end
         if math.abs(herr) < a.heading_tol and math.abs(s.alt - self.goal_alt) < 4
-            and math.abs(s.vs) < 1.2 then
-            self:setPhase((self.hop or dist < a.approach_r) and "approach" or "cruise")
+            and math.abs(s.vs) < 1.2 and math.abs(s.yaw_rate) < 2 then
+            self:setPhase("cruise")
         end
         return cmd
     end
 
     if self.phase == "cruise" then
-        if dist < a.approach_r then
-            fl:setMode("hover")
-            self:setPhase("approach")
-            return { alt = self.goal_alt, heading = brg, u_sp = 0 }
-        end
-        if math.abs(herr) > a.turn_limit then
+        if dist > a.face_r and math.abs(herr) > a.turn_limit then
             fl:setMode("hover")
             self:setPhase("turn")
-            return { alt = self.goal_alt, heading = brg, u_sp = 0 }
+            return { alt = self.goal_alt, heading = brg, damp_u = 0 }
         end
         fl:setMode("cruise")
-        local room = dist - a.approach_r * 0.6
-        local v_sp = math.min(a.cruise_speed, U.brakeSpeed(room, a.cruise_brake))
-        -- slow down while badly off course so the turn is tighter
-        if math.abs(herr) > 15 then v_sp = math.min(v_sp, 10) end
+        local cap = (self.retries > 0) and a.creep_speed or (self.hop and a.hop_speed or a.cruise_speed)
+        local room = math.max(df, 0) - a.stop_margin
+        local v_sp = math.min(cap, U.brakeSpeed(room, a.cruise_brake))
+        if math.abs(herr) > 15 and dist > a.face_r then v_sp = math.min(v_sp, 10) end
         self.v_sp = v_sp
+        local cmd = { alt = self.goal_alt }
+        if dist > a.face_r then
+            cmd.heading, cmd.bank = brg, true
+        end -- close in: no steering at all, just the straight line
         local e = v_sp - s.u
-        local cmd = { alt = self.goal_alt, heading = brg, bank = true }
-        if e < -3 and fl:feature("rear_reverse") then
+        if e < -1 and fl:feature("rear_reverse") then
             cmd.rear_rev = true
-            cmd.rear = U.clamp((-e) * 1.5, 1, 10)
+            cmd.rear = U.clamp((-e) * 2, 1, 10)
             self.level_i = 0
         else
             self.level_i = U.clamp(self.level_i + a.speed_int * e * dt, 0, 15)
             cmd.rear = U.clamp(self.level_i + a.speed_gain * e, 0, 15)
+        end
+        -- at (or past) the point, or planned to a standstill: stop
+        if (dist < a.face_r and (v_sp < 0.5 or df < 0)) or dist < a.arrive_r then
+            fl:setMode("hover")
+            self:setPhase("stop")
+            self.still = 0
         end
         return cmd
     end
 
     if self.phase == "turn" then
         fl:setMode("hover")
-        if math.abs(herr) < a.heading_tol and math.abs(s.yaw_rate) < 3 then
+        if math.abs(herr) < a.heading_tol and math.abs(s.yaw_rate) < 2 then
             self:setPhase("cruise")
         end
-        return { alt = self.goal_alt, heading = brg, u_sp = 0, w_sp = 0 }
+        return { alt = self.goal_alt, heading = brg, damp_u = 0 }
     end
 
-    if self.phase == "approach" then
-        -- A heavy hull overshoots any heading change, so: far out, turn in
-        -- place first and only then travel straight in; close in (with
-        -- hysteresis) stop turning and creep onto the point. The landing
-        -- that follows holds the exact spot and turns onto the waypoint
-        -- heading on the way down.
+    if self.phase == "stop" then
         fl:setMode("hover")
-        if dist > 8 then self.facing = true elseif dist < 5 then self.facing = false end
-        if self.facing then self.hold_hdg = nil else self.hold_hdg = self.hold_hdg or s.heading end
-        local heading = self.facing and brg or self.hold_hdg
-        local df = dx * s.fwd_x + dz * s.fwd_z
-        local dl = dx * -s.fwd_z + dz * s.fwd_x
-        local u_mag = math.min(a.hover_speed, U.brakeSpeed(math.abs(df), a.hover_brake),
-            0.4 * math.abs(df))
-        if self.facing and math.abs(herr) > 15 then u_mag = 0 end -- turn first
-        self.v_sp = u_mag
-        local cmd = {
-            alt = self.goal_alt, heading = heading,
-            u_sp = U.sign(df) * u_mag,
-            w_sp = U.clamp(0.3 * dl, -2, 2),
-        }
-        if dist < a.arrive_r and s.hspeed < a.arrive_speed then
-            fl:beginLanding({ x = wp.x, z = wp.z, heading = wp.heading,
-                shutdown = a.shutdown_on_land, from_ap = true })
+        self.v_sp = 0
+        if math.abs(s.u) < 0.3 and math.abs(s.yaw_rate) < 1 then
+            self.still = (self.still or 0) + dt
+        else
+            self.still = 0
+        end
+        if self.still > 2 or self.pt > 60 then
+            if dist > a.retry_r and self.retries < a.retries then
+                self.retries = self.retries + 1
+                self.turn_alt = nil
+                self:setPhase("depart") -- re-aim at the point, creep back
+            else
+                self:setPhase("align")
+            end
+        end
+        return { alt = self.goal_alt, damp_u = 0, tight = true }
+    end
+
+    if self.phase == "align" then
+        fl:setMode("hover")
+        local herr2 = U.wrap180((wp.heading or s.heading) - s.heading)
+        self.herr = herr2
+        if (math.abs(herr2) < a.heading_tol and math.abs(s.yaw_rate) < 1) or self.pt > 60 then
+            fl:beginLanding({ shutdown = a.shutdown_on_land, from_ap = true })
             self:setPhase("land")
         end
-        return cmd
+        return { alt = self.goal_alt, heading = wp.heading, damp_u = 0, tight = true }
     end
 
     return nil

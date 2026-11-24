@@ -237,7 +237,7 @@ local function act(a)
     end
     if a == "ctl:hold" then
         fl.t.hover.brake = not fl.t.hover.brake
-        return say("POSITION HOLD " .. (fl.t.hover.brake and "ON" or "OFF"))
+        return say("AUTO BRAKE " .. (fl.t.hover.brake and "ON" or "OFF"))
     end
     if a == "ctl:rec" then return say(Rec.toggle(os.clock()) and "RECORDING" or "RECORDING STOPPED") end
     if a == "ctl:print" then

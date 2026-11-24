@@ -496,7 +496,8 @@ end
 
 -- -------------------------------------------------------------- AUTO
 
-local STEPS = { { "depart", "DEPART" }, { "cruise", "CRUISE" }, { "approach", "APPROACH" }, { "land", "LAND" } }
+local STEPS = { { "depart", "DEPART" }, { "cruise", "CRUISE" }, { "stop", "STOP + ALIGN" }, { "land", "LAND" } }
+local STEP_OF = { turn = "cruise", align = "stop" }
 
 function UI:auto(m, static)
     local W = D.W
@@ -528,7 +529,7 @@ function UI:auto(m, static)
     self:part("apname", ap.name .. (ap.hop and "h" or ""), function()
         D.slot(6, y0 + 10, W - 12, ap.name .. (ap.hop and "  (HOVER HOP)" or ""), C.white, C.bg, 2)
     end)
-    local cur = ap.phase == "turn" and "cruise" or ap.phase
+    local cur = STEP_OF[ap.phase] or ap.phase
     self:part("steps", cur, function()
         local sw = math.floor((W - 12 - 3 * 4) / 4)
         local done = true
@@ -655,7 +656,7 @@ function UI:ctrl(m, static)
         { "ctl:gear", "GEAR " .. (fl.gear_down and "DOWN" or "UP"), "TAP TO " .. (fl.gear_down and "RAISE" or "LOWER"), fl:feature("gear") and "normal" or "off" },
         { "ctl:mode", fl.mode:upper(), "SHIFT TOGGLES", (fl.phase == "flying" and not fl.ap and fl:feature("cruise_mode")) and "normal" or "off" },
         { "ctl:estop", fl.phase == "estop" and "RESET E-STOP" or "E-STOP", fl.phase == "estop" and "OR PRESS SPACE" or "CUTS ALL LIFT", fl.phase == "estop" and "warn" or "danger" },
-        { "ctl:hold", "POSITION HOLD", fl.t.hover.brake and "ON" or "OFF", fl.t.hover.brake and "active" or "normal" },
+        { "ctl:hold", "AUTO BRAKE", fl.t.hover.brake and "ON: REAR STOPS DRIFT" or "OFF: COAST", fl.t.hover.brake and "active" or "normal" },
         { "ctl:rec", m.rec and ("REC " .. fmtTime(m.rec_t)) or "RECORD", m.rec and "TAP TO STOP" or "LOG THE FLIGHT", m.rec and "warn" or "normal" },
         { "ctl:print", "PRINT LOG", m.rec_n and (m.rec_n .. " SAMPLES") or "NEEDS A RECORDING", (m.rec_n or 0) > 1 and "normal" or "off" },
         { "ctl:landoff", "LAND + OFF", "THEN SHUT DOWN", (fl.phase == "flying" or landing) and "normal" or "off" },

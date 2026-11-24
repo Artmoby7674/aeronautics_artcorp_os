@@ -239,7 +239,7 @@ check("engine start: no prop tilt on the ground", states.boot_tilt == false, tos
 check("takeoff: climbed after SPACE", (states.alt20 or 0) > 68, states.alt20)
 check("waypoints: imported from the old OS", files["v2/data/waypoints.lua"] and files["v2/data/waypoints.lua"]:find("REACTOR") ~= nil)
 local miss = math.sqrt((sim.pos.x - 40) ^ 2 + (sim.pos.z + 30) ^ 2)
-check("autopilot hop: landed at the waypoint (< 10 m)", sim.pos.y < 64.5 and miss < 10, string.format("y=%.1f miss=%.1f", sim.pos.y, miss))
+check("autopilot hop: landed at the waypoint (< 15 m)", sim.pos.y < 64.5 and miss < 15, string.format("y=%.1f miss=%.1f", sim.pos.y, miss))
 local r = sim:relay(cfg.peripherals[cfg.engine.relay_key])
 check("autopilot hop: powered off (clutch out)", (r.out[cfg.engine.clutch_side] or 0) == 0)
 check("learned values saved", files["v2/data/learned.lua"] ~= nil)

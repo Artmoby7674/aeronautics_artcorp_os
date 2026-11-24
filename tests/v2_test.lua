@@ -91,7 +91,9 @@ do
     print(string.format("hover trim: mean=%.2f max=%.2f hdg=%.1f drift=%.1f m alt=%.2f", sum / n, mx, t.heading, U.hypot(t.x, t.z), t.alt))
     check("hover: mean attitude < 1.5", sum / n < 1.5, f(sum / n))
     check("hover: max attitude < 3", mx < 3, f(mx))
-    check("hover: heading held", math.abs(U.wrap180(t.heading - 90)) < 5, f(t.heading))
+-- no heading hold any more (the ship cannot strafe, so hands-off only
+    -- stops rotation and fore/aft drift); it must not be spinning
+    check("hover: not rotating", math.abs(w.fl.est.s.yaw_rate) < 1.5, f(w.fl.est.s.yaw_rate))
     check("hover: drift braked (coasting allowed under the pulse threshold)", t.speed < 1.2, f(t.speed))
     check("hover: drift distance bounded", U.hypot(t.x, t.z) < 25, f(U.hypot(t.x, t.z)))
     check("hover: altitude held", math.abs(t.alt - 150) < 1, f(t.alt))
@@ -102,8 +104,10 @@ do
     local w = World.new():airborne(230, 0)
     w:run(5)
     local low = 1e9
-    w.fl.heading_target = 180
-    w:run(40, function(w) low = math.min(low, w:truth().alt) end)
+    -- a heading command (what the autopilot sends) instead of the pilot
+    w.fl.ap = { update = function() return { alt = 230, heading = 180, damp_u = 0 } end, cancel = function() end }
+    w:run(60, function(w) low = math.min(low, w:truth().alt) end)
+    w.fl.ap = nil
     local t = w:truth()
     print(string.format("turn@230: heading=%.1f lowest=%.2f", t.heading, low))
     check("turn@230: reaches heading", math.abs(U.wrap180(t.heading - 180)) < 4, f(t.heading))
@@ -166,10 +170,11 @@ do
     print(string.format("trip: t=%.0f miss=%.1f m hdg=%.1f touch=%.2f below=%.1f maxatt=%.1f", w.t, miss, t.heading, w.sim.touch_v or -1, below, maxatt))
     check("trip: landed", landedEvent(w) ~= nil)
     check("trip: used cruise", phases.cruise == true)
-    -- Smooth, momentum-based travel (long tilt pulses, no flicker) trades
-    -- precision for calm: a pulse is a ~4 m/s push, so the last metres are
-    -- coarse. For a hull this size, landing within ~10 m is the target.
-    check("trip: on the waypoint (< 10 m)", miss < 10, f(miss))
+    -- The ship cannot strafe, so it stops near the point, turns in place
+    -- and descends with only fore/aft drift cancelled (no sideways fixes:
+    -- the tail fin would turn them into rotation). It lands where it drifts
+    -- to: within ~15 m is the target for a hull this size.
+    check("trip: on the waypoint (< 15 m)", miss < 15, f(miss))
     check("trip: on its heading", math.abs(U.wrap180(t.heading - 200)) < 5, f(t.heading))
     check("trip: never sank > 5 m in cruise", below < 5, f(below))
     check("trip: attitude < 8 deg", maxatt < 8, f(maxatt))
@@ -182,17 +187,17 @@ end
 do
     local w = World.new():airborne(100, 0)
     w:startAP({ name = "HOP", x = -150, z = 120, heading = 90 })
-    local cruised = false
+    local vmax = 0
     w:run(300, function(w)
-        if w.fl.mode == "cruise" then cruised = true end
+        vmax = math.max(vmax, w:truth().speed)
         return landedEvent(w) ~= nil
     end)
     local t = w:truth()
     local miss = U.hypot(t.x + 150, t.z - 120)
     print(string.format("hop: t=%.0f miss=%.1f", w.t, miss))
     check("hop: landed", landedEvent(w) ~= nil)
-    check("hop: never cruised", not cruised)
-    check("hop: on the waypoint (< 10 m)", miss < 10, f(miss))
+    check("hop: slow (hop speed cap)", vmax < w.tune.autopilot.hop_speed + 2, f(vmax))
+    check("hop: on the waypoint (< 15 m)", miss < 15, f(miss))
 end
 
 -- 10. E-stop cuts the props; SPACE restores flight
