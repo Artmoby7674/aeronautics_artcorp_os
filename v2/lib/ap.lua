@@ -105,19 +105,6 @@ function AP:update(fl, s, dt)
         fl:takeoff()
         return nil
     end
-    -- the take-off direction check needs the ship hands-off: hover where
-    -- it is until it is over (it only runs until both answers are known)
-    if fl.calib then
-        self.pt = 0
-        fl:setMode("hover")
-        if not self.told_calib then
-            self.told_calib = true
-            U.log("A/P %s: waiting in hover for the direction check", self.name or "?")
-            fl:notify("A/P WAITS: DIRECTION CHECK")
-        end
-        return { alt = fl.alt_target or s.alt, damp_u = 0 }
-    end
-
     local wp = self.wp
     local dx, dz = wp.x - s.x, wp.z - s.z
     local dist = U.hypot(dx, dz)

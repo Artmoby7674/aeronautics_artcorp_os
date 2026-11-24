@@ -19,6 +19,7 @@ return {
     -- Landing/unflip: altitude -> climb-rate setpoint -> lift (gains below).
     vertical = {
         throttle_hold = true,
+        takeoff_climb = 20,  -- m the TAKE OFF button (or SPACE when parked) climbs
         alt_gain = 0.8,      -- (m/s) per m of altitude error
         brake_accel = 1.5,   -- m/s^2 used to shape the stop onto a target
         climb_max = 6,       -- m/s

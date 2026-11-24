@@ -71,8 +71,8 @@ do
     local t = w:truth()
     print(string.format("takeoff: alt=%.2f (target %.1f) maxatt=%.2f", t.alt, w.fl.alt_target, maxatt))
     check("takeoff: flying", w.fl.phase == "flying", w.fl.phase)
-    check("takeoff: one tap = 6 m", math.abs(w.fl.alt_target - 70) < 0.01, w.fl.alt_target)
-    check("takeoff: holds altitude", math.abs(t.alt - 70) < 0.5, f(t.alt))
+    check("takeoff: climbs 20 m", math.abs(w.fl.alt_target - 84) < 0.01, w.fl.alt_target)
+    check("takeoff: holds altitude", math.abs(t.alt - 84) < 0.5, f(t.alt))
     check("takeoff: level", maxatt < 3, f(maxatt))
 end
 
@@ -479,6 +479,18 @@ do
     local A = require("atmos")
     local b = A.new(w.tune, 6)
     check("air: saved and loaded", b:fromTable(w.fl.atmos:toTable()) and math.abs(b:hoverAt(140) - w.fl.atmos:hoverAt(140)) < 1e-6)
+end
+
+-- 19. FLY from the ground climbs at once (v2.26 flight: it hovered a
+--     minute waiting for the direction check, which never finished).
+do
+    local w = World.new({ loop_ticks = 3 }) -- parked, directions not checked
+    local alt0 = w:truth().alt
+    w:startAP({ name = "FAR", x = 0, z = -3000, heading = 0 })
+    w:run(15)
+    local up = w:truth().alt - alt0
+    print(string.format("fly from ground: %.1f m up after 15 s (phase %s)", up, w.fl.ap and w.fl.ap.phase or "-"))
+    check("fly from ground: climbing within 15 s (> 25 m)", up > 25, f(up))
 end
 
 print(string.format("v2_test: %d passed, %d failed", passed, failed))

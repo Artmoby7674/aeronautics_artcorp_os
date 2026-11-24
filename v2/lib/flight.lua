@@ -107,7 +107,7 @@ function Flight:takeoff()
     if self.phase ~= "parked" then return end
     self.phase = "flying"
     self:holdHere()
-    self.alt_target = self.est.s.alt + 6
+    self.alt_target = self.est.s.alt + (self.t.vertical.takeoff_climb or 20)
     self.ctl:softReset()
     self:notify("TAKEOFF")
     -- check which way pitch/roll corrections really move the hull, once
@@ -198,7 +198,9 @@ function Flight:pilot(dt)
         end
     end
     -- the target never runs far from the ship (no wind-up when held)
-    self.alt_target = U.clamp(self.alt_target, s.alt - 15, s.alt + 15)
+    -- (room for the take-off climb, which starts on the ground)
+    local reach = math.max(15, (t.vertical.takeoff_climb or 20) + 5)
+    self.alt_target = U.clamp(self.alt_target, s.alt - reach, s.alt + reach)
     self.alt_target = math.min(self.alt_target, t.ship.max_altitude)
     cmd.alt = self.alt_target
 
@@ -488,7 +490,10 @@ function Flight:run(cmd, dt)
         roll_sp = ctl:lateral(s, cmd.w_sp, cmd.fine)
     end
     local dp, dr = ctl:attitude(s, dt, cmd.pitch or 0, roll_sp)
-    if self.calib and self.phase == "flying" then dp, dr = self:calibStep(s, dt, dp, dr) end
+    -- direction check: only while hovering by hand, never under the
+    -- autopilot (it used to hold the autopilot back a minute waiting for a
+    -- check the swinging hull could not finish); resumes when hovering
+    if self.calib and self.phase == "flying" and not self.ap then dp, dr = self:calibStep(s, dt, dp, dr) end
     self.last_dp, self.last_dr = dp, dr
     if cmd.reverse then
         -- righting: a hard, simple PD push on whichever way is shorter
