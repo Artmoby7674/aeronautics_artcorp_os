@@ -62,7 +62,7 @@ _G.fs = {
             local d = files[p]
             return { readAll = function() return d end, close = function() end }
         end
-        local buf = {}
+        local buf = { mode == "a" and files[p] or nil }
         return {
             write = function(s) buf[#buf + 1] = s end,
             writeLine = function(s) buf[#buf + 1] = s .. "\n" end,
@@ -85,7 +85,10 @@ local function ser(v, ind)
     elseif type(v) == "string" then return string.format("%q", v) end
     return tostring(v)
 end
-_G.textutils = { serialize = ser, unserialize = function(s) return load("return " .. s)() end }
+_G.textutils = { serialize = ser, unserialize = function(s) return load("return " .. s)() end,
+    formatTime = function(t) return string.format("%.2f", t) end }
+os.time = os.time or function() return 0 end
+fs.getSize = function(p) return #(files[p] or "") end
 _G.rednet = { open = function() end, send = function() return true end, broadcast = function() end }
 _G.keys = { getName = function() return nil end }
 _G.term = { nativePaletteColour = function() return 0, 0, 0 end }
@@ -195,6 +198,10 @@ local errs = 0
 for _, l in ipairs(printed) do if l:find("ERROR") or l:find("%[UI%]") then errs = errs + 1 print("  log: " .. l) end end
 check("no runtime errors logged", errs == 0, errs)
 check("no draw errors", #mon.errors == 0, mon.errors[1])
+local log = files["v2/data/log.txt"] or ""
+check("log: screen setup recorded", log:find("screen main_monitor: 348x216 px") ~= nil, log:sub(1, 300))
+check("log: taps recorded", log:find("touch main_monitor") ~= nil)
+check("log: first frame recorded", log:find("first frame drawn") ~= nil)
 
 -- ---------------------------------------------------------------- airborne start
 -- A restart in the air (error, chunk reload) must take control at once:

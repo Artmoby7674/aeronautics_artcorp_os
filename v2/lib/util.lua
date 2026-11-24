@@ -105,4 +105,26 @@ function U.merge(a, b)
     return a
 end
 
+-- Diagnostics log on the ship's own disk (v2/data/log.txt, ~32 KB, then
+-- rotated to log.old). The ship computer is out of reach in flight, so this
+-- is how a problem gets seen afterwards. Never raises.
+U.LOG_PATH = "v2/data/log.txt"
+local LOG_MAX = 32 * 1024
+function U.log(fmt, ...)
+    local okf, msg = pcall(string.format, tostring(fmt), ...)
+    if not okf then msg = tostring(fmt) end
+    pcall(function()
+        local p = U.LOG_PATH
+        if fs.exists(p) and fs.getSize(p) > LOG_MAX then
+            pcall(fs.delete, p .. ".old")
+            pcall(fs.move, p, p .. ".old")
+        end
+        local f = fs.open(p, "a")
+        if not f then return end
+        local day = (os.day and os.day()) or 0
+        f.writeLine(string.format("[%s d%d %8.2f] %s", textutils.formatTime(os.time(), true), day, os.clock(), msg))
+        f.close()
+    end)
+end
+
 return U

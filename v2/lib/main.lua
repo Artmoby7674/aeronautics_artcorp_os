@@ -58,6 +58,7 @@ local function beginBoot()
     if app.power ~= "off" then return end
     app.power, app.boot_t = "booting", 0
     say("STARTING ENGINES")
+    U.log("engine start")
 end
 
 local function powerOff(why)
@@ -71,6 +72,7 @@ local function powerOff(why)
     saveLearned(fl.ctl)
     app.ui:invalidate()
     say("POWER OFF" .. (why and (" (" .. why .. ")") or ""))
+    U.log("power off: %s", tostring(why))
 end
 
 local function bootTick(dt)
@@ -326,11 +328,50 @@ local function controlTick()
     Rec.tick(os.clock(), app.fl.est.s)
 end
 
+-- The cockpit screen: the configured monitor, unless another attached
+-- monitor is bigger (a monitor wall that came apart leaves the configured
+-- name on one small piece). Every monitor seen is written to the log.
 local function findMonitor()
-    local name = app.cfg.ship.peripherals.main_monitor
-    local m = name and peripheral.wrap(name)
-    if not m then m = peripheral.find("monitor") end
-    return m
+    local want = app.cfg.ship.peripherals.main_monitor
+    local best, best_name, best_area = nil, nil, -1
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "monitor" then
+            local m = peripheral.wrap(name)
+            local ok, w, h = pcall(m.getSize)
+            local area = ok and (w * h) or 0
+            U.log("monitor %s: %sx%s cells%s", name, tostring(w), tostring(h),
+                name == want and " (configured)" or "")
+            if area > best_area or (area == best_area and name == want) then
+                best, best_name, best_area = m, name, area
+            end
+        end
+    end
+    if not best and want then best, best_name = peripheral.wrap(want), want end
+    if best_name and best_name ~= want then
+        U.log("using %s instead of configured %s (bigger)", best_name, tostring(want))
+    end
+    app.mon_name = best_name
+    return best
+end
+
+local function initScreen(mon)
+    local ok, why = D.init(mon, app.cfg.tune.ui.palette)
+    if ok then
+        U.log("screen %s: %dx%d px, graphics %s, palette %s", tostring(app.mon_name), D.W, D.H,
+            tostring(D.path), D.palette_ok and "v2" or "stock")
+        if D.W < 300 or D.H < 180 then
+            U.log("screen too small for the layout (need ~348x216 px)")
+            say("SCREEN TOO SMALL: CHECK THE MONITOR BLOCKS", D.C.bad)
+        end
+    else
+        U.log("screen %s: %s", tostring(app.mon_name), tostring(why))
+    end
+    print("monitor: " .. (ok and string.format("%dx%d px, %s", D.W, D.H, D.path) or tostring(why)))
+    return ok
+end
+
+local function trace(err)
+    return tostring(err) .. "\n" .. (debug and debug.traceback and debug.traceback("", 2) or "")
 end
 
 function Main.run(opts)
@@ -343,9 +384,14 @@ function Main.run(opts)
     if f then f.write(cfg.slot) f.close() end
 
     print("ArtCorp Flight OS v2 - ship " .. cfg.name .. " (slot " .. cfg.slot .. ")")
+    U.log("---- start (run %s) ship %s slot %s", tostring(opts.runs or 1), cfg.name, cfg.slot)
+    if opts.recovered then U.log("restarted after: %s", tostring(opts.recovered)) end
     HW.init(cfg.ship)
     app.missing = HW.connect()
-    if #app.missing > 0 then print("missing: " .. table.concat(app.missing, ", ")) end
+    if #app.missing > 0 then
+        print("missing: " .. table.concat(app.missing, ", "))
+        U.log("missing peripherals: %s", table.concat(app.missing, ", "))
+    end
     app.fl = Flight.new(cfg.tune, HW, cfg.ship)
     loadLearned(app.fl.ctl)
     Nav.init(ROOT, cfg.slot)
@@ -353,26 +399,26 @@ function Main.run(opts)
     app.ui = UI.new()
     local mon = findMonitor()
     if mon then
-        local ok, why = D.init(mon, cfg.tune.ui.palette)
-        if ok then
-            print(string.format("monitor: %dx%d px, graphics %s, palette %s", D.W, D.H, D.path,
-                D.palette_ok and "v2" or "stock"))
-        else
-            print("monitor: " .. tostring(why))
-        end
+        initScreen(mon)
     else
         print("no monitor found: running headless")
+        U.log("no monitor found")
     end
     -- Already in the air (restart after an error, chunk reload, reboot):
     -- take control at once instead of sitting on the splash with the props
     -- cut. On the ground the pilot starts the engines from the screen.
     local thr = (cfg.ship.proximity or {}).landed_threshold or 15
     local raw = HW.ship()
-    if raw.ok and HW.proximity() < thr then
+    local prox0 = HW.proximity()
+    U.log("start: telemetry %s, ground sensor %d", raw.ok and "ok" or tostring(raw.err), prox0)
+    -- airborne = the sensor sees nothing or the ground is several blocks
+    -- down; a parked ship whose sensor reads 13-14 is still on the ground
+    if raw.ok and prox0 <= thr - 3 then
         app.power = "on"
         app.fl:boot()
         HW.setClutch(true)
         say("AIRBORNE START: CONTROL RESUMED", D.C.warn)
+        U.log("airborne start: control resumed")
     end
     if opts.recovered then
         app.errors[#app.errors + 1] = "RESTARTED AFTER: " .. tostring(opts.recovered)
@@ -392,13 +438,14 @@ function Main.run(opts)
             local period = now - last_tick
             last_tick = now
             app.loop.ms = U.lowpass(app.loop.ms, period * 1000, period, 1)
-            local ok, err2 = pcall(controlTick)
+            local ok, err2 = xpcall(controlTick, trace)
             if not ok then
-                err2 = tostring(err2)
-                if app.errors[#app.errors] ~= err2 then
-                    app.errors[#app.errors + 1] = err2
+                local first = tostring(err2):match("^[^\n]*")
+                if app.errors[#app.errors] ~= first then
+                    app.errors[#app.errors + 1] = first
                     if #app.errors > 5 then table.remove(app.errors, 1) end
-                    print("[ERROR] " .. err2)
+                    print("[ERROR] " .. first)
+                    U.log("control error: %s", err2)
                 end
             end
             control = os.startTimer(DT) -- always re-armed: an error never stops control
@@ -406,20 +453,40 @@ function Main.run(opts)
             app.disk = fs.getFreeSpace("/")
             Link.tick(os.clock())
             if D.ok then
-                local ok, err2 = pcall(function() app.ui:render(model()) end)
-                if not ok then print("[UI] " .. tostring(err2)) app.ui:invalidate() end
+                local ok, err2 = xpcall(function() app.ui:render(model()) end, trace)
+                if not ok then
+                    local first = tostring(err2):match("^[^\n]*")
+                    print("[UI] " .. first)
+                    if app.last_ui_err ~= first then
+                        app.last_ui_err = first
+                        U.log("screen error: %s", err2)
+                    end
+                    app.ui:invalidate()
+                elseif not app.ui_ok_logged then
+                    app.ui_ok_logged = true
+                    U.log("first frame drawn (%s)", app.power)
+                end
             end
             frame = os.startTimer(1 / math.max(cfg.tune.ui.fps, 1))
         elseif e == "monitor_touch" then
             local px, py = (ev[3] - 1) * 6 + 3, (ev[4] - 1) * 9 + 4
-            local a = D.ok and app.ui:touch(px, py) or nil
-            print(string.format("touch %d,%d -> %s", ev[3], ev[4], tostring(a or (D.ok and "nothing there" or "no graphics"))))
-            local ok2, err2 = pcall(act, a)
-            if not ok2 then print("[ACTION] " .. tostring(err2)) end
+            local a
+            if ev[2] ~= app.mon_name then
+                a = nil
+            elseif D.ok then
+                a = app.ui:touch(px, py)
+            end
+            local what = a or (ev[2] ~= app.mon_name and ("other monitor " .. tostring(ev[2]))
+                or (D.ok and "nothing there" or "no graphics"))
+            print(string.format("touch %d,%d -> %s", ev[3], ev[4], what))
+            U.log("touch %s %d,%d -> %s", tostring(ev[2]), ev[3], ev[4], what)
+            local ok2, err2 = xpcall(function() act(a) end, trace)
+            if not ok2 then print("[ACTION] " .. tostring(err2)) U.log("action error: %s", err2) end
         elseif e == "monitor_resize" then
             -- monitors can be rebuilt (CC logs "Monitor is malformed, resetting")
+            U.log("monitor_resize %s", tostring(ev[2]))
             local mon2 = findMonitor()
-            if mon2 and D.init(mon2, cfg.tune.ui.palette) then app.ui:invalidate() end
+            if mon2 and initScreen(mon2) then app.ui:invalidate() end
         elseif e == "rednet_message" then
             pcall(Link.onRednet, ev[2], ev[3])
         elseif e == "modem_message" then
@@ -428,9 +495,10 @@ function Main.run(opts)
             app.missing = HW.connect()
             Link.opened = {}
             Link.open()
-            if e == "peripheral" and not D.ok then
+            U.log("%s %s", e, tostring(ev[2]))
+            if e == "peripheral" and (not D.ok or peripheral.getType(ev[2]) == "monitor") then
                 local mon2 = findMonitor()
-                if mon2 and D.init(mon2, cfg.tune.ui.palette) then app.ui:invalidate() end
+                if mon2 and initScreen(mon2) then app.ui:invalidate() end
             end
         elseif e == "key" then
             local k = keys.getName(ev[2]) or ""
@@ -441,7 +509,8 @@ function Main.run(opts)
     end
     saveLearned(app.fl.ctl)
     D.shutdown()
-    print("v2 stopped. Outputs keep their last values; reboot to start the default OS.")
+    U.log("stopped (terminate)")
+    print("Flight OS stopped. Outputs keep their last values; reboot to start it again.")
 end
 
 return Main
