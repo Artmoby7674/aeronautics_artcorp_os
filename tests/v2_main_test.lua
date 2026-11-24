@@ -115,7 +115,8 @@ end
 
 script = {}   -- { t = time, fn = function() return event or nil end }
 local function at(t, fn) script[#script + 1] = { t = t, fn = fn } end
-local function touchCell(px, py) return { "monitor_touch", "main_monitor", math.floor(px / 6) + 1, math.floor(py / 9) + 1 } end
+-- CC:Graphics delivers taps as 1-based PIXEL positions in pixel mode
+local function touchCell(px, py) return { "monitor_touch", "main_monitor", math.floor(px) + 1, math.floor(py) + 1 } end
 
 local Main = require("main")
 local UIref = require("ui")
@@ -153,7 +154,7 @@ at(300, function() return { "terminate" } end)
 
 si = 1
 local pending = {}
-os.pullEventRaw = function()
+local function nextEvent()
     while true do
         if #pending > 0 then return table.unpack(table.remove(pending, 1)) end
         -- next timer
@@ -172,6 +173,49 @@ os.pullEventRaw = function()
         end
     end
 end
+
+os.queueEvent = function(...) pending[#pending + 1] = { ... } end
+os.pullEventRaw = function(filter) return coroutine.yield(filter) end
+-- Like CC: telemetry is a main-thread call, so the calling coroutine is
+-- suspended until "task_complete" and drops every other event meanwhile.
+-- (This is what starved the old single-loop design of its screen timer.)
+local task_n = 0
+local rawPose = sublevel.getLogicalPose
+sublevel.getLogicalPose = function()
+    if coroutine.isyieldable() then
+        task_n = task_n + 1
+        local n = task_n
+        os.queueEvent("task_complete", n)
+        repeat local _, id = coroutine.yield("task_complete") until id == n
+    end
+    return rawPose()
+end
+-- CC's parallel API: every coroutine gets only the events matching its
+-- filter (or all, with no filter); events arriving for a coroutine that is
+-- waiting on something else are simply not delivered to it.
+_G.parallel = {
+    waitForAny = function(...)
+        local cos, filters = {}, {}
+        for i, fn in ipairs({ ... }) do
+            cos[i] = coroutine.create(fn)
+            local ok, f = coroutine.resume(cos[i])
+            if not ok then error(f, 0) end
+            filters[i] = f
+            if coroutine.status(cos[i]) == "dead" then return i end
+        end
+        while true do
+            local ev = { nextEvent() }
+            for i, co in ipairs(cos) do
+                if filters[i] == nil or filters[i] == ev[1] or ev[1] == "terminate" then
+                    local ok, f = coroutine.resume(co, table.unpack(ev))
+                    if not ok then error(f, 0) end
+                    filters[i] = f
+                    if coroutine.status(co) == "dead" then return i end
+                end
+            end
+        end
+    end,
+}
 
 -- capture the UI instance for hit lookup
 local render = UIref.render
@@ -201,7 +245,8 @@ check("no draw errors", #mon.errors == 0, mon.errors[1])
 local log = files["v2/data/log.txt"] or ""
 check("log: screen setup recorded", log:find("screen main_monitor: 348x216 px") ~= nil, log:sub(1, 300))
 check("log: taps recorded", log:find("touch main_monitor") ~= nil)
-check("log: first frame recorded", log:find("first frame drawn") ~= nil)
+check("log: first frame recorded", log:find("frame 1 drawn") ~= nil)
+check("screen kept refreshing (frame 50 reached)", log:find("frame 50 drawn") ~= nil)
 
 -- ---------------------------------------------------------------- airborne start
 -- A restart in the air (error, chunk reload) must take control at once:

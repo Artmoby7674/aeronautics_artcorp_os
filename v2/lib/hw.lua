@@ -23,7 +23,8 @@ function HW.connect()
     dev, cache = {}, {}
     local missing = {}
     for key, name in pairs(cfg.peripherals or {}) do
-        if type(name) == "string" and name ~= "" then
+        -- kbd_computer is a computer ID, not a peripheral name
+        if type(name) == "string" and name ~= "" and key ~= "kbd_computer" and not name:match("^%d+$") then
             local p = peripheral.wrap(name)
             if p then dev[key] = p else missing[#missing + 1] = key end
         end

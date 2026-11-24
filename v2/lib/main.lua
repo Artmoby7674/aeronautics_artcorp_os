@@ -391,7 +391,16 @@ function Main.run(opts)
     if #app.missing > 0 then
         print("missing: " .. table.concat(app.missing, ", "))
         U.log("missing peripherals: %s", table.concat(app.missing, ", "))
+        for key, name in pairs(cfg.ship.peripherals) do
+            for _, m in ipairs(app.missing) do
+                if m == key then U.log("  %s wants '%s'", key, tostring(name)) end
+            end
+        end
     end
+    local seen = {}
+    for _, n in ipairs(peripheral.getNames()) do seen[#seen + 1] = n .. "=" .. tostring(peripheral.getType(n)) end
+    table.sort(seen)
+    U.log("peripherals on the network: %s", #seen > 0 and table.concat(seen, ", ") or "none")
     app.fl = Flight.new(cfg.tune, HW, cfg.ship)
     loadLearned(app.fl.ctl)
     Nav.init(ROOT, cfg.slot)
@@ -410,10 +419,14 @@ function Main.run(opts)
     local thr = (cfg.ship.proximity or {}).landed_threshold or 15
     local raw = HW.ship()
     local prox0 = HW.proximity()
-    U.log("start: telemetry %s, ground sensor %d", raw.ok and "ok" or tostring(raw.err), prox0)
+    local sensor = HW.device((cfg.ship.proximity or {}).input_key or "aux_relay") ~= nil
+    U.log("start: telemetry %s, ground sensor %s", raw.ok and "ok" or tostring(raw.err),
+        sensor and tostring(prox0) or "NOT CONNECTED")
     -- airborne = the sensor sees nothing or the ground is several blocks
-    -- down; a parked ship whose sensor reads 13-14 is still on the ground
-    if raw.ok and prox0 <= thr - 3 then
+    -- down; a parked ship whose sensor reads 13-14 is still on the ground.
+    -- Without a connected sensor there is no way to tell: stay on the
+    -- start screen (it read 0 = "airborne" while the relays were missing).
+    if raw.ok and sensor and prox0 <= thr - 3 then
         app.power = "on"
         app.fl:boot()
         HW.setClutch(true)
@@ -426,33 +439,57 @@ function Main.run(opts)
     end
     print("Ctrl+T (hold) on this computer stops the OS.")
 
-    local control = os.startTimer(DT)
-    local frame = os.startTimer(0.2)
-    local last_tick = os.clock()
+    -- Three loops, each waiting only for its own events (parallel API).
+    -- Monitor/relay/telemetry calls make CC suspend the calling loop until
+    -- the call completes, and events arriving meanwhile are dropped FOR THAT
+    -- LOOP. With one loop, the screen's refresh timer was regularly lost
+    -- during a control tick and the screen never drew again; with separate
+    -- loops every loop still receives its own timers.
     local running = true
-    while running do
-        local ev = { os.pullEventRaw() }
-        local e = ev[1]
-        if e == "timer" and ev[2] == control then
-            local now = os.clock()
-            local period = now - last_tick
-            last_tick = now
-            app.loop.ms = U.lowpass(app.loop.ms, period * 1000, period, 1)
-            local ok, err2 = xpcall(controlTick, trace)
-            if not ok then
-                local first = tostring(err2):match("^[^\n]*")
-                if app.errors[#app.errors] ~= first then
-                    app.errors[#app.errors + 1] = first
-                    if #app.errors > 5 then table.remove(app.errors, 1) end
-                    print("[ERROR] " .. first)
-                    U.log("control error: %s", err2)
+    local actions = {} -- touches queued for the control loop
+
+    local function controlLoop()
+        local timer = os.startTimer(DT)
+        local last_tick = os.clock()
+        while running do
+            local e, id = os.pullEventRaw("timer")
+            if e == "timer" and id == timer then
+                local now = os.clock()
+                local period = now - last_tick
+                last_tick = now
+                app.loop.ms = U.lowpass(app.loop.ms, period * 1000, period, 1)
+                while #actions > 0 do
+                    local a = table.remove(actions, 1)
+                    local ok2, err2 = xpcall(function() act(a) end, trace)
+                    if not ok2 then print("[ACTION] " .. tostring(err2)) U.log("action error: %s", err2) end
                 end
+                local ok, err2 = xpcall(controlTick, trace)
+                if not ok then
+                    local first = tostring(err2):match("^[^\n]*")
+                    if app.errors[#app.errors] ~= first then
+                        app.errors[#app.errors + 1] = first
+                        if #app.errors > 5 then table.remove(app.errors, 1) end
+                        print("[ERROR] " .. first)
+                        U.log("control error: %s", err2)
+                    end
+                end
+                timer = os.startTimer(DT) -- always re-armed: an error never stops control
             end
-            control = os.startTimer(DT) -- always re-armed: an error never stops control
-        elseif e == "timer" and ev[2] == frame then
+        end
+    end
+
+    local function wait(secs)
+        local t = os.startTimer(secs)
+        repeat local e, id = os.pullEventRaw("timer") until id == t or not running
+    end
+
+    local function screenLoop()
+        local frames = 0
+        while running do
             app.disk = fs.getFreeSpace("/")
-            Link.tick(os.clock())
+            pcall(Link.tick, os.clock())
             if D.ok then
+                local t0 = os.clock()
                 local ok, err2 = xpcall(function() app.ui:render(model()) end, trace)
                 if not ok then
                     local first = tostring(err2):match("^[^\n]*")
@@ -462,51 +499,65 @@ function Main.run(opts)
                         U.log("screen error: %s", err2)
                     end
                     app.ui:invalidate()
-                elseif not app.ui_ok_logged then
-                    app.ui_ok_logged = true
-                    U.log("first frame drawn (%s)", app.power)
+                else
+                    frames = frames + 1
+                    if frames == 1 or frames == 50 then
+                        U.log("frame %d drawn (%s) in %.2f s", frames, app.power, os.clock() - t0)
+                    end
                 end
             end
-            frame = os.startTimer(1 / math.max(cfg.tune.ui.fps, 1))
-        elseif e == "monitor_touch" then
-            local px, py = (ev[3] - 1) * 6 + 3, (ev[4] - 1) * 9 + 4
-            local a
-            if ev[2] ~= app.mon_name then
-                a = nil
-            elseif D.ok then
-                a = app.ui:touch(px, py)
-            end
-            local what = a or (ev[2] ~= app.mon_name and ("other monitor " .. tostring(ev[2]))
-                or (D.ok and "nothing there" or "no graphics"))
-            print(string.format("touch %d,%d -> %s", ev[3], ev[4], what))
-            U.log("touch %s %d,%d -> %s", tostring(ev[2]), ev[3], ev[4], what)
-            local ok2, err2 = xpcall(function() act(a) end, trace)
-            if not ok2 then print("[ACTION] " .. tostring(err2)) U.log("action error: %s", err2) end
-        elseif e == "monitor_resize" then
-            -- monitors can be rebuilt (CC logs "Monitor is malformed, resetting")
-            U.log("monitor_resize %s", tostring(ev[2]))
-            local mon2 = findMonitor()
-            if mon2 and initScreen(mon2) then app.ui:invalidate() end
-        elseif e == "rednet_message" then
-            pcall(Link.onRednet, ev[2], ev[3])
-        elseif e == "modem_message" then
-            pcall(Link.onModem, ev[3], ev[4], ev[5])
-        elseif e == "peripheral" or e == "peripheral_detach" then
-            app.missing = HW.connect()
-            Link.opened = {}
-            Link.open()
-            U.log("%s %s", e, tostring(ev[2]))
-            if e == "peripheral" and (not D.ok or peripheral.getType(ev[2]) == "monitor") then
-                local mon2 = findMonitor()
-                if mon2 and initScreen(mon2) then app.ui:invalidate() end
-            end
-        elseif e == "key" then
-            local k = keys.getName(ev[2]) or ""
-            if k == "up" then app.ui:cycleTab(-1) elseif k == "down" then app.ui:cycleTab(1) end
-        elseif e == "terminate" then
-            running = false
+            wait(1 / math.max(cfg.tune.ui.fps, 1))
         end
     end
+
+    local function eventLoop()
+        while running do
+            local ev = { os.pullEventRaw() }
+            local e = ev[1]
+            if e == "monitor_touch" then
+                -- In CC:Graphics pixel mode taps arrive as PIXEL positions
+                -- (the log showed 168,128 on a 57x24-cell screen); in text
+                -- mode they are character cells.
+                local px, py
+                if D.ok then px, py = ev[3] - 1, ev[4] - 1
+                else px, py = (ev[3] - 1) * 6 + 3, (ev[4] - 1) * 9 + 4 end
+                local a
+                if ev[2] == app.mon_name and D.ok then a = app.ui:touch(px, py) end
+                local what = a or (ev[2] ~= app.mon_name and ("other monitor " .. tostring(ev[2]))
+                    or (D.ok and "nothing there" or "no graphics"))
+                print(string.format("touch %d,%d -> %s", ev[3], ev[4], what))
+                U.log("touch %s %d,%d -> %s", tostring(ev[2]), ev[3], ev[4], what)
+                if a then actions[#actions + 1] = a end
+            elseif e == "monitor_resize" then
+                -- monitors can be rebuilt (CC logs "Monitor is malformed, resetting")
+                U.log("monitor_resize %s", tostring(ev[2]))
+                local mon2 = findMonitor()
+                if mon2 and initScreen(mon2) then app.ui:invalidate() end
+            elseif e == "rednet_message" then
+                pcall(Link.onRednet, ev[2], ev[3])
+            elseif e == "modem_message" then
+                pcall(Link.onModem, ev[3], ev[4], ev[5])
+            elseif e == "peripheral" or e == "peripheral_detach" then
+                app.missing = HW.connect()
+                Link.opened = {}
+                Link.open()
+                U.log("%s %s (missing now: %s)", e, tostring(ev[2]),
+                    #app.missing > 0 and table.concat(app.missing, ", ") or "none")
+                if e == "peripheral" and (not D.ok or peripheral.getType(ev[2]) == "monitor") then
+                    local mon2 = findMonitor()
+                    if mon2 and initScreen(mon2) then app.ui:invalidate() end
+                end
+            elseif e == "key" then
+                local k = keys.getName(ev[2]) or ""
+                if k == "up" then app.ui:cycleTab(-1) elseif k == "down" then app.ui:cycleTab(1) end
+            elseif e == "terminate" then
+                running = false
+                os.queueEvent("timer", -1) -- wake the other loops so they finish
+            end
+        end
+    end
+
+    parallel.waitForAny(eventLoop, controlLoop, screenLoop)
     saveLearned(app.fl.ctl)
     D.shutdown()
     U.log("stopped (terminate)")
