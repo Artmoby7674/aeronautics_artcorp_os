@@ -204,8 +204,9 @@ local function audit(label, wantTab, reqTab, st, wantCancel)
         check(label .. ": " .. string.format("%q fits its slot", g.str),
             not g.truncated, string.format("at (%d,%d)", g.x, g.y))
         -- A glyph is content, so it must never reach into the tab strip even
-        -- if some other check would have classified it as chrome.
-        if g.x < STRIP_X and g.x + g.w > STRIP_X then
+        -- if some other check would have classified it as chrome. (The strip
+        -- starts below the header; header readouts span the full width.)
+        if g.y >= BODY_Y and g.x < STRIP_X and g.x + g.w > STRIP_X then
             check(label .. ": " .. string.format("%q stays clear of the tabs", g.str),
                 false, string.format("spans %d..%d, strip starts %d",
                     g.x, g.x + g.w, STRIP_X))

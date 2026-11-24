@@ -15,6 +15,14 @@ local function buildPath(slot)
     return "config/wp_" .. tostring(slot or "ship") .. ".lua"
 end
 
+local function fmtNum(v)
+    return tostring(tonumber(v) or 0)
+end
+
+local function wrapHeading(h)
+    return ((tonumber(h) or 0) % 360 + 360) % 360
+end
+
 function WP.load(slot)
     path = buildPath(slot)
     WP.list = {}
@@ -32,7 +40,7 @@ function WP.load(slot)
                         name = tostring(w.name),
                         x = tonumber(w.x) or 0,
                         z = tonumber(w.z) or 0,
-                        heading = ((tonumber(w.heading) or 0) % 360 + 360) % 360,
+                        heading = wrapHeading(w.heading),
                         alt = alt,
                     }
                 end
@@ -42,30 +50,25 @@ function WP.load(slot)
     return #WP.list
 end
 
+-- Writes the whole list. Returns false if the file could not be written
+-- (most often: the computer's disk is full), so callers can roll back
+-- instead of reporting a save that never happened.
 function WP.save()
     if not path then return false end
-    local f = fs.open(path, "w")
-    if not f then return false end
-    f.writeLine("return {")
+    local lines = { "return {" }
     for _, w in ipairs(WP.list) do
-        if w.alt then
-            f.writeLine(string.format(
-                "  { name = %q, x = %s, z = %s, heading = %s, alt = %s },",
-                tostring(w.name), tostring(tonumber(w.x) or 0),
-                tostring(tonumber(w.z) or 0),
-                tostring(((tonumber(w.heading) or 0) % 360 + 360) % 360),
-                tostring(tonumber(w.alt))))
-        else
-            f.writeLine(string.format(
-                "  { name = %q, x = %s, z = %s, heading = %s },",
-                tostring(w.name), tostring(tonumber(w.x) or 0),
-                tostring(tonumber(w.z) or 0),
-                tostring(((tonumber(w.heading) or 0) % 360 + 360) % 360)))
-        end
+        local alt = w.alt and (", alt = " .. fmtNum(w.alt)) or ""
+        lines[#lines + 1] = string.format("  { name = %q, x = %s, z = %s, heading = %s%s },",
+            tostring(w.name), fmtNum(w.x), fmtNum(w.z), tostring(wrapHeading(w.heading)), alt)
     end
-    f.writeLine("}")
-    f.close()
-    return true
+    lines[#lines + 1] = "}"
+    local ok = pcall(function()
+        local f = fs.open(path, "w")
+        if not f then error("open failed") end
+        f.write(table.concat(lines, "\n") .. "\n")
+        f.close()
+    end)
+    return ok
 end
 
 function WP.add(wp)
@@ -78,17 +81,23 @@ function WP.add(wp)
         name = tostring(wp.name),
         x = tonumber(wp.x) or 0,
         z = tonumber(wp.z) or 0,
-        heading = ((tonumber(wp.heading) or 0) % 360 + 360) % 360,
+        heading = wrapHeading(wp.heading),
         alt = alt,
     }
-    WP.save()
+    if not WP.save() then
+        table.remove(WP.list) -- keep memory in step with the file
+        return nil, "SAVE FAILED"
+    end
     return #WP.list
 end
 
 function WP.remove(i)
     if type(i) ~= "number" or not WP.list[i] then return false end
-    table.remove(WP.list, i)
-    WP.save()
+    local removed = table.remove(WP.list, i)
+    if not WP.save() then
+        table.insert(WP.list, i, removed)
+        return false
+    end
     return true
 end
 

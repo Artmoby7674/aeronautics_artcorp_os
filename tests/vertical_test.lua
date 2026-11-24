@@ -418,5 +418,105 @@ do
         string.format("measured=%.3f closed_form=%.3f", acc_meas, accel))
 end
 
+-- 11. AUTO-LAND: descend from 60 m above flat ground and touch down.
+--
+-- Reported in-game: auto-land "doesn't land" and sets off a very bad wobble.
+-- The walking goal used to run at land_descent_rate (12 m/s) while the ship
+-- can only follow at ~5, so the goal ran away below the ship, the altitude PID
+-- saturated, the props went to ~0 (reduce-only stabiliser: no authority left)
+-- and the runaway check then fired a mid-air shutdown.
+--
+-- Ground at GROUND; the gear-mounted sensor reads 15 - height (high = close).
+local function landRun(alt0, ground, sensor_max)
+    local e = makeEnv(alt0, 0)
+    local f, pl, st = e.flight, e.plant, e.state
+    sensor_max = sensor_max or 15
+    local function sense()
+        pl.prox = math.max(0, math.min(sensor_max, math.floor(15 - (pl.alt - ground))))
+    end
+    sense()
+    f.landed = false
+    f:setAutoLand(true)
+    local r = { t = nil, touch_v = 0, max_sink = 0, min_cmd = 15, max_err = 0 }
+    for i = 1, 20 * 120 do
+        -- real ship: vertical speed is velocity.y, not the nose axis
+        st.velocity.z, st.velocity.y = 0, pl.v
+        local was_air = pl.alt > ground
+        local cmd = e.step()
+        if pl.alt <= ground then
+            if was_air then r.touch_v = -pl.v end
+            pl.alt, pl.v = ground, 0
+            st.altitude, st.climb_rate, st.position.y = ground, 0, ground
+        end
+        sense()
+        r.max_sink = math.max(r.max_sink, -pl.v)
+        r.max_err = math.max(r.max_err, pl.alt - f.targets.altitude)
+        if pl.alt > ground + 3 then r.min_cmd = math.min(r.min_cmd, cmd) end
+        if f.shutdown_request then r.shutdown = f.shutdown_request break end
+        if f.landed and f.land_state == Flight.LAND_DONE then r.t = i * DT break end
+    end
+    r.alt = pl.alt
+    return r
+end
+
+do
+    local r = landRun(124, 64)
+    print(string.format("autoland: t=%s touch=%.2f m/s max_sink=%.2f min_cmd=%.2f max_err=%.1f alt=%.1f",
+        tostring(r.t), r.touch_v, r.max_sink, r.min_cmd, r.max_err, r.alt))
+    check("autoland: no mid-air shutdown", r.shutdown == nil, r.shutdown)
+    check("autoland: lands", r.t ~= nil and math.abs(r.alt - 64) < 0.5,
+        string.format("t=%s alt=%.1f", tostring(r.t), r.alt))
+    check("autoland: within 40 s", r.t ~= nil and r.t <= 40, tostring(r.t))
+    check("autoland: soft touchdown (<= 1.5 m/s)", r.touch_v <= 1.5,
+        string.format("%.2f m/s", r.touch_v))
+    check("autoland: descent never exceeds max_descent_rate + 1",
+        r.max_sink <= ((cfg.limits.max_descent_rate or 5) + 1),
+        string.format("%.2f m/s", r.max_sink))
+    check("autoland: props keep attitude authority on the way down",
+        r.min_cmd >= 2, string.format("min cmd %.2f", r.min_cmd))
+    check("autoland: goal never runs away below the ship", r.max_err < 20,
+        string.format("%.1f m", r.max_err))
+end
+
+-- 12. AUTO-LAND onto something the sensor never reads as 15 (sensor tops out
+-- at 13: a slab, a gear leg resting on a fence). The ship stops moving with
+-- the goal below it; that IS ground contact, not a runaway to shut down.
+do
+    local r = landRun(100, 64, 13)
+    check("autoland stall: no shutdown", r.shutdown == nil, r.shutdown)
+    check("autoland stall: latches landed", r.t ~= nil, tostring(r.t))
+end
+
+-- 13. Fore/aft hold must not read the DESCENT as fore/aft drift: pitched
+-- 6 deg nose-down while sinking 4 m/s, with no horizontal motion at all,
+-- the rear thrusters stay off (that projection pulsed the rear at ~1.7 Hz
+-- on every pitch swing -> pitch torque -> more swing: the landing wobble).
+do
+    local e = makeEnv(100, 0)
+    local f = e.flight
+    f.landed = false
+    f:setAutoLand(true)
+    local s6 = math.sin(math.rad(6))
+    local fired = false
+    for _ = 1, 60 do
+        f.state.velocity = { x = 0, y = -4, z = 0 }
+        f.state.forward = { x = 0, y = -s6, z = math.cos(math.rad(6)) }
+        f:landingAssist(DT)
+        if (f.outputs.rear_fw or 0) > 0 or (f.outputs.rear_rev or 0) > 0 then
+            fired = true
+        end
+    end
+    check("autoland: descent is not fore/aft drift", not fired)
+    -- and a genuine 2 m/s forward drift still gets corrected
+    local hit = false
+    for _ = 1, 60 do
+        f.state.velocity = { x = 0, y = -4, z = 2 }
+        f.state.forward = { x = 0, y = -s6, z = math.cos(math.rad(6)) }
+        f:landingAssist(DT)
+        if (f.outputs.rear_fw or 0) > 0 and f.outputs.rear_rev == 1 then hit = true end
+    end
+    check("autoland: real forward drift still braked", hit)
+end
+
 print(string.format("vertical_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("vertical_test FAILED", 0) end

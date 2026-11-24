@@ -155,17 +155,6 @@ end
 print("")
 
 -- ============================================================
--- Step 0: Disconnect all modems
--- ============================================================
-
-print("[0/4] Prepare peripherals")
-print("  Disconnect ALL modems from the computer.")
-print("  This ensures a clean scan for the setup wizard.")
-print("  You will reconnect them one at a time later.")
-print("")
-promptContinue("  When all modems are removed, press any key.")
-
--- ============================================================
 -- Step 1: Config slot menu (setup phase only)
 -- ============================================================
 
@@ -271,7 +260,10 @@ local function listConfigNames()
         fs.makeDir(configDir)
     end
     for _, file in ipairs(fs.list(configDir)) do
-        if file:match("%.lua$") and not file:match("^assignments_") and not file:match("^pid_") then
+        -- skip the per-slot side files (assignments_/pid_/wp_<slot>.lua):
+        -- they belong to a config, they are not configs themselves
+        if file:match("%.lua$") and not file:match("^assignments_")
+            and not file:match("^pid_") and not file:match("^wp_") then
             table.insert(names, (file:gsub("%.lua$", "")))
         end
     end
@@ -324,9 +316,11 @@ local function deleteConfig(slotName)
         if fs.exists(afile) then
             fs.delete(afile)
         end
-        local pfile = configDir .. "/pid_" .. slotName .. ".lua"
-        if fs.exists(pfile) then
-            fs.delete(pfile)
+        for _, prefix in ipairs({ "pid_", "wp_" }) do
+            local side = configDir .. "/" .. prefix .. slotName .. ".lua"
+            if fs.exists(side) then
+                fs.delete(side)
+            end
         end
     end)
     return ok
@@ -434,7 +428,7 @@ local function configSlotMenu()
                                 for i, s in ipairs(slots) do
                                     if s == name then cursor = i break end
                                 end
-                                message = "Created '" .. name .. "' — SPACE to load"
+                                message = "Created '" .. name .. "' - SPACE to load"
                             else
                                 message = "Failed to write config"
                             end
@@ -445,7 +439,7 @@ local function configSlotMenu()
             elseif key == keysLib.d then
                 local slot = slots[cursor]
                 if not slot then
-                    message = "Empty slot — nothing to delete"
+                    message = "Empty slot - nothing to delete"
                 elseif confirmIdx == cursor then
                     if deleteConfig(slot) then
                         message = "Deleted '" .. slot .. "'"
@@ -597,7 +591,6 @@ end
 local assignments_file = configDir .. "/assignments_" .. selected_config .. ".lua"
 local assignments = {}
 local has_saved = false
-local stale_reason = nil
 if fs.exists(assignments_file) then
     local aok, asaved = pcall(function()
         local fn = loadfile(assignments_file)
@@ -609,7 +602,6 @@ if fs.exists(assignments_file) then
             assignments = asaved
             has_saved = true
         else
-            stale_reason = why
             print("[3/5] Saved assignments OUTDATED (" .. tostring(why) .. ")")
             print("  Full peripheral re-wizard required.")
             print("")
@@ -626,11 +618,15 @@ if has_saved then
     end
     print("")
 else
-    if stale_reason then
-        print("  Disconnect ALL modems again for a clean re-scan.")
-        promptContinue("  When all modems are removed, press any key.")
-    end
+    -- The wizard identifies each device by diffing network scans, so it
+    -- needs a clean slate. Only asked when the wizard actually runs (it used
+    -- to be asked on every boot, before we even knew a wizard was needed).
     print("[3/5] Peripheral setup wizard")
+    print("  Disconnect ALL modems from the computer first, so")
+    print("  the scan starts clean. You reconnect them one at a")
+    print("  time below.")
+    promptContinue("  When all modems are removed, press any key.")
+    print("")
     print("  Ship: " .. tostring(ship.name or ship.id) .. "  config v" .. tostring(config.version))
     print("  Connect one device at a time when prompted.")
     print("")

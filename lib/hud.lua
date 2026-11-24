@@ -39,7 +39,6 @@ local C = {
     tab_off_fg = 8,
     bar_bg   = 7,
     blue     = 11,
-    power_on   = 14, -- red
     power_off  = 8,  -- gray
     boot_bg    = 9,
     boot_fg    = 15,
@@ -93,6 +92,8 @@ local function applyLayout()
     L.strip_x = W - L.border - L.strip_w
     L.content_x = L.border + 4
     L.content_w = L.strip_x - L.content_x - 4
+    L.title_x = L.border + 22                  -- ship name, right of the circle
+    L.val_r = L.content_x + L.content_w - 20   -- FLIGHT values end left of the gauge
     L.tab_gap = 5
     L.tab_y0 = L.body_y + 4
     -- Tab height is DERIVED from how many tabs there are, not fixed. The strip
@@ -133,10 +134,13 @@ local function fit(str, w)
     return Font.fit(tostring(str or ""), w)
 end
 
-local function slotText(x, y, w, str, color, align)
+-- Text in a fixed slot: the slot is cleared to `bg` first (default: screen
+-- background), so a shorter value never leaves stale glyphs behind. Pass the
+-- panel colour as bg when the slot sits on a panel (the header).
+local function slotText(x, y, w, str, color, align, bg)
     if w < 1 or x >= L.W then return end
     if y < 0 or y + Font.height > L.H then return end
-    Gfx.fillRect(x, y, w, Font.height, C.bg)
+    Gfx.fillRect(x, y, w, Font.height, bg or C.bg)
     str = fit(str, w)
     if str == "" then return end
     local tw = Font.textWidth(str)
@@ -146,9 +150,14 @@ local function slotText(x, y, w, str, color, align)
     elseif align == "center" then
         tx = x + math.floor((w - tw) / 2)
     end
-    if tx < x then tx = x end
-    if tx + tw > x + w then tx = math.max(x, x + w - tw) end
-    Gfx.text(tx, y, str, color or C.text)
+    Gfx.text(math.max(x, tx), y, str, color or C.text)
+end
+
+local function outline(x, y, w, h, color)
+    Gfx.fillRect(x, y, w, 1, color)
+    Gfx.fillRect(x, y + h - 1, w, 1, color)
+    Gfx.fillRect(x, y, 1, h, color)
+    Gfx.fillRect(x + w - 1, y, 1, h, color)
 end
 
 local function drawBar(x, y, w, h, ratio, fg)
@@ -159,7 +168,7 @@ local function drawBar(x, y, w, h, ratio, fg)
     end
 end
 
--- 15-segment level bar (rear speed level): one cut per possible speed,
+-- 15-segment level bar (rear speed level): one cell per possible level,
 -- filled cells = current level; level 0 = all empty.
 local function drawSegments(x, y, w, h, level, cells)
     cells = cells or 15
@@ -170,6 +179,18 @@ local function drawSegments(x, y, w, h, level, cells)
         local sx = x + (i - 1) * (sw + gap)
         Gfx.fillRect(sx, y, sw, h, i <= level and C.good or C.bar_bg)
     end
+end
+
+-- Section heading: dim caption with a thin rule under it.
+local function section(x, y, w, str)
+    Gfx.text(x, y, fit(str, w), C.dim)
+    Gfx.fillRect(x, y + 9, w, 1, C.panel)
+end
+
+-- Prop thrust colour: red = stalled, yellow = near the top, green otherwise.
+local function thrustColor(t)
+    if t < 1 then return C.bad elseif t > 12 then return C.warn end
+    return C.good
 end
 
 local function label(x, y, str)
@@ -239,11 +260,9 @@ local function drawSplash(progress, booting)
     end
     local tx = math.floor((W - tw) / 2)
     local ty = math.floor(H * 0.22)
-    -- drop shadow / bold
+    -- drop shadow, then the title
     Gfx.textScaled(tx + TITLE_SCALE, ty + TITLE_SCALE, title, C.accent, nil, TITLE_SCALE)
     Gfx.textScaled(tx, ty, title, C.title, nil, TITLE_SCALE)
-    -- subtle accent edge
-    Gfx.textScaled(tx - 1, ty - 1, title, C.accent, nil, TITLE_SCALE)
 
     -- subtitle: ship name when known (below the large title)
     local sub = ship_label or "FLIGHT OS"
@@ -255,7 +274,7 @@ local function drawSplash(progress, booting)
         local active = not booting
         Gfx.fillRect(b.x - 2, b.y - 2, b.w + 4, b.h + 4, C.border)
         Gfx.fillRect(b.x, b.y, b.w, b.h, active and C.boot_bg or C.panel)
-        local lab = booting and "..." or "boot"
+        local lab = booting and "STARTING" or "BOOT"
         local lw = Font.textWidth(lab)
         local lx = b.x + math.floor((b.w - lw) / 2)
         local ly = b.y + math.floor((b.h - Font.height) / 2)
@@ -309,11 +328,9 @@ local function drawChrome()
     Gfx.fillRect(L.border, L.border, L.W - 2 * L.border, L.header_h, C.panel)
     Gfx.fillRect(L.border, L.border + L.header_h, L.W - 2 * L.border, 2, edge)
 
-    -- title starts after shutdown circle
-    local title_x = L.border + 22
-    Gfx.text(title_x, L.border + 6, "ARTCORPOS", C.title)
-    Gfx.text(title_x + 60, L.border + 6, ship_label ~= "FLIGHT OS" and ship_label or "ATLAS",
-        ap_shown and C.good or C.accent)
+    -- ship name right of the shutdown circle; the live readouts fill the rest
+    -- of the header (drawHeader)
+    Gfx.text(L.title_x, L.border + 7, ship_label, ap_shown and C.good or C.title)
 
     Gfx.fillRect(L.strip_x - 3, L.body_y - 2, 3, L.body_h + 4, edge)
 
@@ -321,12 +338,7 @@ local function drawChrome()
         local x, y, w, h = tabRect(i)
         local on = tab.id == active_tab
         Gfx.fillRect(x, y, w, h, on and C.tab_on_bg or C.tab_off_bg)
-        if ap_shown then
-            Gfx.fillRect(x, y, w, 1, C.good)
-            Gfx.fillRect(x, y + h - 1, w, 1, C.good)
-            Gfx.fillRect(x, y, 1, h, C.good)
-            Gfx.fillRect(x + w - 1, y, 1, h, C.good)
-        end
+        if ap_shown then outline(x, y, w, h, C.good) end
         local label_txt = fit(tab.label, w - 4)
         local tw = Font.textWidth(label_txt)
         local tx = x + math.floor((w - tw) / 2)
@@ -335,88 +347,75 @@ local function drawChrome()
     end
 end
 
+-- FLIGHT tab. One label column on the left, one right-aligned value column
+-- ending at L.val_r (left of the altitude gauge), rows on a 16 px pitch.
+local FLIGHT_ROWS = { "ALTITUDE", "TARGET ALT", "SPEED", "CLIMB", "MODE", "GEAR" }
+local ROW = 16
+
 local function drawFlightStatic()
-    local x = L.content_x
-    local y = L.body_y + 2
-    label(x, y, "ALTITUDE")
-    label(x, y + 18, "SPEED")
-    label(x, y + 36, "CLIMB")
-    label(x, y + 54, "MODE")
-    label(x, y + 72, "GEAR/PROX")
-    label(x, y + 90, "THRUST")
-    Gfx.fillRect(x, y + 102, L.content_w - 16, 6, C.bar_bg)
-    label(x, y + 116, "PROP SPD")
-    -- per-prop thrust (0..15) from drone mixer — not tilt
-    label(x, y + 156, "REAR")
-    -- 15-segment rear level line drawn in dynamic (y+168)
-    -- vertical altitude-target gauge track (right edge of content)
-    local gx = x + L.content_w - 12
-    Gfx.fillRect(gx, y, 12, 184, C.bar_bg)
-    Gfx.fillRect(gx, y, 1, 184, C.border)
-    Gfx.fillRect(gx + 11, y, 1, 184, C.border)
-    Gfx.fillRect(gx, y, 12, 2, C.border)
-    Gfx.fillRect(gx, y + 182, 12, 2, C.border)
+    local x, y = L.content_x, L.body_y + 4
+    for i, name in ipairs(FLIGHT_ROWS) do
+        label(x, y + (i - 1) * ROW, name)
+    end
+    local w = L.val_r - x
+    Gfx.fillRect(x, y + 96, w, 1, C.panel)
+    label(x, y + 102, "THRUST")
+    Gfx.fillRect(x, y + 140, w, 1, C.panel)
+    label(x, y + 146, "REAR")
+    -- vertical altitude gauge track (right edge of the content area)
+    local gx = L.content_x + L.content_w - 12
+    Gfx.fillRect(gx, L.body_y + 2, 12, 184, C.bar_bg)
+    outline(gx, L.body_y + 2, 12, 184, C.border)
 end
 
+-- ENGINES tab: one bar per lift prop, the rear level, and average thrust.
+local PROPS = { "FL", "FR", "RL", "RR" }
+
 local function drawEnginesStatic()
-    local x = L.content_x
-    local y = L.body_y + 2
-    label(x, y, "PROPELLERS")
-    Gfx.fillRect(x, y + 8, L.content_w, 2, C.panel)
-    label(x, y + 16, "FL")
-    label(x, y + 34, "FR")
-    label(x, y + 52, "RL")
-    label(x, y + 70, "RR")
-    label(x, y + 90, "REAR")
-    Gfx.fillRect(x, y + 100, L.content_w, 2, C.panel)
-    label(x, y + 108, "SPEED")
-    -- 15-segment rear level line drawn in dynamic (y+120)
-    label(x, y + 164, "TOTAL")
-    Gfx.fillRect(x, y + 176, L.content_w, 8, C.bar_bg)
+    local x, y, w = L.content_x, L.body_y + 4, L.content_w - 4
+    section(x, y, w, "LIFT PROPELLERS")
+    for i, p in ipairs(PROPS) do
+        label(x, y + 16 + (i - 1) * ROW, p)
+    end
+    section(x, y + 84, w, "REAR THRUSTER")
+    label(x, y + 100, "LEVEL")
+    label(x, y + 140, "AVG")
+    section(x, y + 124, w, "AVERAGE LIFT")
 end
 
 local function drawSystemsStatic()
-    local x = L.content_x
-    local y = L.body_y + 2
-    label(x, y, "ATTITUDE")
-    Gfx.fillRect(x, y + 10, L.content_w, 2, C.panel)
-    label(x, y + 20, "PITCH")
-    label(x, y + 40, "ROLL")
-    label(x, y + 60, "YAW")
-    label(x, y + 70, "LOOP") -- control-loop period (20 Hz target)
-    label(x, y + 86, "PID GAINS")
-    Gfx.fillRect(x, y + 96, L.content_w, 2, C.panel)
-    label(x, y + 106, "ALT")
-    label(x, y + 126, "PIT")
-    label(x, y + 146, "ROL")
-    label(x, y + 166, "YAW")
+    local x, y, w = L.content_x, L.body_y + 4, L.content_w - 4
+    section(x, y, w, "ATTITUDE")
+    label(x, y + 16, "PITCH")
+    label(x, y + 32, "ROLL")
+    label(x, y + 48, "HEADING")
+    label(x, y + 64, "CONTROL LOOP") -- 20 Hz tick period
+    section(x, y + 88, w, "PID GAINS")
+    label(x, y + 104, "ALT")
+    label(x, y + 120, "PITCH")
+    label(x, y + 136, "ROLL")
+    label(x, y + 152, "YAW")
 end
 
 local function drawNavStatic()
-    local x = L.content_x
-    local y = L.body_y + 2
-    label(x, y, "NAVIGATION")
-    Gfx.fillRect(x, y + 8, L.content_w, 2, C.panel)
+    local x, y, w = L.content_x, L.body_y + 4, L.content_w - 4
+    section(x, y, w, "POSITION")
     -- position block, top-left (buttons occupy the top-right)
     label(x, y + 16, "X")
-    label(x, y + 34, "Y")
-    label(x, y + 52, "Z")
-    Gfx.fillRect(x, y + 96, L.content_w, 2, C.panel)
-    label(x, y + 106, "HEADING")
-    label(x, y + 124, "TARGET ALT")
-    label(x, y + 142, "ALT ERROR")
-    Gfx.fillRect(x, y + 154, L.content_w, 2, C.panel)
-    label(x, y + 162, "AUTOPILOT")
+    label(x, y + 32, "Y")
+    label(x, y + 48, "Z")
+    Gfx.fillRect(x, y + 94, w, 1, C.panel)
+    label(x, y + 102, "HEADING")
+    label(x, y + 118, "TARGET ALT")
+    label(x, y + 134, "ALT ERROR")
+    Gfx.fillRect(x, y + 150, w, 1, C.panel)
+    label(x, y + 158, "AUTOPILOT")
 end
 
+local ALARM_ROWS = 8
+
 local function drawAlarmsStatic()
-    local x = L.content_x
-    local y = L.body_y + 2
-    label(x, y, "ALARMS")
-    Gfx.fillRect(x, y + 10, L.content_w, 2, C.panel)
-    for i = 0, 7 do
-        Gfx.fillRect(x, y + 18 + i * 20, L.content_w, 16, C.panel)
-    end
+    section(L.content_x, L.body_y + 4, L.content_w - 4, "ALARMS")
 end
 
 -- ACTIONS tab: touch buttons replacing M/L/G/X/R/T/N keys
@@ -508,76 +507,84 @@ local function apCancelRect()
 end
 
 -- Left/right half of the data block; label left, value right-aligned.
-local AP_COL_GAP = 6
+local AP_COL_GAP = 16
 local function apCol(i) -- 1 = left, 2 = right
-    local w = math.floor((L.content_w - AP_COL_GAP) / 2)
+    local w = math.floor((L.content_w - 4 - AP_COL_GAP) / 2)
     return L.content_x + (i - 1) * (w + AP_COL_GAP), w
 end
 
 local function drawButton(bx, by, bw, bh, txt, bg, fg)
     Gfx.fillRect(bx, by, bw, bh, bg)
-    Gfx.fillRect(bx, by, bw, 1, C.border)
-    Gfx.fillRect(bx, by + bh - 1, bw, 1, C.border)
-    Gfx.fillRect(bx, by, 1, bh, C.border)
-    Gfx.fillRect(bx + bw - 1, by, 1, bh, C.border)
+    outline(bx, by, bw, bh, C.border)
     local tw = Font.textWidth(txt)
     Gfx.text(bx + math.floor((bw - tw) / 2),
         by + math.floor((bh - Font.height) / 2), txt, fg)
+end
+
+-- A/P data rows: label on the left of each column, value right-aligned in
+-- the remainder. Values get their OWN slot: slotText clears the slot it is
+-- given, and handing it the whole column used to wipe the labels.
+local AP_ROWS = { { "MODE", "ALT ERR" }, { "CLIMB", "BEARING ERR" },
+                  { "HEADING", "GROUND SPD" }, { "ALT NOW/TGT", "ETA" } }
+local AP_LABEL_W = 70
+
+local function apValue(col, row, str, color)
+    local cx, cw = apCol(col)
+    slotText(cx + AP_LABEL_W - 6, L.body_y + 96 + (row - 1) * 18, cw - AP_LABEL_W + 6,
+        str, color, "right")
 end
 
 local function drawApStatic()
     local x = L.content_x
     local y = L.body_y + 2
     label(x, y, "AUTOPILOT")
-    Gfx.fillRect(x, y + 8, L.content_w, 2, C.panel)
+    Gfx.fillRect(x, y + 9, L.content_w, 1, C.panel)
 
     -- phase boxes: outline + number, drawn once. The active highlight is
     -- dynamic, so it overdraws this and redraws the number with it.
     for i = 1, 5 do
         local bx, by, bw, bh = apPhaseRect(i)
         Gfx.fillRect(bx, by, bw, bh, C.bg)
-        Gfx.fillRect(bx, by, bw, 1, C.border)
-        Gfx.fillRect(bx, by + bh - 1, bw, 1, C.border)
-        Gfx.fillRect(bx, by, 1, bh, C.border)
-        Gfx.fillRect(bx + bw - 1, by, 1, bh, C.border)
+        outline(bx, by, bw, bh, ap_shown and C.border or C.panel)
         local n = tostring(i)
         Gfx.text(bx + math.floor((bw - Font.textWidth(n)) / 2),
             by + math.floor((bh - Font.height) / 2), n, C.dim)
     end
 
-    label(x, L.body_y + 42, "TO WAYPOINT")
-    label(x, L.body_y + 60, "TRIP DONE")
-    Gfx.fillRect(x, L.body_y + 74, L.content_w, 2, C.panel)
+    if not ap_shown then
+        -- idle screen (an AP start/stop forces a full redraw, so this layer
+        -- always matches the run state)
+        label(x, L.body_y + 46, "NOT RUNNING")
+        label(x, L.body_y + 60, "PICK A WAYPOINT: ACTIONS > AUTOPILOT")
+        return
+    end
 
-    -- two columns of flight state
-    local rows = { { "MODE", "ALT ERR" }, { "CLIMB", "BEARING ERR" },
-                   { "HEADING", "GROUND SPD" }, { "ALT NOW/TGT", "ETA" } }
-    for i, names in ipairs(rows) do
-        local ry = L.body_y + 96 + (i - 1) * 18
+    label(x, L.body_y + 42, "TO WAYPOINT")
+    label(x, L.body_y + 56, "TRIP DONE")
+    for i, names in ipairs(AP_ROWS) do
         for c = 1, 2 do
-            local cx = apCol(c)
-            label(cx, ry, names[c])
+            label((apCol(c)), L.body_y + 96 + (i - 1) * 18, names[c])
         end
     end
+    -- column divider
+    local c2 = apCol(2)
+    Gfx.fillRect(c2 - math.floor(AP_COL_GAP / 2), L.body_y + 92, 1, 66, C.panel)
 end
 
 local function drawApDynamic(s)
-    local x, w = L.content_x, L.content_w
+    local x, w = L.content_x, L.content_w - 4
     local ap = s.ap
-    local cx1, cw1 = apCol(1)
-    local cx2, cw2 = apCol(2)
     local bx, by, bw, bh = apCancelRect()
 
     if not ap then
-        slotText(x, L.body_y + 14, w, "AUTOPILOT NOT RUNNING", C.dim, "left")
-        slotText(x, L.body_y + 42, w, "START IT FROM THE ACTIONS TAB", C.dim, "left")
         drawButton(bx, by, bw, bh, "CANCEL A/P", C.bar_bg, C.dim)
         return
     end
 
     -- which waypoint: "distance to WP" is only useful next to WHICH waypoint,
-    -- and the name is short enough to sit on the title row.
-    slotText(x, L.body_y + 2, w, tostring(ap.name or ""), C.text, "right")
+    -- and the name is short enough to sit on the title row (right of it).
+    local nx = x + Font.textWidth("AUTOPILOT") + 8
+    slotText(nx, L.body_y + 2, x + w - nx, tostring(ap.name or ""), C.text, "right")
 
     -- phase highlight
     local idx = apPhaseIndex(ap.phase, ap.step)
@@ -591,103 +598,78 @@ local function drawApDynamic(s)
         end
     end
     -- spelled out beside the boxes, so a glance gives both the number (for
-    -- bug reports) and the meaning (for the person flying). The slot is
-    -- bounded to the space LEFT of the tab strip -- slotText fills its whole
-    -- width, so handing it L.content_w here would paint over the tabs.
+    -- bug reports) and the meaning (for the person flying). Bounded to the
+    -- space left of the tab strip.
     local capx = x + 5 * (AP_CELL_W + AP_CELL_GAP) + 4
     local capw = math.max(0, (x + w) - capx)
-    slotText(capx, L.body_y + 20, capw, idx and AP_PHASES[idx].long or "?",
+    slotText(capx, L.body_y + 18, capw, idx and AP_PHASES[idx].long or "?",
         idx and C.accent or C.dim, "left")
-    if ap.paused then
-        slotText(capx, L.body_y + 30, capw, "PAUSED", C.warn, "left")
-    end
+    slotText(capx, L.body_y + 28, capw, ap.paused and "PAUSED" or "", C.warn, "left")
 
-    -- distance + trip percentage: the two numbers that answer "how far now,
-    -- and how much is left"
+    -- distance + trip percentage: "how far now, and how much is done"
+    local vx = x + AP_LABEL_W + 4
     local d = tonumber(ap.dist) or 0
-    slotText(x, L.body_y + 42, w, string.format("%.0f M", d), C.accent, "right")
+    slotText(vx, L.body_y + 42, x + w - vx, string.format("%.0f M", d), C.accent, "right")
     local pct = (tonumber(ap.progress) or 0) * 100
-    slotText(x, L.body_y + 60, w, string.format("%.0f%%", pct), C.accent, "right")
-    Gfx.fillRect(x, L.body_y + 72, w, 8, C.bar_bg)
-    local fillw = math.floor(w * clamp(pct / 100, 0, 1) + 0.5)
-    if fillw > 0 then Gfx.fillRect(x, L.body_y + 72, fillw, 8, C.good) end
+    slotText(vx, L.body_y + 56, x + w - vx, string.format("%.0f%%", pct), C.accent, "right")
+    drawBar(x, L.body_y + 68, w, 6, pct / 100, C.good)
 
     -- flight state, chosen to match what has actually gone wrong before:
     -- altitude error + climb rate (the climb oscillation), bearing error (the
     -- bank not tracking the bearing), and the mode (cruise quietly turning
     -- into hover, which is a one-glance diagnosis).
-    -- Show the PLAN, not the vertical law's command. During the ceiling
-    -- discovery climb the law is deliberately commanding the 450 m guard so
-    -- the ship can find out how high it can really go; that number is an
-    -- implementation detail and reading it back as "target altitude" is the
-    -- y450 readout that used to alarm the pilot. ap.goal_alt is the altitude
-    -- the run actually intends to cruise at.
-    local tgt_alt = (ap and tonumber(ap.goal_alt)) or s.target_altitude or 0
+    -- Show the PLAN, not the vertical law's command: during the ceiling
+    -- discovery climb the law commands the 450 m guard, and reading that back
+    -- as "target altitude" alarmed pilots. ap.goal_alt is the intended cruise.
+    local tgt_alt = tonumber(ap.goal_alt) or s.target_altitude or 0
     local alt_err = (s.altitude or 0) - tgt_alt
     local berr = tonumber(ap.err) or 0
     local eta = ap.eta
-    slotText(cx1, L.body_y + 96, cw1, tostring(s.mode or "-"):upper(), C.text, "right")
-    slotText(cx2, L.body_y + 96, cw2, string.format("%+.0f", alt_err),
-        math.abs(alt_err) > 10 and C.bad or C.good, "right")
-    slotText(cx1, L.body_y + 114, cw1,
-        string.format("%+.1f M/S", s.climb_rate or 0), C.text, "right")
-    slotText(cx2, L.body_y + 114, cw2, string.format("%+.1f", berr),
-        math.abs(berr) < 5 and C.good or (math.abs(berr) < 15 and C.warn or C.bad),
-        "right")
-    slotText(cx1, L.body_y + 132, cw1, string.format("%.1f", s.yaw or 0), C.text, "right")
-    slotText(cx2, L.body_y + 132, cw2,
-        string.format("%.1f M/S", s.speed or 0), C.text, "right")
-    slotText(cx1, L.body_y + 150, cw1,
-        string.format("%.0f/%.0f", s.altitude or 0, tgt_alt),
-        C.text, "right")
-    slotText(cx2, L.body_y + 150, cw2,
-        (eta and eta >= 0) and string.format("%.0f S", eta) or "--", C.text, "right")
+    apValue(1, 1, tostring(s.mode or "-"):upper(), C.text)
+    apValue(2, 1, string.format("%+.0f", alt_err), math.abs(alt_err) > 10 and C.bad or C.good)
+    apValue(1, 2, string.format("%+.1f M/S", s.climb_rate or 0), C.text)
+    apValue(2, 2, string.format("%+.1f", berr),
+        math.abs(berr) < 5 and C.good or (math.abs(berr) < 15 and C.warn or C.bad))
+    apValue(1, 3, string.format("%.1f", s.yaw or 0), C.text)
+    apValue(2, 3, string.format("%.1f M/S", s.speed or 0), C.text)
+    apValue(1, 4, string.format("%.0f/%.0f", s.altitude or 0, tgt_alt), C.text)
+    apValue(2, 4, (eta and eta >= 0) and string.format("%.0f S", eta) or "--", C.text)
 
     -- cancel: the one live control during a run, so it stays enabled
     drawButton(bx, by, bw, bh, "CANCEL A/P", C.good, 15)
 end
 
 local function drawActionsStatic()
-    local x = L.content_x
-    local y = L.body_y + 2
-    label(x, y, "CONTROLS")
-    Gfx.fillRect(x, y + 8, L.content_w, 2, C.panel)
+    section(L.content_x, L.body_y + 4, L.content_w - 4, "CONTROLS")
 end
 
 local function drawActionsDynamic(s)
-    local cfg = render_config
-    local feats = (cfg and cfg.features) or {}
+    local feats = (render_config and render_config.features) or {}
     for i, btn in ipairs(ACTION_BTNS) do
         local bx, by, bw, bh = actionBtnRect(i)
-        local enabled = true
-        if btn.feat and feats[btn.feat] == false then enabled = false end
+        local enabled = not (btn.feat and feats[btn.feat] == false)
         local bg = enabled and C.panel or C.bar_bg
         local fg = enabled and C.text or C.dim
-        if btn.id == "estop" then
-            bg = C.bad
-            fg = 15
-        elseif btn.id == "land" and s.auto_land then
-            bg = C.warn
-            fg = 15
-        elseif btn.id == "gear" and s.gear_down then
-            bg = C.good
-            fg = 15
-        elseif btn.id == "autopilot" and s.ap then
-            bg = C.good
-            fg = 15
-        end
-        Gfx.fillRect(bx, by, bw, bh, bg)
-        Gfx.fillRect(bx, by, bw, 1, C.border)
-        Gfx.fillRect(bx, by + bh - 1, bw, 1, C.border)
-        Gfx.fillRect(bx, by, 1, bh, C.border)
-        Gfx.fillRect(bx + bw - 1, by, 1, bh, C.border)
         local txt = btn.label
-        if btn.id == "estop" and s.estop then
-            txt = "E-STOP (ON)"
+        if not enabled then
+            txt = btn.label .. " (N/A)"
+        elseif btn.id == "estop" then
+            bg, fg = C.bad, 15
+            if s.estop then txt = "E-STOP (ON)" end
+        elseif btn.id == "land" and s.auto_land then
+            bg, fg, txt = C.warn, 15, "AUTO-LAND (ON)"
+        elseif btn.id == "gear" then
+            txt = s.gear_down and "GEAR (DOWN)" or "GEAR (UP)"
+            if s.gear_down then bg, fg = C.good, 15 end
+        elseif btn.id == "autopilot" and s.ap then
+            bg, fg = C.good, 15
         end
-        local tw = Font.textWidth(txt)
-        Gfx.text(bx + math.floor((bw - tw) / 2), by + math.floor((bh - Font.height) / 2), txt, fg)
+        drawButton(bx, by, bw, bh, txt, bg, fg)
     end
+    -- how to get out of an e-stop is not obvious from the button alone
+    local hx, hy = L.content_x + 4, L.body_y + 16 + 2 * 38 + 6
+    slotText(hx, hy, L.content_w - 8,
+        s.estop and "E-STOP ON: SPACE/CTRL OR SHIFT CLEARS IT" or "", C.warn, "left")
 end
 
 -- ============================================================
@@ -713,10 +695,7 @@ end
 
 local function wpBox(x, y, w, h, bg)
     Gfx.fillRect(x, y, w, h, bg)
-    Gfx.fillRect(x, y, w, 1, C.border)
-    Gfx.fillRect(x, y + h - 1, w, 1, C.border)
-    Gfx.fillRect(x, y, 1, h, C.border)
-    Gfx.fillRect(x + w - 1, y, 1, h, C.border)
+    outline(x, y, w, h, C.border)
 end
 
 local function wpCenter(x, y, w, h, txt, fg)
@@ -835,95 +814,99 @@ local function drawContentStatic()
 end
 
 local function drawFlightDynamic(s)
-    local x = L.content_x
-    local y = L.body_y + 2
+    local x, y = L.content_x, L.body_y + 4
     local o = s.outputs or {}
-    local vw = L.content_w - 20
+    local vx = x + 76
+    local vw = L.val_r - vx
 
-    slotText(x + 70, y, vw - 70, string.format("%.1f", s.altitude or 0), C.accent, "right")
-    slotText(x + 70, y + 18, vw - 70, string.format("%.1f", s.speed or 0) .. " MS", C.accent, "right")
-
+    local function row(i, str, color)
+        slotText(vx, y + (i - 1) * ROW, vw, str, color, "right")
+    end
+    row(1, string.format("%.1f", s.altitude or 0), C.accent)
+    row(2, string.format("%.1f", s.target_altitude or 0), C.warn) -- = gauge marker
+    row(3, string.format("%.1f M/S", s.speed or 0), C.accent)
     local clb = s.climb_rate or 0
     local cc = C.good
     if clb < -2 then cc = C.bad elseif clb < 0 then cc = C.warn end
-    slotText(x + 70, y + 36, vw - 70, string.format("%+.1f", clb), cc, "right")
-
+    row(4, string.format("%+.1f M/S", clb), cc)
     local mode = s.mode or "???"
-    slotText(x + 70, y + 54, vw - 70, mode, mode == "HOVER" and C.good or C.warn, "left")
+    row(5, mode, mode == "HOVER" and C.good or C.warn)
 
-    local gp = string.format("%s %d", s.gear_down and "DN" or "UP", s.proximity or 0)
-    if s.auto_land then gp = "AL " .. (s.land_state or "") .. " " .. gp end
-    if s.landed then gp = "GND " .. gp end
-    slotText(x + 70, y + 72, vw - 70, gp, s.landed and C.good or C.text, "left")
+    local gp = (s.gear_down and "DOWN" or "UP") ..
+        string.format("  PROX %d", s.proximity or 0)
+    if s.auto_land then gp = "LAND " .. tostring(s.land_state or "") .. "  " .. gp end
+    if s.landed then gp = "GROUND  " .. gp end
+    row(6, gp, s.landed and C.good or C.text)
 
     local thrust = (o.speed or 0) / 15
-    drawBar(x, y + 102, L.content_w - 16, 6, thrust, C.good)
-    slotText(x + L.content_w - 60, y + 90, 44,
+    slotText(vx, y + 102, vw,
         tostring(math.floor(thrust * 100 + 0.5)) .. "%", C.good, "right")
+    drawBar(x, y + 112, L.val_r - x, 6, thrust, C.good)
 
-    local labels = { "FL", "FR", "RL", "RR" }
-    for i, p in ipairs(labels) do
+    -- per-prop thrust (0..15): four "FL 11.7" cells across the full row
+    local cw = math.floor((L.val_r - x) / 4)
+    for i, p in ipairs(PROPS) do
         local t = o[p .. "_speed"] or o.speed or 0
-        local tc = C.good
-        if t < 1 then tc = C.bad elseif t > 12 then tc = C.warn end
-        slotText(x + 40, y + 128 + (i - 1) * 8, 70, string.format("%5.1f", t), tc, "right")
+        local cx = x + (i - 1) * cw
+        Gfx.text(cx, y + 126, p, C.dim)
+        slotText(cx + 16, y + 126, cw - 26, string.format("%.1f", t), thrustColor(t), "right")
     end
 
-    drawSegments(x, y + 168, L.content_w - 16, 6, s.target_speed)
+    slotText(vx, y + 146, vw, string.format("%d/15", s.target_speed or 0), C.text, "right")
+    drawSegments(x, y + 158, L.val_r - x, 8, s.target_speed)
 
-    -- Vertical altitude target gauge (right edge)
-    local gx = x + L.content_w - 12
-    local gh = 184
-    local max_alt = 450 -- gauge scale: AP_CEIL_HARD, not the discovered ceiling
-    -- (a learned ceiling above this would otherwise pin the needle)
+    -- vertical altitude gauge: filled to the current altitude, yellow marker
+    -- at the target. Scale is AP_CEIL_HARD (450), not a discovered ceiling.
+    local gx = L.content_x + L.content_w - 12
+    local gy, gh = L.body_y + 2, 184
+    local max_alt = 450
     local function altY(alt)
         local a = clamp(alt or 0, 0, max_alt)
-        return y + gh - 3 - math.floor((a / max_alt) * (gh - 8))
+        return gy + gh - 3 - math.floor((a / max_alt) * (gh - 8))
     end
-    local cur = s.altitude or 0
-    local tgt = s.target_altitude or 0
-    local cy = altY(cur)
-    local bottom = y + gh - 2
+    Gfx.fillRect(gx + 2, gy + 2, 8, gh - 4, C.bar_bg)
+    local cy = altY(s.altitude)
+    local bottom = gy + gh - 2
     if bottom > cy then
         Gfx.fillRect(gx + 2, cy, 8, bottom - cy, C.accent)
     end
-    local ty = altY(tgt)
-    Gfx.fillRect(gx, ty, 12, 2, C.warn)
-    -- current altitude chip above gauge (target shown by the marker line)
-    slotText(x + L.content_w - 60, y - 0, 44, string.format("%.0f", cur), C.accent, "right")
+    Gfx.fillRect(gx + 1, altY(s.target_altitude), 10, 2, C.warn)
 end
 
 local function drawEnginesDynamic(s)
-    local x = L.content_x
-    local y = L.body_y + 2
+    local x, y = L.content_x, L.body_y + 4
     local o = s.outputs or {}
-    local labels = { "FL", "FR", "RL", "RR" }
-    for i, p in ipairs(labels) do
-        local spd = o[p .. "_speed"] or o.speed or 0
-        local tc = C.good
-        if spd < 1 then tc = C.bad elseif spd > 12 then tc = C.warn end
-        slotText(x + 40, y + 16 + (i - 1) * 18, 80, string.format("%5.1f", spd), tc, "right")
+    local bx = x + 36
+    local vw = 36
+    local bw = L.content_w - 4 - (bx - x) - vw - 6
+    for i, p in ipairs(PROPS) do
+        local t = o[p .. "_speed"] or o.speed or 0
+        local ry = y + 16 + (i - 1) * ROW
+        drawBar(bx, ry, bw, 7, t / 15, thrustColor(t))
+        slotText(bx + bw + 6, ry, vw, string.format("%.1f", t), thrustColor(t), "right")
     end
-    drawSegments(x, y + 120, L.content_w, 8, s.target_speed)
-    drawBar(x, y + 176, L.content_w, 8, (o.speed or 0) / 15, C.good)
+    drawSegments(bx, y + 100, bw, 7, s.target_speed)
+    slotText(bx + bw + 6, y + 100, vw, string.format("%d/15", s.target_speed or 0), C.text, "right")
+    local avg = (o.speed or 0) / 15
+    drawBar(bx, y + 140, bw, 7, avg, C.good)
+    slotText(bx + bw + 6, y + 140, vw, string.format("%d%%", math.floor(avg * 100 + 0.5)),
+        C.good, "right")
 end
 
 local function drawSystemsDynamic(s)
-    local x = L.content_x
-    local y = L.body_y + 2
-    local vw = L.content_w - 70
+    local x, y = L.content_x, L.body_y + 4
+    local vx = x + 90
+    local vw = L.content_w - 4 - 90
 
-    local pitch = s.pitch or 0
-    local pc = C.good
-    if math.abs(pitch) > 10 then pc = C.bad elseif math.abs(pitch) > 5 then pc = C.warn end
-    slotText(x + 70, y + 20, vw, string.format("%+8.1f", pitch), pc, "right")
-
-    local roll = s.roll or 0
-    local rc = C.good
-    if math.abs(roll) > 10 then rc = C.bad elseif math.abs(roll) > 5 then rc = C.warn end
-    slotText(x + 70, y + 40, vw, string.format("%+8.1f", roll), rc, "right")
-
-    slotText(x + 70, y + 60, vw, string.format("%+8.1f", s.yaw or 0), C.text, "right")
+    local function attColor(a)
+        a = math.abs(a)
+        if a > 10 then return C.bad elseif a > 5 then return C.warn end
+        return C.good
+    end
+    local pitch, roll = s.pitch or 0, s.roll or 0
+    slotText(vx, y + 16, vw, string.format("%+.1f", pitch), attColor(pitch), "right")
+    slotText(vx, y + 32, vw, string.format("%+.1f", roll), attColor(roll), "right")
+    slotText(vx, y + 48, vw, string.format("%.1f", s.yaw or 0), C.text, "right")
 
     -- Control-loop period: green = on the 20 Hz timer, red = starved
     local loop = s.loop
@@ -931,36 +914,29 @@ local function drawSystemsDynamic(s)
         local lp = loop.ema
         local lc = C.good
         if lp > 0.09 then lc = C.bad elseif lp > 0.06 then lc = C.warn end
-        slotText(x + 70, y + 70, vw, string.format("%.1fms", lp * 1000), lc, "right")
+        slotText(vx, y + 64, vw, string.format("%.1f MS", lp * 1000), lc, "right")
     else
-        slotText(x + 70, y + 70, vw, "--", C.dim, "right")
+        slotText(vx, y + 64, vw, "--", C.dim, "right")
     end
 
-    local pid = {
-        { y + 106, (s.pid_gains or {}).altitude },
-        { y + 126, (s.pid_gains or {}).pitch },
-        { y + 146, (s.pid_gains or {}).roll },
-        { y + 166, (s.pid_gains or {}).yaw },
-    }
-    for _, row in ipairs(pid) do
-        local g = row[2] or {}
-        slotText(x + 50, row[1], L.content_w - 50,
-            string.format("K%.1f I%.2f D%.1f", g.kp or 0, g.ki or 0, g.kd or 0),
-            C.text, "left")
+    local g = s.pid_gains or {}
+    for i, name in ipairs({ "altitude", "pitch", "roll", "yaw" }) do
+        local k = g[name] or {}
+        slotText(x + 50, y + 88 + i * 16, L.content_w - 54,
+            string.format("KP %.2f  KI %.2f  KD %.2f", k.kp or 0, k.ki or 0, k.kd or 0),
+            C.text, "right")
     end
 end
 
 local function drawNavDynamic(s)
-    local x = L.content_x
-    local y = L.body_y + 2
-    local w = L.content_w
+    local x, y = L.content_x, L.body_y + 4
+    local w = L.content_w - 4
     local pos = s.position or {}
 
     -- position, top-left
-    slotText(x + 40, y + 16, 88, string.format("%.1f", pos.x or 0), C.text, "left")
-    slotText(x + 40, y + 34, 88,
-        string.format("%.1f", pos.y or (s.altitude or 0)), C.text, "left")
-    slotText(x + 40, y + 52, 88, string.format("%.1f", pos.z or 0), C.text, "left")
+    slotText(x + 16, y + 16, 80, string.format("%.1f", pos.x or 0), C.text, "right")
+    slotText(x + 16, y + 32, 80, string.format("%.1f", pos.y or (s.altitude or 0)), C.text, "right")
+    slotText(x + 16, y + 48, 80, string.format("%.1f", pos.z or 0), C.text, "right")
 
     -- 4 buttons, top-right
     for i, btn in ipairs(NAV_BTNS) do
@@ -975,20 +951,11 @@ local function drawNavDynamic(s)
                 fg = C.dim
             end
         end
-        Gfx.fillRect(bx, by, bw, bh, bg)
-        Gfx.fillRect(bx, by, bw, 1, C.border)
-        Gfx.fillRect(bx, by + bh - 1, bw, 1, C.border)
-        Gfx.fillRect(bx, by, 1, bh, C.border)
-        Gfx.fillRect(bx + bw - 1, by, 1, bh, C.border)
-        local txt = (btn.id == "rec" and s.recording) and "STOP" or btn.label
-        local tw = Font.textWidth(txt)
-        Gfx.text(bx + math.floor((bw - tw) / 2),
-            by + math.floor((bh - Font.height) / 2), txt, fg)
+        drawButton(bx, by, bw, bh, (btn.id == "rec" and s.recording) and "STOP" or btn.label, bg, fg)
     end
 
     -- status line: keyboard prompt > printing > recent kbd event > recording
-    Gfx.fillRect(x, y + 82, w, Font.height + 4, C.bg) -- y+82..95: keeps the y+96 divider clear
-    local st = nil
+    local st = ""
     if s.kbd_prompt then
         st = s.kbd_prompt
     elseif s.printing then
@@ -1000,17 +967,16 @@ local function drawNavDynamic(s)
         st = string.format("REC %d:%02d | %d SAMP",
             math.floor(t / 60), math.floor(t) % 60, s.rec_n or 0)
     end
-    if st then
-        Gfx.text(x, y + 86, fit(st, w), C.accent)
-    end
+    slotText(x, y + 74, w, st, C.accent, "left")
 
     -- navigation rows
-    slotText(x + 90, y + 106, w - 90, string.format("%.1f", s.yaw or 0), C.accent, "right")
-    slotText(x + 90, y + 124, w - 90, string.format("%.1f", s.target_altitude or 0), C.accent, "right")
+    local vx, vw = x + 90, w - 90
+    slotText(vx, y + 102, vw, string.format("%.1f", s.yaw or 0), C.accent, "right")
+    slotText(vx, y + 118, vw, string.format("%.1f", s.target_altitude or 0), C.accent, "right")
     local err = (s.altitude or 0) - (s.target_altitude or 0)
     local ec = C.good
     if math.abs(err) > 10 then ec = C.bad elseif math.abs(err) > 3 then ec = C.warn end
-    slotText(x + 90, y + 142, w - 90, string.format("%+.1f", err), ec, "right")
+    slotText(vx, y + 134, vw, string.format("%+.1f", err), ec, "right")
 
     -- autopilot row: objective distance, route progress %, ETA
     if s.ap then
@@ -1018,89 +984,88 @@ local function drawNavDynamic(s)
         local d = math.floor(tonumber(ap.dist) or 0)
         local pct = math.floor((tonumber(ap.progress) or 0) * 100 + 0.5)
         local eta = ap.eta
-        local eta_s = (eta and eta >= 0) and string.format("%dm%02ds",
+        local eta_s = (eta and eta >= 0) and string.format("%dM%02dS",
             math.floor(eta / 60), math.floor(eta % 60)) or "--"
-        local txt = string.format("%s %dm %d%% ETA %s",
+        local txt = string.format("%s %dM %d%% ETA %s",
             tostring(ap.name):upper(), d, pct, eta_s)
         if ap.paused then txt = "PAUSED " .. txt end
-        slotText(x + 90, y + 162, w - 90, fit(txt, w - 90), C.good, "left")
+        slotText(vx - 20, y + 158, vw + 20, txt, C.good, "right")
     else
-        slotText(x + 90, y + 162, w - 90, "-", C.dim, "left")
+        slotText(vx - 20, y + 158, vw + 20, "OFF", C.dim, "right")
     end
 end
 
 local function drawAlarmsDynamic(s, status_msg)
-    local x = L.content_x
-    local y = L.body_y + 2
+    local x, y = L.content_x, L.body_y + 4
+    local w = L.content_w - 4
     local msgs = {}
-    if s.unflip then
-        table.insert(msgs, { "AUTOMATIC UNFLIP SEQUENCE", C.bad })
-    end
-    if s.estop then
-        table.insert(msgs, { "E-STOP LATCHED (RESET)", C.bad })
-    end
+    local function add(text, color) msgs[#msgs + 1] = { text, color } end
+    if s.unflip then add("AUTOMATIC UNFLIP SEQUENCE", C.bad) end
+    if s.estop then add("E-STOP ON (SPACE/CTRL/SHIFT CLEARS)", C.bad) end
     -- Control loop starving (persistent late timers): see SYSTEMS LOOP row
     local loop = s.loop
     if loop and (loop.late_streak or 0) >= 5 then
-        table.insert(msgs, { string.format("CONTROL LOOP SLOW %.0fMS",
-            (loop.ema or 0) * 1000), C.bad })
+        add(string.format("CONTROL LOOP SLOW %.0fMS", (loop.ema or 0) * 1000), C.bad)
     end
-    -- status feedback ("Tab: X", "GEAR DOWN", ...) is not an alarm — this
-    -- tab is reserved for real alarms
-    if status_msg and status_msg ~= "" and status_msg:sub(1, 4) ~= "Tab:" then
-        table.insert(msgs, { status_msg, C.accent })
-    end
-    local alt = s.altitude or 0
-    if alt < 70 then
-        table.insert(msgs, { "LOW ALTITUDE", C.bad })
-    end
+    if (s.altitude or 0) < 70 and not s.landed then add("LOW ALTITUDE", C.bad) end
     -- fast descent is expected while auto-landing (6 m/s walk)
-    if (s.climb_rate or 0) < -4 and not s.auto_land then
-        table.insert(msgs, { "FAST DESCENT", C.warn })
-    end
+    if (s.climb_rate or 0) < -4 and not s.auto_land then add("FAST DESCENT", C.warn) end
     if math.abs(s.pitch or 0) > 15 or math.abs(s.roll or 0) > 15 then
-        table.insert(msgs, { "EXTREME ATTITUDE", C.bad })
+        add("EXTREME ATTITUDE", C.bad)
     end
-    if #msgs == 0 then
-        table.insert(msgs, { "NO ACTIVE ALARMS", C.good })
-    end
-    for i = 1, 8 do
+    if s.sable_error then add("NO SHIP TELEMETRY (CC:SABLE)", C.bad) end
+    -- the latest status line, as a dim footnote under the real alarms
+    if status_msg and status_msg ~= "" then add(status_msg, C.accent) end
+    if #msgs == 0 then add("NO ACTIVE ALARMS", C.good) end
+
+    for i = 1, ALARM_ROWS do
+        local ry = y + 16 + (i - 1) * 20
         local m = msgs[i]
-        Gfx.fillRect(x + 2, y + 18 + (i - 1) * 20, L.content_w - 4, 16, C.panel)
         if m then
-            Gfx.text(x + 6, y + 22 + (i - 1) * 20, fit(m[1], L.content_w - 12), m[2])
+            Gfx.fillRect(x, ry, w, 16, C.panel)
+            Gfx.fillRect(x, ry, 3, 16, m[2])
+            Gfx.text(x + 8, ry + 5, fit(m[1], w - 12), m[2])
+        else
+            Gfx.fillRect(x, ry, w, 16, C.bg)
         end
     end
 end
 
+-- Header readouts. One region right of the ship name: a fresh status
+-- message takes it over for its 3 s, otherwise it shows ALT / SPD / MODE and
+-- a state chip. (These used to be separate, overlapping slots, so a long
+-- status line was cut through by the readouts: "STOPEAR DOWN".)
+local function drawHeader(s, status_msg)
+    local y = L.border + 7
+    local x0 = L.title_x + Font.textWidth(ship_label) + 12
+    local x1 = L.W - L.border - 6
+    Gfx.fillRect(x0, y, x1 - x0, Font.height, C.panel)
+    if status_msg ~= "" then
+        slotText(x0, y, x1 - x0, status_msg, C.title, "right", C.panel)
+        return
+    end
+    local parts = {
+        { string.format("ALT %.0f", s.altitude or 0), C.title },
+        { string.format("SPD %.1f", s.speed or 0), C.title },
+        { tostring(s.mode or ""), s.mode == "HOVER" and C.good or C.warn },
+    }
+    if s.estop then parts[#parts + 1] = { "E-STOP", C.bad }
+    elseif s.ap then parts[#parts + 1] = { "A/P", C.good }
+    elseif s.landed then parts[#parts + 1] = { "GND", C.good }
+    elseif s.auto_land then parts[#parts + 1] = { "LAND", C.warn } end
+    local tx = x1
+    for i = #parts, 1, -1 do
+        local str = parts[i][1]
+        local tw = Font.textWidth(str)
+        if tx - tw < x0 then break end
+        Gfx.text(tx - tw, y, str, parts[i][2])
+        tx = tx - tw - 12
+    end
+end
+
 local function drawDynamic(s, status_msg)
-    local x = L.content_x
-    local y = L.border + 6
-
     drawShutdownButton()
-
-    local hdr = status_msg or ""
-    if hdr == "" then hdr = s.mode or "" end
-    local hdr_x = L.W - L.border - 140
-    local hdr_w = 130
-    -- keep clear of power button on left / not overlap title
-    if hdr_x < L.border + 120 then
-        hdr_x = L.border + 120
-        hdr_w = L.W - L.border - hdr_x - 4
-    end
-    -- slotText fits to hdr_w itself (fit(hdr, 20) truncated to ~3 chars)
-    slotText(hdr_x, y, hdr_w, hdr, C.accent, "right")
-
-    local readout_x = L.border + 120
-    slotText(readout_x, y, 56, string.format("A%.0f", s.altitude or 0), C.text, "right")
-    slotText(readout_x + 60, y, 56, string.format("S%.0f", s.speed or 0), C.text, "right")
-    if s.estop then
-        slotText(readout_x + 120, y, 44, "STOP", C.bad, "right")
-    elseif s.landed then
-        slotText(readout_x + 120, y, 44, "GND", C.good, "right")
-    elseif s.auto_land then
-        slotText(readout_x + 120, y, 44, "LAND", C.warn, "right")
-    end
+    drawHeader(s, status_msg)
 
     if active_tab == "flight" then
         drawFlightDynamic(s)
@@ -1398,6 +1363,9 @@ local function hitTest(x, y)
         and inRect(boot_rect.x - 6, boot_rect.y - 9, boot_rect.w + 12, boot_rect.h + 18, x, y) then
         return "boot"
     end
+    -- Nothing else is on the splash. Without this a tap over the (hidden)
+    -- tab strip silently switched the tab the ship would boot into.
+    if splash_active then return nil end
 
     -- Shutdown is gated on the ring actually being DRAWN. On the splash/boot
     -- screens drawSplash never paints it, but the rect stayed hit-testable, so

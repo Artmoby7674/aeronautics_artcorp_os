@@ -104,11 +104,6 @@ function Kbd.onModemRaw(modem, channel, reply, message)
     Kbd.onMessage(sender, message, "raw")
 end
 
-function Kbd.available()
-    Kbd.openNet()
-    return Kbd.id ~= nil
-end
-
 -- fields: { { label, kind }, ... } with kind = "number" | "name".
 -- cb(values, err): values = { ... } on success, err on cancel/timeout.
 function Kbd.ask(fields, cb)
@@ -248,11 +243,6 @@ function Kbd.onMessage(sender, msg, protocol)
     else
         log("unknown op from #" .. tostring(sender) .. ": " .. tostring(msg.op))
     end
-end
-
-function Kbd.reset()
-    Kbd.id = nil
-    Kbd.pending = nil
 end
 
 return Kbd

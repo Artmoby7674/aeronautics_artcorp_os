@@ -622,6 +622,7 @@ do
                 -- NOTE: the handle's methods are invoked with the line as the
                 -- only argument (verified against lib/waypoints.lua).
                 writeLine = function(l) written = (written or "") .. tostring(l) .. "\n" end,
+                write = function(t) written = (written or "") .. tostring(t) end,
                 close = function() end,
             }
         end,
@@ -1761,6 +1762,51 @@ check("bank: the allocation grows with the error (bank is not faded out)",
 check("bank: the roll stabiliser is engaged (hull actually banks)",
     math.abs(oRoll) > math.abs(zRoll) and math.abs(oRoll) > 0.1,
     string.format("straight roll=%.3f  off-course roll=%.3f", zRoll, oRoll))
+
+-- 14. PHASE 2 -> 3 HANDOVER: ALTITUDE BEFORE SPEED.
+--     Reported in-game: the ship dropped out of the air going from step 2
+--     (rotate) to step 3 (fast travel). This plant has no rear-thrust pitch
+--     torque, so it cannot reproduce the sink itself; what is pinned here is
+--     the protection. (a) The rear must not keep spooling up while the ship is
+--     sinking below its goal, and must back off when it is well below. (b) The
+--     autopilot's own HOVER -> CRUISE switch keeps the altitude PID trim.
+do
+    local function cruiseAt(alt_below, climb)
+        local env = makeEnv({ alt0 = 260 })
+        local f = env.flight
+        f:startAutopilot{ name = "FAR", x = 0, z = 3000, heading = 0, alt = 260 }
+        local ap = f.ap
+        ap.phase, ap.step, ap.needs_climb, ap.alt = "cruise", "turn", false, 260
+        f:setMode(Flight.MODE_CRUISE, true)
+        f.targets.speed = 5
+        env.state.altitude = 260 - alt_below
+        env.state.position.y = env.state.altitude
+        env.state.climb_rate = climb
+        f:updateAutopilot(DT)
+        return f.targets.speed
+    end
+    check("handover: rear keeps spooling while the height holds",
+        cruiseAt(0, 0) > 5, string.format("rear=%.2f", cruiseAt(0, 0)))
+    check("handover: rear holds while sinking below the goal",
+        cruiseAt(4, -2) == 5, string.format("rear=%.2f", cruiseAt(4, -2)))
+    check("handover: rear backs off to level 1 when well below and sinking",
+        cruiseAt(10, -3) <= 1, string.format("rear=%.2f", cruiseAt(10, -3)))
+    check("handover: below the goal but climbing back is not blocked",
+        cruiseAt(4, 1) > 5, string.format("rear=%.2f", cruiseAt(4, 1)))
+
+    local env = makeEnv({ alt0 = 260 })
+    local f = env.flight
+    f.pid.altitude.integral = 1.7
+    f.targets.altitude = 261
+    f:setMode(Flight.MODE_CRUISE, true)
+    check("handover: autopilot mode switch keeps the altitude trim",
+        f.pid.altitude.integral == 1.7 and f.targets.altitude == 261,
+        string.format("integral=%s target=%s", tostring(f.pid.altitude.integral),
+            tostring(f.targets.altitude)))
+    f:setMode(Flight.MODE_HOVER)
+    check("handover: a manual mode switch still resets it",
+        f.pid.altitude.integral == 0, tostring(f.pid.altitude.integral))
+end
 
 print(string.format("ap_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("ap_test FAILED", 0) end

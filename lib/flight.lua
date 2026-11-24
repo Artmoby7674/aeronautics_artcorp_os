@@ -106,7 +106,28 @@ local LAND_FA_PERIOD = 0.6  -- s pulse window for fore/aft corrections
 local LAND_FA_DUTY = 0.5    -- max on-time fraction: corrections stay brief
 local LAND_FA_FULL = 2.5    -- m/s excess velocity to reach max duty
 local LAND_FA_SIGN = 1      -- flip if the rear push amplifies drift
-local LAND_ALT_ERR_SHUTDOWN = 20 -- m goal-below-ship error: stop + OS shutdown
+-- Descent profile. The sensor only sees max_blocks (~15) down, so the ship
+-- must be able to stop inside that: speed is capped by a v^2 braking curve on
+-- the sensed height (v = sqrt(2 * LAND_DECEL * h)) and by max_descent_rate,
+-- never by land_descent_rate alone (12 m/s cannot be stopped in 15 blocks).
+local LAND_DECEL = 1.2       -- m/s^2 braking budget inside sensor range
+local LAND_TOUCH_RATE = 0.8  -- m/s final creep onto the ground
+local LAND_SINK_ACCEL = 1.0  -- m/s^2: sink rate ramps IN this gently (a
+                             -- 0 -> 5 m/s step cut the props to ~0 for a
+                             -- second: no attitude authority, the wobble)
+local LAND_RATE_GAIN = 1.0   -- extra prop units per m/s of sink-rate error
+                             -- (on top of the PID's kd; kd alone lagged ~1 m/s)
+-- The goal is not walked down any more: it is re-placed every tick exactly
+-- kd/kp * rate below the ship, which turns the altitude PID (D on climb rate)
+-- into a descent-RATE controller; LAND_RATE_GAIN stiffens it to
+--     out = (kd + LAND_RATE_GAIN) * (sink - rate).   The old walking
+-- goal ran away below the ship (12 m/s goal vs a ~5 m/s ship), saturated the
+-- PID, dropped the props to ~0 (no attitude authority: the wobble) and then
+-- tripped the runaway shutdown mid-air, or hit the ground at 12 m/s.
+-- Ground contact the sensor cannot confirm (it never reaches 15, e.g. on a
+-- slab): goal below the ship and no vertical motion for this long = landed.
+local LAND_STALL_RATE = 0.25 -- m/s
+local LAND_STALL_T = 2.5     -- s, with the sensor seeing ground
 
 -- ============================================================
 -- Waypoint AUTOPILOT (ACTIONS -> AUTOPILOT / >>> in WP popup).
@@ -147,6 +168,16 @@ local AP_ARRIVE_R = 4       -- m: reached the waypoint XZ position
 local AP_BRAKE_R = 12       -- m: leave cruise / start braking here (anti-overshoot)
 local AP_ALIGN_TOL = 2      -- deg: aligned to wp.heading before auto-land
 local AP_STOP_SPEED = 0.6   -- m/s: considered stationary
+-- ALTITUDE BEFORE SPEED (rear thruster gate, travel legs). Cruise sits at the
+-- discovered ceiling, i.e. where the lift props already need ~13 of 15, and
+-- the stabiliser is reduce-only: every pitch correction against the rear
+-- push is paid for in lift. Spooling the rear 1 -> 15 at the phase 2 -> 3
+-- handover could therefore start a sink that the push kept feeding ("drops
+-- out of the air going from step 2 to 3"). So the rear only grows while the
+-- ship is holding its height, and backs off to the minimum if it is losing it.
+local AP_REAR_SINK = 1.0     -- m/s: sinking faster than this blocks rear spool-up
+local AP_REAR_HOLD_BELOW = 2 -- m: ... when also this far below the goal
+local AP_REAR_CUT_BELOW = 6  -- m: this far below while sinking -> rear to level 1
 local AP_LEVEL_PER = 5      -- m of distance per rear speed level (taper)
 local AP_MAX_LEVEL = 15
 local AP_YAW_SIGN = 1       -- aim/align yaw_cmd sign: +1 maps a left bearing to
@@ -518,7 +549,7 @@ function Flight.new(config, hardware)
         speed = 0, -- rear speed level: 0 = off, cruise 1..15 (W/S steps it)
     }
 
-    self.estop = false        -- latched by X until reset (R / altitude / mode)
+    self.estop = false        -- latched by E-STOP; cleared by Space/Ctrl, a mode change or reboot
 
     -- One-shot: on the next update() (i.e. the first tick after the boot
     -- sequence powers on), re-capture the altitude goal from freshly read
@@ -590,6 +621,9 @@ function Flight.new(config, hardware)
     self._ground_ticks = 0 -- consecutive landed_thr hits (debounced latch)
     self.shift_level = 0
     self.shift_armed = true -- allow next toggle after release
+    self.off_level = 0      -- OFF button (engine relay) rising-edge latch
+    self.off_armed = false  -- armed only after a released reading, so a
+                            -- button held through boot cannot fire at once
 
     self.last_update = os.clock()
     self.update_count = 0
@@ -628,7 +662,12 @@ function Flight:resyncAltitudeTarget()
     if ap then ap:reset() end
 end
 
-function Flight:setMode(mode)
+-- keep_alt: the autopilot switching HOVER<->CRUISE between its own legs.
+-- The altitude goal and the altitude PID (its integral is the learned lift
+-- trim at this height) carry straight across; both modes feed the PID into
+-- the same lift formula, so wiping it only made the collective step at the
+-- handover. Manual switches still reset everything.
+function Flight:setMode(mode, keep_alt)
     if mode == self.mode then return false end
 
     local old_mode = self.mode
@@ -639,11 +678,13 @@ function Flight:setMode(mode)
     -- OWNS the mode and switches HOVER<->CRUISE itself; a manual mode
     -- change while autopilot is active is blocked upstream in os_main.
 
-    for _, pid in pairs(self.pid) do
-        pid:reset()
+    for name, pid in pairs(self.pid) do
+        if not (keep_alt and name == "altitude") then pid:reset() end
     end
 
-    self.targets.altitude = self.state.altitude
+    if not keep_alt then
+        self.targets.altitude = self.state.altitude
+    end
     if mode == Flight.MODE_CRUISE then
         -- Rear props come up at speed level 1 (cruise minimum, signal 14);
         -- W/S steps the goal bar. Hover puts them back to level 0 (signal 15).
@@ -1160,7 +1201,7 @@ function Flight:updateAutopilot(dt)
         ap.stop_hold = 0
         ap.brake_reverse = false
         self.targets.speed = 0
-        if self.mode ~= Flight.MODE_HOVER then self:setMode(Flight.MODE_HOVER) end
+        if self.mode ~= Flight.MODE_HOVER then self:setMode(Flight.MODE_HOVER, true) end
     end
     -- Rear props spool at limits.cruise_ramp (level/s) instead of jumping to
     -- the target: an instant 0->15 kick at cruise entry pitches the nose over
@@ -1168,8 +1209,16 @@ function Flight:updateAutopilot(dt)
     -- RISES are ramped — braking/crawl drops stay instant.
     local function rearRamp(want)
         local cur = self.targets.speed or 0
-        if want > cur then
-            want = math.min(want, cur + (limits.cruise_ramp or 8) * dt)
+        local below = (ap.alt or state.altitude) - state.altitude
+        local sinking = (state.climb_rate or 0) < -AP_REAR_SINK
+        if sinking and below > AP_REAR_CUT_BELOW then
+            want = math.min(want, 1) -- losing the height: stop pushing
+        elseif want > cur then
+            if sinking and below > AP_REAR_HOLD_BELOW then
+                want = cur -- hold the push until the height is back
+            else
+                want = math.min(want, cur + (limits.cruise_ramp or 8) * dt)
+            end
         end
         self.targets.speed = want
     end
@@ -1191,7 +1240,7 @@ function Flight:updateAutopilot(dt)
     -- detour) and the braking curve v^2 <= 2*a*room handles arrival.
     if ap.hover_only and (ap.phase == "cruise" or ap.phase == "correct"
         or ap.phase == "arrive") then
-        if self.mode ~= Flight.MODE_HOVER then self:setMode(Flight.MODE_HOVER) end
+        if self.mode ~= Flight.MODE_HOVER then self:setMode(Flight.MODE_HOVER, true) end
         self.targets.speed = 0
         self.targets.altitude = ap.alt
         self.targets.yaw_cmd = clamp(
@@ -1223,7 +1272,7 @@ function Flight:updateAutopilot(dt)
     if ap.phase == "aim" then
         -- HOVER, two steps — CLIMB FIRST (always, even for short hops), then
         -- TURN onto the bearing. Cruise only once both are done.
-        if self.mode ~= Flight.MODE_HOVER then self:setMode(Flight.MODE_HOVER) end
+        if self.mode ~= Flight.MODE_HOVER then self:setMode(Flight.MODE_HOVER, true) end
 
         -- CEILING PROBE, every phase, every tick. It has to run here rather
         -- than inside the climb step: the climb finishes as soon as the ship is
@@ -1398,7 +1447,7 @@ function Flight:updateAutopilot(dt)
                     -- short hop: the travel legs stay in HOVER (rear never on)
                     self.targets.speed = 0
                 else
-                    self:setMode(Flight.MODE_CRUISE) -- freezes altitude at current
+                    self:setMode(Flight.MODE_CRUISE, true) -- altitude goal + trim carry over
                     rearRamp(AP_MAX_LEVEL) -- spool at cruise_ramp (no kick-dive)
                 end
                 setPhase("cruise")
@@ -1408,7 +1457,7 @@ function Flight:updateAutopilot(dt)
     elseif ap.phase == "cruise" then
         -- CRUISE: bank-to-turn heading hold + rear taper (anti-overshoot).
         if self.mode ~= Flight.MODE_CRUISE then
-            self:setMode(Flight.MODE_CRUISE)
+            self:setMode(Flight.MODE_CRUISE, true)
             rearRamp(AP_MAX_LEVEL) -- spool at cruise_ramp (no kick-dive)
         end
         self.targets.yaw_cmd = 0
@@ -1455,7 +1504,7 @@ function Flight:updateAutopilot(dt)
     elseif ap.phase == "correct" then
         -- Off-course: stay in cruise, reverse-brake to ~AP_CORRECT_SPEED,
         -- bank back onto the bearing, then re-accelerate.
-        if self.mode ~= Flight.MODE_CRUISE then self:setMode(Flight.MODE_CRUISE) end
+        if self.mode ~= Flight.MODE_CRUISE then self:setMode(Flight.MODE_CRUISE, true) end
         self.targets.yaw_cmd = 0
         self.targets.altitude = ap.alt
         local slow = speed <= AP_CORRECT_SPEED
@@ -1495,7 +1544,7 @@ function Flight:updateAutopilot(dt)
 
     elseif ap.phase == "arrive" then
         -- CRUISE: brake down onto the waypoint XZ (anti-overshoot).
-        if self.mode ~= Flight.MODE_CRUISE then self:setMode(Flight.MODE_CRUISE) end
+        if self.mode ~= Flight.MODE_CRUISE then self:setMode(Flight.MODE_CRUISE, true) end
         self.targets.yaw_cmd = 0
         self.targets.altitude = ap.alt
         local room = math.max(dist - AP_ARRIVE_R, 0)
@@ -1509,13 +1558,13 @@ function Flight:updateAutopilot(dt)
         if (dist <= AP_ARRIVE_R and speed <= AP_STOP_SPEED) or timedOut() then
             ap.brake_reverse = false
             self.targets.speed = 0
-            self:setMode(Flight.MODE_HOVER)
+            self:setMode(Flight.MODE_HOVER, true)
             setPhase("align")
         end
 
     elseif ap.phase == "align" then
         -- HOVER: rotate onto the stored heading (<= AP_ALIGN_TOL).
-        if self.mode ~= Flight.MODE_HOVER then self:setMode(Flight.MODE_HOVER) end
+        if self.mode ~= Flight.MODE_HOVER then self:setMode(Flight.MODE_HOVER, true) end
         self.targets.speed = 0
         local herr = angleError(ap.heading, state.yaw or 0)
         -- Manual Q/E assist allowed here too (above the waypoint: turning
@@ -1570,29 +1619,43 @@ function Flight:updateState()
     self.state.yaw_rate = rateDps(self.state.angularVelocity.y)
     self.state.roll_rate = rateDps(self.state.angularVelocity.x)
     self.yaw_rate_dps = self.state.yaw_rate
-    if state.sable_error then
-        self.last_sable_error = state.sable_error
-    end
+    -- current, not sticky: one failed read must not alarm forever
+    self.last_sable_error = state.sable_error
     return state
 end
 
--- Sample attitude + outputs to stab_log.txt (0.5 s) while banked or pitched.
+-- Optional calibration log: samples attitude + outputs to stab_log.txt every
+-- 0.5 s while banked or pitched (README: yaw-coupling calibration).
+--
+-- OFF by default and size-capped. It used to run unconditionally and grew
+-- ~200 B/s whenever the hull was off level -- an autopilot leg is one long
+-- bank -- until it filled the computer's 1 MB disk. A full disk silently
+-- breaks every other write (waypoints, keyboard pairing, assignments).
+-- Enable per ship with `debug = { stab_log = true }` in the config.
+local STAB_LOG_PATH = "stab_log.txt"
+local STAB_LOG_MAX = 64 * 1024 -- bytes; logging stops once the file is this big
+
 function Flight:debugAttitude(dt)
+    local dbg = self.config.debug
+    if not (dbg and dbg.stab_log) or self._dbg_full then return end
     self._dbg_t = (self._dbg_t or 0) + dt
     if self._dbg_t < 0.5 then return end
     self._dbg_t = 0
     local st = self.state
     if math.abs(st.roll or 0) < 1 and math.abs(st.pitch or 0) < 1 then return end
     pcall(function()
-        local f = fs.open("stab_log.txt", "a")
+        if fs.exists(STAB_LOG_PATH) and fs.getSize(STAB_LOG_PATH) >= STAB_LOG_MAX then
+            self._dbg_full = true
+            print("[stab_log] reached " .. STAB_LOG_MAX .. " bytes - logging stopped")
+            return
+        end
+        local f = fs.open(STAB_LOG_PATH, "a")
         if not f then return end
-        local o = self.outputs or {}
+        local o = self.outputs
         f.writeLine(string.format(
-            "t=%.1f pitch=%.1f roll=%.1f base=%s FL=%s FR=%s RL=%s RR=%s rear=%s/%s",
-            os.clock(), st.pitch or 0, st.roll or 0,
-            tostring(o.speed),
-            tostring(o.FL_speed), tostring(o.FR_speed),
-            tostring(o.RL_speed), tostring(o.RR_speed),
+            "t=%.1f pitch=%.1f roll=%.1f base=%.1f FL=%.1f FR=%.1f RL=%.1f RR=%.1f rear=%s/%s",
+            os.clock(), st.pitch or 0, st.roll or 0, o.speed or 0,
+            o.FL_speed or 0, o.FR_speed or 0, o.RL_speed or 0, o.RR_speed or 0,
             tostring(o.rear_fw), tostring(o.rear_bw)))
         f.close()
     end)
@@ -1686,17 +1749,14 @@ end
 --  - Returns prop yaw tilt (-tilt_max..tilt_max); rear thrusters are not
 --    steered anymore (single W/S speed level only)
 function Flight:rotationControl(dt, yaw_stick, tilt_max)
-    local state = self.state
     local rate = self.yaw_rate_dps
-    local yaw_tilt = 0
-
     if math.abs(yaw_stick) > 0.05 then
         -- Rate command while stick held (deg/s), damp toward that rate
         local rate_target = yaw_stick * 35
         local rate_err = rate_target - rate
         local damp = clamp(rate_err / 45, -1, 1) * tilt_max * 0.4
         local direct = yaw_stick * tilt_max * 0.6
-        yaw_tilt = clamp(direct + damp, -tilt_max, tilt_max)
+        local yaw_tilt = clamp(direct + damp, -tilt_max, tilt_max)
 
         -- Keep hold target tracking so release does not snap
         if not self.heading_valid then
@@ -1707,31 +1767,14 @@ function Flight:rotationControl(dt, yaw_stick, tilt_max)
         return yaw_tilt
     end
 
-    -- Hands-off: no prop-tilt stabilisation (tilt is piloting-only for now;
-    -- heading autopilot via tilt may come later).
+    -- Hands-off: no prop-tilt heading hold (tilt is piloting-only for now;
+    -- heading hold via tilt may come later). The hold target stays captured
+    -- so the autopilot and the next stick input start from a valid heading.
+    -- (A yaw PID used to be evaluated here and its output thrown away.)
     if not self.heading_valid then
         self:captureHeading()
     end
-
-    local err = angleError(self.targets.yaw, state.yaw)
-    local pid = self.pid.yaw
-
-    local p = pid.kp * err
-    pid.integral = clamp(pid.integral + err * dt, -pid.integral_limit, pid.integral_limit)
-    local i = pid.ki * pid.integral
-    -- Damp absolute rotation (positive yaw rate = turning left/increasing yaw)
-    local d = -pid.kd * rate
-
-    yaw_tilt = 0
-    local out = clamp(p + i + d, -pid.output_limit, pid.output_limit)
-
-    -- Deadband: avoid micro-wiggle when nearly on heading and still
-    if math.abs(err) < 0.35 and math.abs(rate) < 1.5 then
-        yaw_tilt = 0
-        pid.integral = pid.integral * 0.9
-    end
-
-    return yaw_tilt
+    return 0
 end
 
 function Flight:update()
@@ -1799,8 +1842,8 @@ function Flight:update()
         self._ground_ticks = 0
         if self.landed and self.proximity < (landed_thr - 1) and self.targets.altitude > self.state.altitude + 1 then
             -- climbing away
-    self.landed = false
-    self.land_position = nil -- world coords recorded at touchdown
+            self.landed = false
+            self.land_position = nil -- world coords recorded at touchdown
             if self.land_state == Flight.LAND_DONE or self.land_state == Flight.LAND_TOUCH then
                 self.land_state = Flight.LAND_IDLE
                 self.auto_land = false
@@ -1882,8 +1925,15 @@ function Flight:landingAssist(dt)
     local state = self.state
     local vel = state.velocity or { x = 0, y = 0, z = 0 }
     local fwd = state.forward or { x = 0, y = 0, z = 0 }
-    local fwd_vel = (vel.x * fwd.x + vel.y * fwd.y + vel.z * fwd.z)
-        * LAND_FA_SIGN
+    -- HORIZONTAL nose axis only: with the full 3-D nose vector a few degrees
+    -- of pitch projected the descent speed onto "fore/aft", so every pitch
+    -- swing fired a rear pulse whose torque drove the next swing (wobble).
+    local fx, fz = fwd.x or 0, fwd.z or 0
+    local fn = math.sqrt(fx * fx + fz * fz)
+    local fwd_vel = 0
+    if fn > 1e-3 then
+        fwd_vel = ((vel.x or 0) * fx + (vel.z or 0) * fz) / fn * LAND_FA_SIGN
+    end
     -- Gentle pulsed corrections: strength is a coarse number, so trim with
     -- time instead — short bursts on a fixed window whose duty grows with
     -- the excess velocity but never exceeds LAND_FA_DUTY (split-second
@@ -1926,8 +1976,9 @@ function Flight:updateAutoLand(dt)
             self.land_state = Flight.LAND_TOUCH
         elseif armed_ready then
             self.land_state = Flight.LAND_DESCEND
-            -- start slightly above current and walk target down
             self.targets.altitude = self.state.altitude
+            self.land_rate = nil   -- descent rate ramps in from the current sink
+            self._land_stall = 0
         end
         -- else: gear still settling, stay ARMED until it finishes
     end
@@ -1940,30 +1991,49 @@ function Flight:updateAutoLand(dt)
     end
 
     if self.land_state == Flight.LAND_DESCEND then
-        -- Runaway-goal safety: the goal kept walking down after the ship
-        -- stopped (ground latch never fired). Freeze the goal and ask
-        -- os_main for a full shutdown (clutch decouple + splash). The
-        -- climb-rate guard keeps a mid-air catch-up (fast fall, big error)
-        -- from tripping it.
-        local alt_err = self.state.altitude - self.targets.altitude
-        if alt_err > LAND_ALT_ERR_SHUTDOWN
-            and (self.state.climb_rate or 0) > -3 then
-            self.targets.altitude = self.state.altitude
-            if not self.shutdown_request then
-                self.shutdown_request =
-                    string.format("land alt error %.0f m", alt_err)
-            end
-        end
-
-        local rate = (self.config.limits and self.config.limits.land_descent_rate) or 12.0
-        local land_thr = (self.config.proximity or {}).landed_threshold or 15
-        -- Freeze the walking target once the sensor says touchdown range:
-        -- the debounced ground-contact latch below finishes the landing.
+        local limits = self.config.limits or {}
+        local prox_cfg = self.config.proximity or {}
+        local land_thr = prox_cfg.landed_threshold or 15
+        local rate = math.min(limits.land_descent_rate or 12.0,
+            limits.max_descent_rate or 5)
+        -- Sensed height above ground (sensor reads high = close); out of
+        -- range counts as the full range. The reading is whole blocks, so
+        -- take the LOW end of the block it reports (one block conservative).
+        local h = (prox_cfg.max_blocks or 15) - self.proximity - 1
+        if self.proximity <= 0 then h = prox_cfg.max_blocks or 15 end
+        rate = clamp(math.sqrt(2 * LAND_DECEL * math.max(h, 0)),
+            LAND_TOUCH_RATE, math.max(rate, LAND_TOUCH_RATE))
+        -- Speed-up is ramped from the current sink; slowing down is not
+        -- (the braking curve already shapes it).
+        local prev = self.land_rate
+        if prev == nil then prev = math.max(-(self.state.climb_rate or 0), 0) end
+        rate = math.min(rate, prev + LAND_SINK_ACCEL * dt)
+        self.land_rate = rate
+        -- Freeze the goal once the sensor says touchdown range: the
+        -- debounced ground-contact latch finishes the landing.
         if self.proximity < land_thr and not self.shutdown_request then
-            self.targets.altitude = self.targets.altitude - rate * dt
-            if self.targets.altitude < 0 then
-                self.targets.altitude = 0
-            end
+            local pa = self.pid.altitude
+            local sink = -(self.state.climb_rate or 0)
+            local lead = ((pa.kd or 0.7) * rate
+                - LAND_RATE_GAIN * (sink - rate)) / math.max(pa.kp or 0.35, 1e-3)
+            self.targets.altitude = math.max(self.state.altitude - lead, 0)
+        end
+        -- Stall = supported by something the sensor does not read as 15
+        -- (replaces the old "goal ran 20 m below the ship" shutdown: the goal
+        -- can no longer run away, and a ship sitting on a slab is landed, not
+        -- broken). Not moving while the rate law asks for a sink is only
+        -- possible when resting on something; with the sensor blind, wait
+        -- longer before believing it.
+        local stalled = math.abs(self.state.climb_rate or 0) < LAND_STALL_RATE
+            and self.targets.altitude < self.state.altitude - 1
+        local need = LAND_STALL_T
+        if self.proximity < (prox_cfg.gear_deploy_threshold or 1) then
+            need = LAND_STALL_T * 3
+        end
+        self._land_stall = stalled and ((self._land_stall or 0) + dt) or 0
+        if self._land_stall >= need then
+            self._land_stall = 0
+            self.land_state = Flight.LAND_TOUCH
         end
         self:landingAssist(dt)
         if not self.heading_valid then

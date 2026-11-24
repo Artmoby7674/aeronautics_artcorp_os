@@ -8,54 +8,8 @@ local devices = {}
 -- the whole control loop. Invalidated whenever devices are re-wrapped.
 local out_cache = {}
 
-function Hardware.invalidateOutputs()
-    out_cache = {}
-end
-
 function Hardware.init(cfg)
     config = cfg
-end
-
-function Hardware.scan()
-    local found = {}
-
-    local modem = peripheral.find("modem", function(name, m)
-        return not m.isWireless()
-    end)
-    if modem then
-        local names = modem.getNamesRemote()
-        for _, name in ipairs(names) do
-            local devType = modem.getTypeRemote(name)
-            table.insert(found, { name = name, type = devType, via = "wired" })
-        end
-    end
-
-    local wireless = peripheral.find("modem", function(name, m)
-        return m.isWireless()
-    end)
-    if wireless then
-        local types_to_find = { "monitor", "speaker" }
-        for _, ptype in ipairs(types_to_find) do
-            local dev = peripheral.find(ptype)
-            if dev then
-                local wname = peripheral.getName(dev)
-                if wname then
-                    local already = false
-                    for _, d in ipairs(found) do
-                        if d.name == wname then already = true break end
-                    end
-                    if not already then
-                        table.insert(found, { name = wname, type = ptype, via = "wireless" })
-                    end
-                end
-            end
-        end
-    end
-
-    if #found == 0 then
-        return nil, "No peripherals found (wired or wireless)"
-    end
-    return found
 end
 
 function Hardware.connect()
@@ -95,26 +49,34 @@ local function engineCfg()
     return config and config.engine or nil
 end
 
+-- Cached analog write: these engine pins are re-asserted every tick while
+-- booting / on the splash, so only touch the peripheral when the value moves.
+local function writePin(relayKey, relay, side, value)
+    local cache_key = relayKey .. ":" .. side
+    if out_cache[cache_key] == value then return true end
+    local ok = pcall(relay.setAnalogOutput, side, value)
+    if ok then out_cache[cache_key] = value end
+    return ok
+end
+
 function Hardware.setEngineStarter(active)
     local e = engineCfg()
     if not e or not Hardware.hasFeature("engine_auto_start") then return false end
-    local relay = devices[e.relay_key or "engine_relay"]
+    local key = e.relay_key or "engine_relay"
+    local relay = devices[key]
     if not relay then return false end
     local value = active and (e.active or 15) or (e.inactive or 0)
-    return pcall(function()
-        relay.setAnalogOutput(e.start_side or "left", value)
-    end)
+    return writePin(key, relay, e.start_side or "left", value)
 end
 
 function Hardware.setClutch(engaged)
     local e = engineCfg()
     if not e or not Hardware.hasFeature("clutch") then return false end
-    local relay = devices[e.relay_key or "engine_relay"]
+    local key = e.relay_key or "engine_relay"
+    local relay = devices[key]
     if not relay then return false end
     local value = engaged and (e.active or 15) or (e.inactive or 0)
-    return pcall(function()
-        relay.setAnalogOutput(e.clutch_side or "right", value)
-    end)
+    return writePin(key, relay, e.clutch_side or "right", value)
 end
 
 function Hardware.engineOutputsOff()
@@ -136,11 +98,6 @@ function Hardware.readInputs()
         end
     end
     return keys
-end
-
-function Hardware.isKeyPressed(key)
-    local keys = Hardware.readInputs()
-    return (keys[key] or 0) > 0
 end
 
 function Hardware.getProximity()
@@ -273,18 +230,6 @@ function Hardware.setAllSpeed(value)
     end
 end
 
-function Hardware.setAllTilt(value)
-    for _, prop in ipairs({"FL", "FR", "RL", "RR"}) do
-        if value >= 0 then
-            Hardware.setPropellerOutput(prop, "tilt_fwd", value)
-            Hardware.setPropellerOutput(prop, "tilt_bwd", 0)
-        else
-            Hardware.setPropellerOutput(prop, "tilt_fwd", 0)
-            Hardware.setPropellerOutput(prop, "tilt_bwd", math.abs(value))
-        end
-    end
-end
-
 -- Body frame (Create/Sable): +X east, +Y up, +Z south.
 -- Ship local X = LONGITUDINAL axis (craft built pointing east); local Z = right.
 -- toEuler docs say (pitch, yaw, roll), but its YXZ decomposition against this
@@ -412,19 +357,6 @@ function Hardware.getShipState()
     end
 
     return state
-end
-
-function Hardware.hasSable()
-    return type(sublevel) == "table" and type(sublevel.getLogicalPose) == "function"
-end
-
-function Hardware.playNote(instrument, volume, pitch)
-    local spk = devices.speaker
-    if spk then
-        pcall(function()
-            spk.playNote(instrument, volume or 1, pitch or 1)
-        end)
-    end
 end
 
 return Hardware

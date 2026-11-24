@@ -52,11 +52,6 @@ function Rec.duration()
     return samples[#samples][1]
 end
 
-function Rec.clear()
-    active = false
-    samples = {}
-end
-
 -- Called from the control tick while recording.
 function Rec.tick(now, pos)
     if not active then return end

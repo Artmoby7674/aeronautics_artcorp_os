@@ -28,18 +28,6 @@ local Gfx = {
     _old = nil,
 }
 
-function Gfx.cindex(cc)
-    if not cc or cc <= 0 then return 0 end
-    local i = 0
-    local v = cc
-    while v > 1 do
-        v = math.floor(v / 2)
-        i = i + 1
-    end
-    if i > 15 then i = 15 end
-    return i
-end
-
 local function textSize(obj)
     local ok1, tw, th = pcall(function() return obj.getSize() end)
     local ok2, w2, h2 = pcall(function() return obj.getSize(2) end)
@@ -97,9 +85,6 @@ function Gfx.init(mon, textScale)
             Gfx._path = "direct"
             Gfx.supported = true
             Gfx.W, Gfx.H = textSize(mon)
-            if Gfx.W == 0 then
-                Gfx.W, Gfx.H = textSize(mon)
-            end
             return true
         end
     end
@@ -173,23 +158,13 @@ function Gfx.fillRect(x, y, w, h, color)
     call("drawPixels", cx, cy, color, cw, ch)
 end
 
-function Gfx.blit(x, y, rows)
-    if not rows or #rows == 0 then return end
-    if x >= Gfx.W or y >= Gfx.H then return end
-    if y + #rows <= 0 then return end
-    call("drawPixels", x, y, rows)
-end
-
 function Gfx.text(x, y, str, color, bg)
     str = tostring(str or "")
     if str == "" then return end
     if not Gfx.supported then return end
     if y + Font.height <= 0 or y >= Gfx.H then return end
     if x >= Gfx.W then return end
-    if x < 0 or y < 0 then
-        -- shift for negative origin: only support x>=0 fully; trim string for x>=0
-        if x < 0 then return end
-    end
+    if x < 0 then return end -- glyph rows are not clipped on the left
     str = Font.fit(str, Gfx.W - x)
     if str == "" then return end
     local rows = Font.render(str, color or 0, bg)
@@ -219,19 +194,6 @@ end
 
 function Gfx.textWidth(str)
     return Font.textWidth(str)
-end
-
-function Gfx.snapshot(x, y, w, h)
-    local ok, res = pcall(function() return call("getPixels", x, y, w, h, true) end)
-    if ok and res then return res end
-    local ok2, res2 = pcall(function() return call("getPixels", x, y, w, h) end)
-    if ok2 and res2 then return res2 end
-    return nil
-end
-
-function Gfx.restore(x, y, data)
-    if not data then return end
-    call("drawPixels", x, y, data)
 end
 
 function Gfx.setPaletteColor(idx, r, g, b)

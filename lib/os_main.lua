@@ -116,9 +116,6 @@ function OS.start(cfg, hardware)
     end
 
     flight:setMode(Flight.MODE_HOVER)
-    if not hasFeature("cruise_mode") then
-        flight:setMode(Flight.MODE_HOVER)
-    end
     flight.proximity = hw.getProximity() or 0
     flight.landed = flight.proximity >= ((config.proximity and config.proximity.landed_threshold) or 15)
     flight:cutPropsSoft()
@@ -210,12 +207,12 @@ function OS.start(cfg, hardware)
         (feats.auto_land and " auto-land" or "") ..
         (feats.cruise_mode and " cruise" or "") ..
         (feats.fuel_level and " fuel" or ""))
-    print("Power: OFF (splash) — tap boot to start sequence")
+    print("Power: OFF (splash) - tap boot (or Space/Enter) to start")
     print("")
     print("Controls (when ON):")
     print("  W/S - Tilt collective (translation)")
     print("  Q/E - Yaw left/right")
-    print("  Space/Ctrl - Altitude target +/−")
+    print("  Space/Ctrl - Altitude target +/-")
     if hasFeature("cruise_mode") then
         print("  Shift redstone - Hover <-> Cruise")
         print("  Cruise: W/S rear goal bar 0-15 (step +/-1, hold repeats), Space/Ctrl altitude")
@@ -340,9 +337,6 @@ function OS.bootTick()
     local t = os.clock() - boot_started
     local start_s = eng.start_seconds or 3
     local clutch_at = start_s + (eng.clutch_delay or 1)
-    local active = eng.active or 15
-    local _ = active
-
     if t < start_s then
         if not OS._starter_on then
             OS._starter_on = true
@@ -379,6 +373,12 @@ function OS.controlTick()
 
     if power_state == "booting" then
         OS.bootTick()
+        -- Boot completes HERE, not in the display path: updateDisplay returns
+        -- early with no monitor attached, which used to leave a monitor-less
+        -- ship stuck in "booting" forever.
+        if os.clock() - boot_started >= BOOT_DURATION then
+            OS.finishBoot()
+        end
         return
     end
 
@@ -423,19 +423,9 @@ function OS.controlTick()
     local up_d = (keys.UP or 0) > 0
     local dn_d = (keys.DOWN or 0) > 0
     if up_d and not OS._tab_edge.up then
-        local hud = loadLib("lib.hud")
-        local id = hud.prevTab() -- tab strip is top-down: up = earlier tab
-        if id then
-            status_message = "Tab: " .. tostring(id):upper()
-            status_time = os.clock()
-        end
+        loadLib("lib.hud").prevTab() -- tab strip is top-down: up = earlier tab
     elseif dn_d and not OS._tab_edge.down then
-        local hud = loadLib("lib.hud")
-        local id = hud.nextTab() -- down = later tab
-        if id then
-            status_message = "Tab: " .. tostring(id):upper()
-            status_time = os.clock()
-        end
+        loadLib("lib.hud").nextTab() -- down = later tab
     end
     OS._tab_edge.up = up_d
     OS._tab_edge.down = dn_d
@@ -639,6 +629,12 @@ function OS.findPrinter()
         if pr and type(pr.newPage) ~= "function" then pr = nil end
     end
     if not pr then
+        -- No printer: this runs on every HUD frame (10 Hz), so do not rescan
+        -- the whole network each time - once every 5 s is plenty.
+        if OS._printer_scan and os.clock() - OS._printer_scan < 5 then
+            return nil
+        end
+        OS._printer_scan = os.clock()
         pr = peripheral.find("printer")
     end
     OS._printer_cache = pr
@@ -713,10 +709,10 @@ function OS.doNav(op)
                 status_time = os.clock()
                 return
             end
-            local n, aerr = WP.add({ name = name, x = x, z = z,
+            local n = WP.add({ name = name, x = x, z = z,
                 heading = heading })
             if not n then
-                status_message = "WP SAVE FAILED"
+                status_message = "WP SAVE FAILED (DISK FULL?)"
                 status_time = os.clock()
                 return
             end
@@ -766,9 +762,9 @@ function OS.doNav(op)
                 status_time = os.clock()
                 return
             end
-            local n, aerr = WP.add({ name = name, x = x, z = z, heading = h })
+            local n = WP.add({ name = name, x = x, z = z, heading = h })
             if not n then
-                status_message = "WP SAVE FAILED"
+                status_message = "WP SAVE FAILED (DISK FULL?)"
                 status_time = os.clock()
                 return
             end
@@ -809,7 +805,11 @@ function OS.doWp(op)
         local wp = i and WP.list[i]
         if not wp then return end
         local name = wp.name
-        WP.remove(i)
+        if not WP.remove(i) then
+            status_message = "WP DELETE FAILED (DISK FULL?)"
+            status_time = os.clock()
+            return
+        end
         local hud = loadLib("lib.hud")
         hud.setWaypoints(WP.list)
         hud.wpAfterDelete()
@@ -844,11 +844,7 @@ function OS.handleKey(key, held)
     -- Arrows stay live even during autopilot (only flight controls are inert).
     if key == keys.up or key == keys.down then
         local hud = loadLib("lib.hud")
-        local id = (key == keys.up) and hud.prevTab() or hud.nextTab()
-        if id then
-            status_message = "Tab: " .. tostring(id):upper()
-            status_time = os.clock()
-        end
+        if key == keys.up then hud.prevTab() else hud.nextTab() end
         OS.updateDisplay()
         return
     end
@@ -894,6 +890,16 @@ function OS.beginBoot()
     end
     status_message = ""
     print("[" .. string.format("%.0f", os.clock()) .. "] Boot sequence (" .. tostring(BOOT_DURATION) .. "s)...")
+end
+
+function OS.finishBoot()
+    if power_state ~= "booting" then return end
+    power_state = "on"
+    local hud = loadLib("lib.hud")
+    hud.markChromeDirty()
+    status_message = clutch_engaged and "READY + CLUTCH" or "READY"
+    status_time = os.clock()
+    print(ts() .. " Boot complete" .. (clutch_engaged and " (clutch coupled)" or ""))
 end
 
 function OS.powerOff()
@@ -950,14 +956,8 @@ function OS.handleMonitorTouch(x, y)
         OS.doNav(action:sub(5))
     elseif action:sub(1, 3) == "wp:" then
         OS.doWp(action:sub(4))
-    elseif action ~= "boot" then
-        local tab = action
-        if action:sub(1, 4) == "tab:" then
-            tab = action:sub(5)
-        end
-        status_message = "Tab: " .. tostring(tab):upper()
-        status_time = os.clock()
     end
+    -- "tab:<id>": the HUD already switched; the new tab is the feedback
 
     -- redraw now so the first tap is visible without waiting for the HUD timer
     OS.updateDisplay()
@@ -970,10 +970,12 @@ function OS.handlePeripheralConnect(name, peripheralType)
     status_time = os.clock()
     OS._printer_cache = nil
     OS._printer_off = nil
+    OS._printer_scan = nil -- a new device may be the printer: look right away
     Kbd.openNet() -- a freshly attached modem may be the rednet link
-    for key, assigned in pairs(config.peripherals or {}) do
+    for _, assigned in pairs(config.peripherals or {}) do
         if assigned == name then
             pcall(Hardware.connect)
+            break
         end
     end
 end
@@ -999,16 +1001,7 @@ function OS.updateDisplay()
     end
 
     if power_state == "booting" then
-        local p = (os.clock() - boot_started) / BOOT_DURATION
-        if p >= 1 then
-            power_state = "on"
-            hud.markChromeDirty()
-            status_message = clutch_engaged and "READY + CLUTCH" or "READY"
-            status_time = os.clock()
-            print("[" .. string.format("%.0f", os.clock()) .. "] Boot complete" ..
-                (clutch_engaged and " (clutch coupled)" or ""))
-            p = 1
-        end
+        local p = math.min(1, (os.clock() - boot_started) / BOOT_DURATION)
         pcall(hud.renderPower, "booting", p, status_message)
         return
     end
