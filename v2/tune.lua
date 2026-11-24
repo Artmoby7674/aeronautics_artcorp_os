@@ -104,7 +104,10 @@ return {
         -- 11 m off instead of 36 m.
         lat_gain = 1.0,      -- degrees of roll per m/s of sideways speed
         lat_max = 3,         -- degrees
-        tilt_sign = 1,       -- flip if W moves the ship backwards
+        -- -1 on this ship: in hover W went backwards and S forwards (v2.25).
+        -- With yaw.sign = -1 too, every prop's tilt faces act the opposite
+        -- way to the wiring names (a "forward" tilt pushes back).
+        tilt_sign = -1,      -- flip if W moves the ship backwards
     },
 
     cruise = {
