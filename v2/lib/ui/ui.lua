@@ -576,7 +576,11 @@ function UI:ship(m, static)
         D.text(lx, y0, "HARDWARE", C.accent, C.bg)
         D.text(rx, y0, "LEARNED IN FLIGHT", C.accent, C.bg)
         self:button(rx, y0 + 140, colw, 18, "RESET LEARNED VALUES", "ship:reset", "normal")
-        D.text(lx, y0 + 146, "OS V" .. V.number, C.accent, C.bg)
+        -- ship backup on a floppy (any disk drive on the network)
+        local bw = math.floor((colw - 4) / 2)
+        self:button(lx, y0 + 140, bw, 18, "SAVE DISK", "ship:disksave", "normal")
+        self:button(lx + bw + 4, y0 + 140, bw, 18, "LOAD DISK", "ship:diskload", "normal")
+        D.text(lx + colw, y0, "OS V" .. V.number, C.accent, C.bg, 1, "r")
     end
     local loop = m.loop or {}
     local left = {

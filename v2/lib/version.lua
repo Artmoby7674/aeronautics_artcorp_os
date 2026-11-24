@@ -5,6 +5,7 @@
 -- start-up, in the log and on the error screen; the cockpit screen (start
 -- screen, SHIP tab) shows the number only. Newest first.
 local history = {
+    { "2.28", "SHIP DISK", "save / load the ship (wiring, learned, air, waypoints) to a floppy" },
     { "2.27", "QUICK START", "A/P climbs at once (no wait for the direction check); take-off +20 m" },
     { "2.26", "W FORWARD", "hover W/S tilt direction matches the ship (W was going backwards)" },
     { "2.25", "AIR SENSE", "measures the air it flies in: ceiling + altitude hold adapt to any world; cruise Y270" },
@@ -32,6 +33,6 @@ return {
     note = latest[3],
     date = "2026-11-24",
     history = history,
-    -- "v2.27 QUICK START"
+    -- "v2.28 SHIP DISK"
     label = "v" .. latest[1] .. " " .. latest[2],
 }

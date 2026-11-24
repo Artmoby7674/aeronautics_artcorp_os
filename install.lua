@@ -24,6 +24,7 @@ local files = {
     { "v2/lib/ctl.lua", "v2/lib/ctl.lua" },
     { "v2/lib/est.lua", "v2/lib/est.lua" },
     { "v2/lib/atmos.lua", "v2/lib/atmos.lua" },
+    { "v2/lib/shipdisk.lua", "v2/lib/shipdisk.lua" },
     { "v2/lib/flight.lua", "v2/lib/flight.lua" },
     { "v2/lib/hw.lua", "v2/lib/hw.lua" },
     { "v2/lib/link.lua", "v2/lib/link.lua" },

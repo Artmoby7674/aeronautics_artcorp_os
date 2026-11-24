@@ -44,7 +44,7 @@ local last_err = nil
 while true do
     runs = runs + 1
     -- reload the OS fresh on every start (only its own modules)
-    for _, m in ipairs({ "main", "util", "config", "hw", "est", "atmos", "ctl", "flight", "ap",
+    for _, m in ipairs({ "main", "util", "config", "hw", "est", "atmos", "ctl", "flight", "ap", "shipdisk",
         "nav", "link", "rec", "draw", "font", "ui", "version" }) do
         package.loaded[m] = nil
     end

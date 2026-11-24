@@ -10,6 +10,7 @@ local Rec = require("rec")
 local D = require("draw")
 local UI = require("ui")
 local V = require("version")
+local ShipDisk = require("shipdisk")
 
 local Main = {}
 
@@ -291,6 +292,28 @@ local function act(a)
         saveLearned(c)
         return say("LEARNED VALUES RESET")
     end
+    -- ship backup on a floppy in any disk drive on the network
+    if a == "ship:disksave" then
+        saveLearned(fl.ctl) -- what was learned this flight goes on the disk too
+        local n, why = ShipDisk.save(app.cfg.slot, { ship = app.cfg.name, os = V.label })
+        if not n then return say(why, D.C.bad) end
+        return say(string.format("SAVED %s TO DISK (%d FILES)", tostring(app.cfg.name):upper(), n), D.C.good)
+    end
+    if a == "ship:diskload" then
+        if app.power == "on" and fl.phase ~= "parked" and fl.phase ~= "estop" then
+            return say("LAND FIRST: LOADING RESTARTS THE OS", D.C.bad)
+        end
+        local m, why = ShipDisk.peek()
+        if not m then return say(why, D.C.bad) end
+        if not confirmed("ship:diskload") then
+            return say("TAP AGAIN TO LOAD " .. tostring(m.ship or m.slot):upper() .. " FROM DISK", D.C.warn)
+        end
+        local ok, why2 = ShipDisk.load()
+        if not ok then return say(why2, D.C.bad) end
+        say("LOADED " .. tostring(ok.ship or ok.slot):upper() .. ": RESTARTING", D.C.good)
+        app.reboot_at = os.clock() + 1.5 -- let the screen show it, then restart on it
+        return
+    end
 end
 
 -- ------------------------------------------------------------ alerts
@@ -402,6 +425,13 @@ local function timingSummary(tick_ms)
 end
 
 local function controlTick()
+    if app.reboot_at and os.clock() >= app.reboot_at then
+        -- a ship was loaded from disk: start again on it (learned values are
+        -- NOT saved first, that would overwrite what was just loaded)
+        U.log("restarting on the ship loaded from disk")
+        U.bbFlush(os.clock())
+        os.reboot()
+    end
     local tick_t0 = HW.now_ms()
     HW.resetStats()
     app.prev, app.keys = app.keys, HW.inputs()
