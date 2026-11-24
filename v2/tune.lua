@@ -14,8 +14,11 @@ return {
                              -- compensation follows it, not the command)
     },
 
-    -- Vertical channel: altitude -> climb-rate setpoint -> lift.
+    -- Vertical channel. In flight: hold the prop speed that balances at the
+    -- target altitude and let the air bring the ship there (throttle_hold).
+    -- Landing/unflip: altitude -> climb-rate setpoint -> lift (gains below).
     vertical = {
+        throttle_hold = true,
         alt_gain = 0.8,      -- (m/s) per m of altitude error
         brake_accel = 1.5,   -- m/s^2 used to shape the stop onto a target
         climb_max = 6,       -- m/s
@@ -24,7 +27,7 @@ return {
         rate_int = 0.35,     -- integral on climb-rate error
         int_limit = 3,       -- m/s^2
         hover_learn = true,  -- learn the real hover throttle in flight
-        hover_learn_tau = 25,-- s
+        hover_learn_tau = 15,-- s (the fixed-speed hold settles off-target until this is right)
     },
 
     -- Pitch/roll stabiliser: prop speed DIFFERENCES, applied symmetrically
@@ -99,8 +102,14 @@ return {
 
     cruise = {
         ramp = 4,            -- rear levels per second (rising only)
+        -- Cruise steers ONLY by banking (no prop tilt at speed: the fin turns
+        -- tilt kicks into roll and pitch). Bank right = nose swings right.
         bank_gain = 0.25,    -- degrees of bank per degree of heading error
+        bank_damp = 0.8,     -- degrees of bank taken off per deg/s of turn
         bank_max = 6,
+        bank_sign = 1,       -- flip if banking turns the ship the wrong way
+        bank_v0 = 6,         -- m/s: no banking below this (it only slides)
+        bank_v1 = 15,        -- m/s: full banking from this speed
         manual_turn = 12,    -- deg/s of heading change while Q/E held
     },
 

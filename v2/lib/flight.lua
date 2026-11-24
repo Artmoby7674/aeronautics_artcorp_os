@@ -397,11 +397,21 @@ end
 -- Run a command through the control laws.
 function Flight:run(cmd, dt)
     local s, ctl, t = self.est.s, self.ctl, self.t
-    local vs_sp = cmd.vs or ctl:rateFor(s, cmd.alt or s.alt)
-    if self.prox and self.prox > 0 and self.phase ~= "unflip" then
-        vs_sp = math.max(vs_sp, -self:sinkLimit())
+    -- Altitude: normally the fixed prop speed that balances at the target
+    -- (Ctl:holdLift). The climb-rate controller is kept for what needs a
+    -- set descent speed: landing, a sink faster than is safe this close to
+    -- the ground, unflip, and explicit climb-rate commands.
+    local lift
+    local sink_cap = (self.prox and self.prox > 0 and self.phase ~= "unflip") and self:sinkLimit() or nil
+    local use_rate = cmd.vs or self.phase ~= "flying" or not t.vertical.throttle_hold
+        or (sink_cap and s.vs < -sink_cap)
+    if use_rate then
+        local vs_sp = cmd.vs or ctl:rateFor(s, cmd.alt or s.alt)
+        if sink_cap then vs_sp = math.max(vs_sp, -sink_cap) end
+        lift = ctl:lift(s, dt, vs_sp)
+    else
+        lift = ctl:holdLift(s, cmd.alt or s.alt)
     end
-    local lift = ctl:lift(s, dt, vs_sp)
 
     -- signed: reverse thrust tips (and yaws) the hull the other way
     ctl.rear_level = (self.rear_rev and -1 or 1) * (self.rear or 0)
@@ -431,6 +441,12 @@ function Flight:run(cmd, dt)
         if self.yaw_brk then rate_sp = 0 end
     end
     ctl.dbg_yaw = nil
+    -- CRUISE: never steer with the prop tilts. At speed a tilt kick goes
+    -- through the tail fin into a mess of roll and pitch. The ship steers
+    -- like a plane instead: it banks (below) and the fin swings the nose
+    -- round smoothly. The tilts are for turning in place, in hover.
+    local cruising = self.mode == "cruise" and not cmd.reverse
+    if cruising then rate_sp = nil end
     local yaw = rate_sp and ctl:yaw(s, dt, rate_sp) or 0
 
     local fwd = 0
@@ -440,7 +456,16 @@ function Flight:run(cmd, dt)
 
     local roll_sp = 0
     if cmd.bank then
-        roll_sp = U.clamp(t.cruise.bank_gain * herr, -t.cruise.bank_max, t.cruise.bank_max)
+        -- bank toward the heading wanted, eased off by how fast the nose is
+        -- already swinging (so it rolls out before reaching the heading
+        -- instead of overshooting it)
+        -- Only at real cruise speed: slow, a bank just slides the hull
+        -- sideways (the fin needs airspeed to swing the nose round).
+        local c = t.cruise
+        local v0, v1 = c.bank_v0 or 6, c.bank_v1 or 15
+        local k = U.clamp(((s.u or 0) - v0) / math.max(v1 - v0, 1), 0, 1)
+        roll_sp = k * (c.bank_sign or 1) * U.clamp(c.bank_gain * herr - (c.bank_damp or 0) * (s.yaw_rate or 0),
+            -c.bank_max, c.bank_max)
     elseif cmd.w_sp then
         roll_sp = ctl:lateral(s, cmd.w_sp, cmd.fine)
     end

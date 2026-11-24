@@ -181,7 +181,10 @@ do
     -- aligned before the descent; no heading hold on the way down (no tilt
     -- loops), so the tail fin may turn it a little as it drifts
     check("trip: on its heading (within 20 deg)", math.abs(U.wrap180(t.heading - 200)) < 20, f(t.heading))
-    check("trip: never sank > 5 m in cruise", below < 5, f(below))
+    -- the altitude hold is a fixed prop speed (the air settles the ship):
+    -- at speed, airflow through the slightly pitched props costs some lift
+    -- and the ship sinks a few metres until the denser air holds it
+    check("trip: never sank > 10 m in cruise", below < 10, f(below))
     check("trip: attitude < 8 deg", maxatt < 8, f(maxatt))
     check("trip: soft touchdown", (w.sim.touch_v or 9) < 1.2, w.sim.touch_v)
     check("trip: autopilot released", w.fl.ap == nil)
@@ -372,6 +375,51 @@ do
     check("ap order: turns at the travel altitude", turn_alt and w.fl.ap and math.abs(turn_alt - w.fl.ap.goal_alt) < 4.5, f(turn_alt or -1))
     check("ap order: waypoint behind = one steady turn", flips == 0, flips)
     check("ap order: faces it and cruises", reached_cruise)
+end
+
+-- 16. Cruise steers by banking only (never prop tilt at speed: the fin
+--     turns tilt kicks into roll and pitch), and the fixed-speed altitude
+--     hold settles a climb without the props swinging.
+do
+    local w = World.new({ loop_ticks = 3 }):airborne(150, 0)
+    w.fl.ctl.roll_known, w.fl.ctl.pitch_known = 1, 1
+    w.fl.calib = nil
+    w.fl:setMode("cruise")
+    w.fl.rear_target = 10
+    w:run(30)
+    w.fl.heading_target = 40
+    local tilt_ticks, maxatt = 0, 0
+    w:run(90, function(w)
+        local o = w.sim:readOutputs()
+        if o.FL_tilt ~= 0 or o.FR_tilt ~= 0 or o.RL_tilt ~= 0 or o.RR_tilt ~= 0 then tilt_ticks = tilt_ticks + 1 end
+        local t = w:truth()
+        maxatt = math.max(maxatt, math.abs(t.roll), math.abs(t.pitch))
+    end)
+    local hdg = w:truth().heading
+    print(string.format("bank turn: heading %.1f (want 40), tilt ticks %d, max attitude %.1f", hdg, tilt_ticks, maxatt))
+    check("bank turn: no prop tilt in cruise", tilt_ticks == 0, tilt_ticks)
+    check("bank turn: reaches the heading", math.abs(U.wrap180(hdg - 40)) < 5, f(hdg))
+    check("bank turn: gentle (attitude < 8 deg)", maxatt < 8, f(maxatt))
+
+    -- climb 60 m on a fixed prop speed: no bounce, props steady once there
+    local w2 = World.new({ loop_ticks = 3 }):airborne(120, 0)
+    w2.fl.ctl.roll_known, w2.fl.ctl.pitch_known = 1, 1
+    w2.fl.calib = nil
+    local peak, lmin, lmax = 0, 99, 0
+    w2:run(120, function(w)
+        w.fl.alt_target = 180 -- the pilot keeps a target within 15 m: re-ask
+        local t = w:truth()
+        peak = math.max(peak, t.alt)
+        if w.t > 80 then
+            local l = w.fl.levels.FL or 0
+            lmin, lmax = math.min(lmin, l), math.max(lmax, l)
+        end
+    end)
+    local alt = w2:truth().alt
+    print(string.format("throttle hold: alt %.1f (want 180) peak %.1f, prop levels %d..%d at the end", alt, peak, lmin, lmax))
+    check("throttle hold: arrives within 3 m", math.abs(alt - 180) < 3, f(alt))
+    check("throttle hold: no big overshoot (< 4 m)", peak < 184, f(peak))
+    check("throttle hold: props steady (one level of dither)", lmax - lmin <= 1, lmin .. ".." .. lmax)
 end
 
 print(string.format("v2_test: %d passed, %d failed", passed, failed))

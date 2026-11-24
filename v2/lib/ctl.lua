@@ -84,6 +84,22 @@ function Ctl:lift(s, dt, vs_sp)
     return self.hover / (s.press * s.den) * (1 + a_cmd / g) / cosatt
 end
 
+-- Altitude hold the pilot's way: set the prop speed that exactly holds the
+-- ship up AT the target altitude, and keep it there. Below the target the
+-- air is thicker, so that speed lifts; above it the air is thinner, so it
+-- sinks; climbing fast, the airflow through the props takes lift away. The
+-- air itself brings the ship to the target, with no overshoot correction
+-- swinging the props up and down. The learned hover throttle (see below)
+-- corrects the speed if the ship settles a little off.
+function Ctl:holdLift(s, alt_target)
+    local ph = self.t.physics
+    local press_t = math.exp(-ph.press_k * (alt_target - ph.press_ref))
+    local cosatt = math.max(math.abs(s.up_y or 1), 0.5)
+    self.vi = 0
+    self.vs_sp, self.a_cmd = nil, 0
+    return self.hover / press_t / cosatt
+end
+
 -- In-flight hover throttle learning: when the ship is steady, the lift it is
 -- actually using IS the hover lift (scaled back to sea level).
 function Ctl:learnHover(s, dt, lift_used)

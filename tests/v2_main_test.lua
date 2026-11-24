@@ -265,7 +265,7 @@ w:airborne(120, 0)
 files["v2/data/state"] = "return { where = \"air\", gear = false }" -- it was flying
 -- learned values saved by v2.9 (no format tag): the wound-up roll trim and
 -- the mid-swing direction answer must not come back
-files["v2/data/learned.lua"] = "return { hover = 5.6, ri = 1.8, pi_ = 0.5, rear_pk = -0.4, roll_sign = -1, roll_known = 1, yaw_brake = 0.7 }"
+files["v2/data/learned.lua"] = "return { hover = 6.0, ri = 1.8, pi_ = 0.5, rear_pk = -0.4, roll_sign = -1, roll_known = 1, yaw_brake = 0.7 }"
 mon.errors = {}
 timers, script, si = {}, {}, 1
 local t0 = sim.t
