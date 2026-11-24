@@ -498,7 +498,7 @@ end
 -- -------------------------------------------------------------- AUTO
 
 local STEPS = { { "depart", "DEPART" }, { "cruise", "CRUISE" }, { "stop", "STOP + ALIGN" }, { "land", "LAND" } }
-local STEP_OF = { turn = "cruise", align = "stop" }
+local STEP_OF = { turn = "depart", align = "stop" }
 
 function UI:auto(m, static)
     local W = D.W

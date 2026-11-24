@@ -412,7 +412,16 @@ function Flight:run(cmd, dt)
     local herr = 0
     if not rate_sp and cmd.heading then
         herr = U.wrap180(cmd.heading - s.heading)
+        -- a target nearly behind: keep turning the way already chosen.
+        -- Otherwise a fraction of a degree flips "the short way" between
+        -- left and right every tick and the tilts flap without turning.
+        if self.turn_dir and math.abs(herr) > 150 and U.sign(herr) ~= self.turn_dir then
+            herr = herr + 360 * self.turn_dir
+        end
+        if math.abs(herr) > 2 then self.turn_dir = U.sign(herr) end
         rate_sp = ctl:yawRateFor(herr)
+    else
+        self.turn_dir = nil
     end
     if rate_sp then
         self.yaw_brk = false

@@ -5,6 +5,7 @@
 -- start-up, in the log and on the error screen; the cockpit screen (start
 -- screen, SHIP tab) shows the number only. Newest first.
 local history = {
+    { "2.22", "YAW FLIP", "yaw direction reversed to match the ship; A/P climbs first, then turns" },
     { "2.21", "REAL TIME", "uses the real control tick (~0.2 s, not 0.05 s); black box + call timing logs" },
     { "2.20", "CALM ROLL", "gains for a strong, 1 s late hull; fine prop steps; lag-proof direction check" },
     { "2.9", "DIR CHECK", "take-off check of which way pitch/roll corrections move the hull" },
@@ -26,6 +27,6 @@ return {
     note = latest[3],
     date = "2026-11-24",
     history = history,
-    -- "v2.21 REAL TIME"
+    -- "v2.22 YAW FLIP"
     label = "v" .. latest[1] .. " " .. latest[2],
 }

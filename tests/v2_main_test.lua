@@ -288,7 +288,7 @@ local said = false
 for _, l in ipairs(printed) do if l:find("RESTARTED AFTER AN ERROR") then said = true end end
 check("airborne start: tells the pilot it restarted", said)
 local L = load(files["v2/data/learned.lua"] or "return {}")()
-check("old learned values: format tagged on save", L.fmt == 2, L.fmt)
+check("old learned values: format tagged on save", L.fmt == 3, L.fmt)
 check("old learned values: roll trim not reloaded", math.abs(L.ri or 0) < 0.5, L.ri)
 check("old learned values: direction check starts over", (L.roll_known or 0) == 0 and L.roll_sign == 1,
     tostring(L.roll_known) .. "/" .. tostring(L.roll_sign))

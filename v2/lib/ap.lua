@@ -2,12 +2,13 @@
 -- (rear thruster) and turn (tilt); it cannot strafe. So the whole trip is
 -- built from straight lines and turns made while stopped:
 --
---   depart  turn toward the waypoint at the current (low) altitude, then
---           climb to the travel altitude; the rear thruster keeps it still
+--   depart  climb straight up to the travel altitude (heading left alone);
+--           the rear thruster keeps it still
+--   turn    up there, turn in place to face the waypoint (also used when
+--           cruise drifts more than turn_limit off course)
 --   cruise  rear thruster on a speed profile that plans its own stop (rear
 --           reverse brakes); heading held toward the waypoint while far out,
 --           then left alone for the last `face_r` metres (no sideways fixes)
---   turn    drifted > turn_limit off course: stop, turn in place, resume
 --   stop    rear thruster brings it to rest; if it ended far from the
 --           waypoint it re-aims and creeps back (a couple of times at most)
 --   align   turn in place onto the waypoint's saved heading
@@ -122,20 +123,13 @@ function AP:update(fl, s, dt)
     local df = dx * s.fwd_x + dz * s.fwd_z -- waypoint distance along the nose
 
     if self.phase == "depart" then
+        -- climb straight up first, heading left alone (rotation only braked):
+        -- turning happens up at the travel altitude, never near the ground
         fl:setMode("hover")
-        local cmd = { heading = brg, damp_u = 0 }
-        -- turn first, low; climb once roughly on the bearing
-        if math.abs(herr) > 30 then
-            if not self.turn_alt then self.turn_alt = s.alt end
-            cmd.alt = self.turn_alt
-        else
-            cmd.alt = self.goal_alt
+        if math.abs(s.alt - self.goal_alt) < 4 and math.abs(s.vs) < 1.2 then
+            self:setPhase("turn")
         end
-        if math.abs(herr) < a.heading_tol and math.abs(s.alt - self.goal_alt) < 4
-            and math.abs(s.vs) < 1.2 and math.abs(s.yaw_rate) < 2 then
-            self:setPhase("cruise")
-        end
-        return cmd
+        return { alt = self.goal_alt, damp_u = 0 }
     end
 
     if self.phase == "cruise" then
@@ -191,7 +185,6 @@ function AP:update(fl, s, dt)
         if self.still > 2 or self.pt > 60 then
             if dist > a.retry_r and self.retries < a.retries then
                 self.retries = self.retries + 1
-                self.turn_alt = nil
                 self:setPhase("depart") -- re-aim at the point, creep back
             else
                 self:setPhase("align")

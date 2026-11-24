@@ -64,7 +64,11 @@ return {
         rate_int = 0.02,     -- integral: learns constant turning torques
         int_limit = 0.6,
         manual_rate = 20,    -- deg/s while Q/E held
-        sign = 1,            -- flip if Q/E turn the wrong way
+        -- -1 on this ship: the v2.21 flight showed the tilt pattern meant to
+        -- turn right turned it LEFT (a commanded right turn swung the nose
+        -- 117 deg left; with the sign wrong the autopilot settles exactly
+        -- facing AWAY from the waypoint and the brake speeds a spin up).
+        sign = -1,           -- flip if Q/E turn the wrong way
     },
 
     -- Prop tilt is on/off and a tilt flip on props this size is a big torque

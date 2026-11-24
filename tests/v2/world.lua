@@ -27,6 +27,19 @@ function World.new(opts)
     self.ship, self.tune = ship, tune
     self.sim = Sim.new(opts.sim or {})
     self.sim:install(ship)
+    -- Like the real ship (v2.21 flight): the tilt pattern the code calls
+    -- "turn right" turns it LEFT, so tune.lua has yaw.sign = -1. Modelled as
+    -- the left/right tilt outputs reaching the opposite side's props (yaw
+    -- reversed, fore/aft tilt unchanged). opts.yaw_as_designed = undo that.
+    if not opts.yaw_as_designed then
+        local raw = self.sim.readOutputs
+        self.sim.readOutputs = function(sim)
+            local o = raw(sim)
+            o.FL_tilt, o.FR_tilt = o.FR_tilt, o.FL_tilt
+            o.RL_tilt, o.RR_tilt = o.RR_tilt, o.RL_tilt
+            return o
+        end
+    end
     HW.init(ship)
     HW.connect()
     self.sim:step(0) -- publish the starting sensor value

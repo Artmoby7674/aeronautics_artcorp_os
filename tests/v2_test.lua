@@ -49,7 +49,7 @@ end
 
 -- 2. Wiring: thrust is inverted at the wire, tilt is on/off
 do
-    local w = World.new()
+    local w = World.new({ yaw_as_designed = true }) -- raw pins, no side swap
     HW.setProp("FL", 12)
     HW.setTilt("FR", -1)
     local o = w.sim:readOutputs()
@@ -340,6 +340,38 @@ do
     local truth = -math.deg(w2.sim.w.y)
     check("slow loop: yaw rate read at its real size", math.abs(w2.fl.est.s.yaw_rate - truth) < 1.5,
         f(w2.fl.est.s.yaw_rate) .. " vs " .. f(truth))
+end
+
+-- 15. Autopilot order: climb first (heading left alone), turn up there,
+--     then go. A waypoint right BEHIND the ship must not leave it flapping
+--     between "turn left" and "turn right" (v2.21 flight: stuck facing away).
+do
+    local w = World.new():airborne(90, 0)
+    w.fl.ctl.roll_known, w.fl.ctl.pitch_known = 1, 1
+    w.fl.calib = nil
+    -- point due south (behind, 180 deg) and a bit east
+    w:startAP({ name = "BEHIND", x = 3, z = 400, heading = 90 })
+    local turned_low, turn_alt, reached_cruise, flips, last_dir = false, nil, false, 0, nil
+    w:run(240, function(w)
+        local ap, t = w.fl.ap, w:truth()
+        if not ap then return true end
+        if ap.phase == "depart" and math.abs(U.wrap180(t.heading - 0)) > 15 then turned_low = true end
+        if ap.phase == "turn" and not turn_alt then turn_alt = t.alt end
+        if ap.phase == "turn" then
+            local d = w.fl.turn_dir
+            -- flips while the point is still well behind (the small correction
+            -- at the end of the turn is fine)
+            if d and last_dir and d ~= last_dir and math.abs(ap.herr or 0) > 120 then flips = flips + 1 end
+            last_dir = d or last_dir
+        end
+        if ap.phase == "cruise" then reached_cruise = true return true end
+    end)
+    print(string.format("ap order: turned while climbing=%s turn started at alt %.1f (goal %.1f) dir flips %d cruise=%s",
+        tostring(turned_low), turn_alt or -1, w.fl.ap and w.fl.ap.goal_alt or -1, flips, tostring(reached_cruise)))
+    check("ap order: no turning during the climb", not turned_low)
+    check("ap order: turns at the travel altitude", turn_alt and w.fl.ap and math.abs(turn_alt - w.fl.ap.goal_alt) < 4.5, f(turn_alt or -1))
+    check("ap order: waypoint behind = one steady turn", flips == 0, flips)
+    check("ap order: faces it and cruises", reached_cruise)
 end
 
 print(string.format("v2_test: %d passed, %d failed", passed, failed))

@@ -55,7 +55,9 @@ local LEARN_KEYS = { "hover", "pi_", "ri", "yi", "rear_pk", "rear_yk", "yaw_brak
 -- 2 (v3.0): trims learned under the v2.9 roll swing were wound up to the
 -- limit, its direction check measured mid-swing, and the rear feedforwards
 -- now follow the thrust direction (reverse = negative).
-local LEARN_FMT = 2
+-- 3 (v2.22): yaw direction flipped: the yaw integrators were learned
+-- backwards.
+local LEARN_FMT = 3
 local LEARN_KEEP = { hover = true, yaw_brake = true }
 
 local function loadLearned(ctl)
