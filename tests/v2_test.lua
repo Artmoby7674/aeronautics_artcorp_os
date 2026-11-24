@@ -446,5 +446,40 @@ do
     check("landing drift: only a little roll (< 4 deg)", maxr < 4, f(maxr))
 end
 
+-- 18. The ship measures the air it flies in (servers set very different
+--     atmospheres). First flight in each world, default assumptions:
+--     thick air that reaches high = it climbs on to the full Y270;
+--     thin air = it finds the real ceiling and travels under it.
+do
+    local function first_trip(press_k, hover)
+        local w = World.new({ loop_ticks = 3, sim = { press_k = press_k, hover = hover } }):airborne(100, 0)
+        w.fl.ctl.roll_known, w.fl.ctl.pitch_known = 1, 1
+        w.fl.calib = nil
+        w:startAP({ name = "FAR", x = 0, z = -3000, heading = 0 })
+        w:run(400, function(w) return w.fl.ap and w.fl.ap.phase == "cruise" and w.fl.ap.pt > 20 end)
+        return w
+    end
+    local w = first_trip(0.0015, 4)
+    local ap, pts = w.fl.ap, w.fl.atmos:points()
+    print(string.format("air thick: %s, cruising at Y%.0f", w.fl.atmos:summary(), w:truth().alt))
+    check("air thick: reached cruise", ap and ap.phase == "cruise")
+    check("air thick: travels at the default Y270", math.abs(w:truth().alt - 270) < 6, f(w:truth().alt))
+    check("air thick: trend measured", pts.measured and math.abs(pts.k - 0.0015) < 0.0005, f(pts.k))
+    check("air thick: hover speed measured", math.abs(w.fl.atmos:hoverAt(63) - 4) < 0.3, f(w.fl.atmos:hoverAt(63)))
+
+    w = first_trip(0.008, 6)
+    ap, pts = w.fl.ap, w.fl.atmos:points()
+    -- true ceiling with 3.5 prop units spare: 63 + ln(11.5/6)/0.008 = Y144
+    print(string.format("air thin: %s, cruising at Y%.0f", w.fl.atmos:summary(), w:truth().alt))
+    check("air thin: reached cruise (no timeout)", ap and ap.phase == "cruise")
+    check("air thin: travels under the real ceiling", w:truth().alt < 148 and w:truth().alt > 120, f(w:truth().alt))
+    check("air thin: trend measured", pts.measured and math.abs(pts.k - 0.008) < 0.002, f(pts.k))
+
+    -- the measured air survives a restart
+    local A = require("atmos")
+    local b = A.new(w.tune, 6)
+    check("air: saved and loaded", b:fromTable(w.fl.atmos:toTable()) and math.abs(b:hoverAt(140) - w.fl.atmos:hoverAt(140)) < 1e-6)
+end
+
 print(string.format("v2_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("v2_test FAILED", 0) end

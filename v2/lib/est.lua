@@ -17,6 +17,7 @@ function Est.new(tune)
 end
 
 function Est:pressure(h)
+    if self.atmos then return self.atmos:press(h) end -- learned (atmos.lua)
     local p = self.t.physics
     return math.exp(-p.press_k * (h - p.press_ref))
 end

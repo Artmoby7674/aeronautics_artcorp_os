@@ -1,6 +1,6 @@
 -- Test harness: the real v2 Flight/HW/AP code flying tests/v2/sim.lua.
 package.path = "./v2/lib/?.lua;./tests/v2/?.lua;" .. package.path
-for _, m in ipairs({ "util", "ctl", "est", "hw", "flight", "ap", "config", "sim" }) do
+for _, m in ipairs({ "util", "ctl", "est", "atmos", "hw", "flight", "ap", "config", "sim" }) do
     package.loaded[m] = nil
 end
 

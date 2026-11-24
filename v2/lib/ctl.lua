@@ -92,23 +92,54 @@ end
 -- swinging the props up and down. The learned hover throttle (see below)
 -- corrects the speed if the ship settles a little off.
 function Ctl:holdLift(s, alt_target)
-    local ph = self.t.physics
-    local press_t = math.exp(-ph.press_k * (alt_target - ph.press_ref))
     local cosatt = math.max(math.abs(s.up_y or 1), 0.5)
     self.vi = 0
     self.vs_sp, self.a_cmd = nil, 0
+    if self.atmos then return self.atmos:hoverAt(alt_target) / cosatt end
+    local ph = self.t.physics
+    local press_t = math.exp(-ph.press_k * (alt_target - ph.press_ref))
     return self.hover / press_t / cosatt
 end
 
--- In-flight hover throttle learning: when the ship is steady, the lift it is
--- actually using IS the hover lift (scaled back to sea level).
-function Ctl:learnHover(s, dt, lift_used)
+-- In-flight air learning: when the ship hangs steady, the lift it is
+-- actually using IS the hover speed at this altitude. With an atmosphere
+-- model (atmos.lua) every such moment is a measurement of the air there;
+-- `hover` (the speed at the reference altitude) is then read off the model.
+-- Not near the ground (ground effect) and not moving fast (airflow).
+function Ctl:learnHover(s, dt, lift_used, near_ground)
     local v = self.t.vertical
     if not v.hover_learn or not lift_used then return end
-    if math.abs(s.vs) > 1.5 or math.abs(s.accel or 0) > 1 then return end
-    if math.abs(s.pitch) > 8 or math.abs(s.roll) > 8 or self.sat ~= 0 then return end
+    -- untilted props only: with a tilt on, the vertical share of the
+    -- thrust is only estimated and would bias the measurement
+    local untilted = (self.sd.L.frac or 0) < 0.01 and (self.sd.R.frac or 0) < 0.01
+    -- Not accelerating = lift equals weight, also while climbing or sinking
+    -- at a steady rate (the airflow term `den` corrects for the speed): the
+    -- ship measures the air on its way up, not only when it hangs still.
+    local steady = math.abs(s.vs) <= 7 and math.abs(s.accel or 0) <= 0.3
+        and math.abs(s.pitch) <= 6 and math.abs(s.roll) <= 6 and untilted
+    -- (props pinned at full speed and still hanging there is a good sample
+    -- too: it is the ceiling. lift_used is what the props really got.)
+    -- props take a second or so to reach a new speed: only measure once the
+    -- ship has been steady for a while and the lift asked for is not moving
+    -- faster than a steady climb needs (else the props are still on their
+    -- way to it and the sample is biased; this used to feed on itself: a
+    -- sample moved the model, which moved the command)
+    local lp = self.lu_prev or lift_used
+    if math.abs(lift_used - lp) > (0.005 + 0.07 * dt) * math.max(lift_used, 1) then steady = false end
+    self.lu_prev = lift_used
+    self.steady_t = steady and (self.steady_t or 0) + dt or 0
+    if self.steady_t < 3 then return end
     local g = self.t.physics.gravity
-    local meas = lift_used * s.press * s.den * math.abs(s.up_y or 1) / (1 + (s.accel or 0) / g)
+    local here = lift_used * s.den * math.abs(s.up_y or 1) / (1 + (s.accel or 0) / g)
+    if self.atmos then
+        if near_ground or (s.hspeed or 0) > 12 then return end
+        self.atmos:observe(s.alt, here, dt)
+        if #self.atmos:points() > 0 then
+            self.hover = self.atmos:hoverAt(self.t.physics.press_ref)
+        end
+        return
+    end
+    local meas = here * s.press
     local base = self.t.ship.hover_throttle
     meas = U.clamp(meas, base * 0.6, base * 1.5)
     self.hover = U.lowpass(self.hover, meas, dt, v.hover_learn_tau)

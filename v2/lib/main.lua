@@ -70,7 +70,23 @@ local function loadLearned(ctl)
     end
 end
 
+-- The air the ship has measured (atmos.lua), its own file: it belongs to
+-- this world/server, not to the stabiliser.
+local ATMOS_PATH = ROOT .. "/data/atmos.lua"
+
+local function loadAtmos(atmos)
+    local t = U.loadTable(ATMOS_PATH)
+    if t and atmos:fromTable(t) then U.log("air: %s", atmos:summary()) end
+end
+
+local function saveAtmos(atmos)
+    if not atmos then return end
+    U.saveTable(ATMOS_PATH, atmos:toTable())
+    atmos.dirty = false
+end
+
 local function saveLearned(ctl)
+    if app.fl then pcall(saveAtmos, app.fl.atmos) end
     local t = { fmt = LEARN_FMT }
     for _, k in ipairs(LEARN_KEYS) do t[k] = ctl[k] end
     U.saveTable(LEARN_PATH, t)
@@ -271,6 +287,7 @@ local function act(a)
         c.hover = fl.t.ship.hover_throttle
         c.pi_, c.ri, c.yi, c.rear_pk, c.rear_yk, c.yaw_brake = 0, 0, 0, 0, 0, nil
         c.roll_sign, c.pitch_sign, c.roll_known, c.pitch_known = 1, 1, 0, 0 -- re-checked at next take-off
+        fl.atmos:reset() -- the air is measured again from scratch
         saveLearned(c)
         return say("LEARNED VALUES RESET")
     end
@@ -424,6 +441,12 @@ local function controlTick()
     end
     Rec.tick(os.clock(), app.fl.est.s)
     if app.fl.phase == "parked" then U.bbFlush(os.clock()) end
+    -- measured air: to disk once a minute while it changes, summary to the log
+    if app.fl.atmos.dirty and os.clock() - (app.atmos_t or 0) >= 60 then
+        app.atmos_t = os.clock()
+        pcall(saveAtmos, app.fl.atmos)
+        U.log("air: %s", app.fl.atmos:summary())
+    end
     if app.fl.phase ~= "parked" then
         local tick_ms = HW.now_ms() - tick_t0
         pcall(blackBox, tick_ms)
@@ -546,6 +569,8 @@ function Main.run(opts)
     U.log("ground sensor is read from %s face '%s'", tostring(pc.input_key), tostring(pc.side))
     app.fl = Flight.new(cfg.tune, HW, cfg.ship)
     loadLearned(app.fl.ctl)
+    app.fl.atmos.base_hover = app.fl.ctl.hover
+    loadAtmos(app.fl.atmos)
     Nav.init(ROOT, cfg.slot)
     Link.open()
     app.ui = UI.new()

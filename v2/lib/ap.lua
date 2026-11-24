@@ -42,9 +42,15 @@ function AP.new(fl, wp)
     return self
 end
 
--- Highest altitude where hover still leaves lift_margin units free.
+-- Highest altitude where hover still leaves lift_margin units free, from
+-- the air the ship has measured (atmos.lua; the tuning file's curve until
+-- it has flown).
 function AP:ceiling(fl)
-    local ph, a = self.t.physics, self.t.autopilot
+    local a = self.t.autopilot
+    if fl.atmos then
+        return fl.atmos:ceiling(a.lift_margin, self.start_alt, self.t.ship.max_altitude)
+    end
+    local ph = self.t.physics
     local H = fl.ctl.hover
     local need = 15 - a.lift_margin
     if need <= H then return self.start_alt end
@@ -128,7 +134,54 @@ function AP:update(fl, s, dt)
         -- turning happens up at the travel altitude, never near the ground
         fl:setMode("hover")
         if math.abs(s.alt - self.goal_alt) < 4 and math.abs(s.vs) < 1.2 then
-            self:setPhase("turn")
+            -- Up at the planned altitude. If the plan was cut short by the
+            -- ceiling the air model PREDICTS, check it: hang here until the
+            -- air at this height is measured, then predict again. A world
+            -- with more air than assumed lets it climb on (and again, each
+            -- step measuring more); at the real limit the plan stops moving.
+            local capped = not self.hop and self.goal_alt < a.cruise_alt - 5
+            if capped and fl.atmos and (self.probes or 0) < 8 then
+                self.probe_t = (self.probe_t or 0) + dt
+                local here = false
+                for _, p in ipairs(fl.atmos:points()) do
+                    if math.abs(p.h - s.alt) < 6 then here = true end
+                end
+                if here or self.probe_t > 30 then
+                    self.probe_t, self.probes = 0, (self.probes or 0) + 1
+                    local ceil = math.min(fl.atmos:ceiling(a.lift_margin, s.alt, self.t.ship.max_altitude),
+                        self.t.ship.max_altitude)
+                    local goal = math.min(a.cruise_alt, ceil)
+                    if goal > self.goal_alt + 5 then
+                        U.log("A/P %s: more air than predicted: climbing on from Y%.0f to Y%.0f", self.name or "?", s.alt, goal)
+                        self.goal_alt, self.ceil = goal, ceil
+                    else
+                        self.probes = 99 -- this is the ceiling: go
+                    end
+                end
+            else
+                self:setPhase("turn")
+            end
+        end
+        -- the air ran out before the planned altitude (thinner than measured
+        -- so far): stalled, props near the top, for 10 s = this IS the
+        -- ceiling. Travel here instead of waiting for a climb that never ends.
+        local pinned = (fl.ctl.margin or 15) < a.lift_margin * 0.5
+        if s.alt < self.goal_alt - 4 and math.abs(s.vs) < 0.5 and pinned then
+            self.stall_t = (self.stall_t or 0) + dt
+        else
+            self.stall_t = 0
+        end
+        if self.stall_t > 10 then
+            -- the air here has just been measured (hanging still at full
+            -- speed): travel where it leaves the lift margin spare
+            local goal = s.alt - 3
+            if fl.atmos then
+                goal = math.min(goal, fl.atmos:ceiling(a.lift_margin, math.min(self.start_alt, s.alt), s.alt))
+            end
+            U.log("A/P %s: ceiling reached at Y%.0f (planned Y%.0f): flying at Y%.0f", self.name or "?", s.alt, self.goal_alt, goal)
+            fl:notify(string.format("CEILING Y%.0f", s.alt))
+            self.goal_alt, self.ceil = goal, goal
+            self.stall_t, self.probes = 0, 0
         end
         return { alt = self.goal_alt, damp_u = 0 }
     end

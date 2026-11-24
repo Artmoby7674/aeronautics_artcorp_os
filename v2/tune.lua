@@ -132,7 +132,8 @@ return {
     },
 
     autopilot = {
-        cruise_alt = 230,    -- preferred travel altitude (capped by lift)
+        cruise_alt = 270,    -- preferred travel altitude (capped by the ceiling the
+                             -- ship measures: see atmos.lua)
         lift_margin = 3.5,   -- prop units kept free at cruise altitude
         hop_range = 400,     -- m: closer than this = slow, low hop
         hop_climb = 20,      -- m above start altitude for hops

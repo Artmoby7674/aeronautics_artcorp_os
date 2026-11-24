@@ -133,7 +133,7 @@ return {
         -- autopilot discovers it at runtime: climb past the 280 floor until
         -- the lift props are down to 13 of 15. This is only an operator cap
         -- on commanded altitude, set above anything the ship can reach.
-        max_altitude = 450,
+        max_altitude = 2000,
         min_altitude = 0,
         max_tilt = 15,
         max_climb_rate = 10,

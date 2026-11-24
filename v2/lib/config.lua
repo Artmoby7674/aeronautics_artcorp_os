@@ -82,7 +82,7 @@ function Config.build(ship, tune)
     local lim = ship.limits or {}
     tune.ship = {
         hover_throttle = lim.hover_throttle or 6,
-        max_altitude = lim.max_altitude or 450,
+        max_altitude = lim.max_altitude or 2000,
         max_speed = lim.hover_max_speed or 15,
         creep = lim.landed_creep or tune.landing.creep,
         gravity = (ship.physics and ship.physics.gravity) or tune.physics.gravity,

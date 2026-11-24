@@ -10,6 +10,7 @@
 local U = require("util")
 local Ctl = require("ctl")
 local Est = require("est")
+local Atmos = require("atmos")
 
 local Flight = {}
 Flight.__index = Flight
@@ -21,6 +22,9 @@ function Flight.new(tune, hw, ship)
     self.t, self.hw, self.shipcfg = tune, hw, ship
     self.ctl = Ctl.new(tune)
     self.est = Est.new(tune)
+    -- the air, learned in flight (shared by the estimator and controllers)
+    self.atmos = Atmos.new(tune, self.ctl.hover)
+    self.est.atmos, self.ctl.atmos = self.atmos, self.atmos
     self.levels = {}
     self.phase = "parked"
     self.mode = "hover"
@@ -403,8 +407,22 @@ function Flight:run(cmd, dt)
     -- the ground, unflip, and explicit climb-rate commands.
     local lift
     local sink_cap = (self.prox and self.prox > 0 and self.phase ~= "unflip") and self:sinkLimit() or nil
-    local use_rate = cmd.vs or self.phase ~= "flying" or not t.vertical.throttle_hold
-        or (sink_cap and s.vs < -sink_cap)
+    -- (and close to the ground, where the sensor sees it: take-off and
+    -- low hovering want a firm climb/descent, not a slow glide to height)
+    -- (and for big altitude changes: up to 8 m from the target the climb
+    -- runs at a set rate, so a world whose air is not yet measured cannot
+    -- fling the ship far past it; the air is measured on the way up and the
+    -- fixed speed then holds it there)
+    local alt_t = cmd.alt or s.alt
+    local far = math.abs(alt_t - s.alt)
+    local v = t.vertical
+    if self.vmode == "rate" then
+        if far <= 8 then self.vmode = "hold" end
+    elseif far > 40 or s.vs > v.climb_max + 1 or s.vs < -(v.sink_max + 1) then
+        self.vmode = "rate"
+    end
+    local use_rate = cmd.vs or self.phase ~= "flying" or not v.throttle_hold
+        or sink_cap ~= nil or self.vmode == "rate"
     if use_rate then
         local vs_sp = cmd.vs or ctl:rateFor(s, cmd.alt or s.alt)
         if sink_cap then vs_sp = math.max(vs_sp, -sink_cap) end
@@ -487,7 +505,10 @@ function Flight:run(cmd, dt)
         lift, dp, dr, fwd, yaw = 0, 0, 0, 0, 0
     end
     local out = ctl:allocate(dt, lift, dp, dr, fwd, yaw, cmd.reverse and -1 or 1)
-    ctl:learnHover(s, dt, self.out.lift_used)
+    -- until the air has been measured, the model starts from the hover
+    -- speed learned so far
+    self.atmos.base_hover = ctl.hover
+    ctl:learnHover(s, dt, self.out.lift_used, (self.prox or 0) > 0)
 
     -- rear thruster: ramps up, drops instantly. Its thrust line is off the
     -- centre of mass, so it pitches the hull; when the stabiliser runs out
