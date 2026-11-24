@@ -1,7 +1,8 @@
 -- Flight OS version. Bumped with EVERY change that reaches the ship, with a
 -- short keyword saying what the change aimed at, so the pilot can tell at a
--- glance which build is running (terminal at start-up, start screen, SHIP
--- tab, log). Newest first.
+-- glance which build is running. The keyword shows on the ship terminal at
+-- start-up, in the log and on the error screen; the cockpit screen (start
+-- screen, SHIP tab) shows the number only. Newest first.
 local history = {
     { "2.8", "GENTLE STAB", "gentler stabiliser for a naturally steady hull" },
     { "2.7", "ROLL GAINS", "separate roll gains: no roll swinging on a narrow hull" },
