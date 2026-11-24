@@ -660,7 +660,7 @@ function UI:ctrl(m, static)
     local landing = fl.phase == "landing"
     local items = {
         fl.phase == "parked"
-            and { "ctl:land", "TAKE OFF", "LIFT TO 6 M", "primary" }
+            and { "ctl:land", "TAKE OFF", "", "primary" }
             or { "ctl:land", landing and "LANDING" or "AUTO-LAND", landing and "TAP TO CANCEL" or "DESCEND HERE", landing and "active" or (fl.phase == "flying" and "primary" or "off") },
         { "ctl:gear", "GEAR " .. (fl.gear_down and "DOWN" or "UP"), "TAP TO " .. (fl.gear_down and "RAISE" or "LOWER"), fl:feature("gear") and "normal" or "off" },
         { "ctl:mode", fl.mode:upper(), "SHIFT TOGGLES", (fl.phase == "flying" and not fl.ap and fl:feature("cruise_mode")) and "normal" or "off" },
@@ -676,7 +676,7 @@ function UI:ctrl(m, static)
         local cy = gy + math.floor((i - 1) / cols) * (bh + 6)
         if static then self:hit(cx, cy, bw, bh, it[1]) end
         self:part("cb" .. i, it[2] .. it[3] .. it[4], function()
-            self:button(cx, cy, bw, bh, it[2], nil, it[4], it[3])
+            self:button(cx, cy, bw, bh, it[2], nil, it[4], it[3] ~= "" and it[3] or nil)
         end)
     end
 end
