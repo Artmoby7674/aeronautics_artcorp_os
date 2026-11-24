@@ -245,7 +245,7 @@ function Flight:landingCmd(dt)
     -- stay level, the rear thruster cancels fore/aft drift, a rotation is
     -- braked to a stop. The autopilot turns onto the waypoint heading BEFORE
     -- starting the descent.
-    local cmd = { damp_u = 0, tight = true }
+    local cmd = { damp_u = 0, w_sp = 0, tight = true } -- w_sp: roll gently against sideways drift
 
     -- wait for the gear to settle (its sensor jumps while it swings down)
     if self.gear_settle > 0 then

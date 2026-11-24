@@ -64,6 +64,7 @@ function AP:planAltitude(fl)
 end
 
 function AP:setPhase(p)
+    if p ~= "turn" then self.turn_brg = nil end
     U.log("A/P %s: %s -> %s (%.0f m to go, %.0f s in %s)", self.name or "?", self.phase, p,
         self.dist or -1, self.pt or 0, self.phase)
     self.phase = p
@@ -168,10 +169,18 @@ function AP:update(fl, s, dt)
 
     if self.phase == "turn" then
         fl:setMode("hover")
-        if math.abs(herr) < a.heading_tol and math.abs(s.yaw_rate) < 2 then
+        -- the heading to face is fixed when the turn starts: close to the
+        -- point, a little sideways drift swings the bearing by many degrees
+        -- a second and chasing it made the turn hunt back and forth (v2.23:
+        -- 46 s to re-aim from 11 m). Rolling against the drift keeps it put.
+        if not self.turn_brg then self.turn_brg = brg end
+        local terr = U.wrap180(self.turn_brg - s.heading)
+        self.herr = terr
+        if math.abs(terr) < a.heading_tol and math.abs(s.yaw_rate) < 2 then
+            self.turn_brg = nil
             self:setPhase("cruise")
         end
-        return { alt = self.goal_alt, heading = brg, damp_u = 0 }
+        return { alt = self.goal_alt, heading = self.turn_brg, damp_u = 0, w_sp = 0, tight = true }
     end
 
     if self.phase == "stop" then
@@ -190,7 +199,7 @@ function AP:update(fl, s, dt)
                 self:setPhase("align")
             end
         end
-        return { alt = self.goal_alt, damp_u = 0, tight = true }
+        return { alt = self.goal_alt, damp_u = 0, w_sp = 0, tight = true }
     end
 
     if self.phase == "align" then
@@ -201,7 +210,7 @@ function AP:update(fl, s, dt)
             fl:beginLanding({ shutdown = a.shutdown_on_land, from_ap = true })
             self:setPhase("land")
         end
-        return { alt = self.goal_alt, heading = wp.heading, damp_u = 0, tight = true }
+        return { alt = self.goal_alt, heading = wp.heading, damp_u = 0, w_sp = 0, tight = true }
     end
 
     return nil

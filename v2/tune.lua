@@ -45,7 +45,10 @@ return {
         -- the swing, so roll damping is kept low (kd 0.24 swung 15-35 deg
         -- in the laggiest cases; 0.12 settles). Smaller deadband: on this
         -- ship a lean of under a degree already slides it sideways.
-        roll = { kp = 0.02, kd = 0.12, deadband = 0.4 },
+        -- (v2.24: kp 0.03, a firmer hold on a steady lean; the sim stays
+        -- stable over every lag/response case. A faster roll trim (ki) was
+        -- tried: it overshoots its trim and slides the hull further.)
+        roll = { kp = 0.03, kd = 0.12, deadband = 0.4 },
         ki = 0.005,          -- prop units per degree-second (slow hull trim:
                              -- holds off the natural slight nose-down pitch)
         int_limit = 2,
@@ -95,8 +98,12 @@ return {
         rear_max = 10,       -- rear level cap while braking
         fwd_gain = 0.3,      -- tilt demand per m/s (autopilot hover travel)
         fwd_dead = 0.25,     -- m/s
-        lat_gain = 0.12,     -- (unused by default: no sideways correction)
-        lat_max = 2,
+        -- Stop, align, turn in place and landing: lean gently against
+        -- sideways drift (the ship cannot strafe, but a small roll tips the
+        -- lift sideways). Sim: a 3 m/s drift at the start of a landing ends
+        -- 11 m off instead of 36 m.
+        lat_gain = 1.0,      -- degrees of roll per m/s of sideways speed
+        lat_max = 3,         -- degrees
         tilt_sign = 1,       -- flip if W moves the ship backwards
     },
 

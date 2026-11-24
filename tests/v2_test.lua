@@ -422,5 +422,29 @@ do
     check("throttle hold: props steady (one level of dither)", lmax - lmin <= 1, lmin .. ".." .. lmax)
 end
 
+-- 17. Landing leans gently against sideways drift (v2.23 flight: landed
+--     ~100 m off sliding sideways at ~2 m/s all the way down).
+do
+    local function land(lat)
+        local w = World.new({ loop_ticks = 3, tune = { hover = { lat_gain = lat } } }):airborne(100, 0)
+        w.fl.ctl.roll_known, w.fl.ctl.pitch_known = 1, 1
+        w.fl.calib = nil
+        w.sim.vel.x = 3 -- sliding to the right
+        w.fl:beginLanding({})
+        local x0, maxr = w.sim.pos.x, 0
+        w:run(120, function(w)
+            local _, _, r = w.sim:attitude()
+            maxr = math.max(maxr, math.abs(r))
+            return w.fl.phase ~= "landing"
+        end)
+        return w.sim.pos.x - x0, maxr
+    end
+    local off = land(0)
+    local d, maxr = land(1.0)
+    print(string.format("landing drift: %.1f m with the lean (%.1f m without), max roll %.1f", d, off, maxr))
+    check("landing drift: lean cuts the slide to under half", d < off / 2, f(d))
+    check("landing drift: only a little roll (< 4 deg)", maxr < 4, f(maxr))
+end
+
 print(string.format("v2_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("v2_test FAILED", 0) end
