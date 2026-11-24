@@ -73,7 +73,7 @@ return {
         },
         aux_relay = {
             SHIFT = "left",
-            PROX = "back",
+            PROX = "right",
         },
         engine_relay = {
             UP = "front",
@@ -94,7 +94,7 @@ return {
 
     proximity = {
         input_key = "aux_relay",
-        side = "back",
+        side = "right",
         landed_threshold = 15,
         gear_deploy_threshold = 1,
         max_blocks = 15,
