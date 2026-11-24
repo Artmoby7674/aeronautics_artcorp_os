@@ -30,6 +30,7 @@ local files = {
     { "v2/lib/nav.lua", "v2/lib/nav.lua" },
     { "v2/lib/rec.lua", "v2/lib/rec.lua" },
     { "v2/lib/util.lua", "v2/lib/util.lua" },
+    { "v2/lib/version.lua", "v2/lib/version.lua" },
     { "v2/lib/ui/draw.lua", "v2/lib/ui/draw.lua" },
     { "v2/lib/ui/font.lua", "v2/lib/ui/font.lua" },
     { "v2/lib/ui/ui.lua", "v2/lib/ui/ui.lua" },

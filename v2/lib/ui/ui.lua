@@ -11,6 +11,7 @@
 -- text/values it shows) changes, so a quiet screen costs almost nothing.
 local D = require("draw")
 local U = require("util")
+local V = require("version")
 
 local UI = {}
 UI.__index = UI
@@ -575,6 +576,7 @@ function UI:ship(m, static)
         D.text(lx, y0, "HARDWARE", C.accent, C.bg)
         D.text(rx, y0, "LEARNED IN FLIGHT", C.accent, C.bg)
         self:button(rx, y0 + 140, colw, 18, "RESET LEARNED VALUES", "ship:reset", "normal")
+        D.text(lx, y0 + 146, "OS " .. V.label:upper(), C.accent, C.bg)
     end
     local loop = m.loop or {}
     local left = {
@@ -690,7 +692,7 @@ function UI:splash(m)
         while sc > 1 and D.textW(name, sc) > W - 20 do sc = sc - 1 end
         D.text(W / 2, 44, name, C.white, C.bg, sc, "c")
         D.rect(W / 2 - 30, 44 + 7 * sc + 4, 60, 2, C.accent)
-        D.text(W / 2, 44 + 7 * sc + 10, "ARTCORP FLIGHT OS  V2", C.dim, C.bg, 1, "c")
+        D.text(W / 2, 44 + 7 * sc + 10, "ARTCORP FLIGHT OS  " .. V.label:upper(), C.dim, C.bg, 1, "c")
         local by = 128
         if booting then
             D.text(W / 2, by - 14, m.boot_step or "STARTING", C.accent, C.bg, 1, "c")

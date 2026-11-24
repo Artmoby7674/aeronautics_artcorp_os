@@ -9,6 +9,7 @@ local Link = require("link")
 local Rec = require("rec")
 local D = require("draw")
 local UI = require("ui")
+local V = require("version")
 
 local Main = {}
 
@@ -404,8 +405,13 @@ function Main.run(opts)
     local f = fs.open(ROOT .. "/data/slot", "w")
     if f then f.write(cfg.slot) f.close() end
 
-    print("ArtCorp Flight OS v2 - ship " .. cfg.name .. " (slot " .. cfg.slot .. ")")
-    U.log("---- start (run %s) ship %s slot %s", tostring(opts.runs or 1), cfg.name, cfg.slot)
+    if term.setTextColor then pcall(term.setTextColor, colors.cyan) end
+    print("ArtCorp Flight OS " .. V.label)
+    if term.setTextColor then pcall(term.setTextColor, colors.white) end
+    print("  last fix: " .. V.note)
+    print("  ship " .. cfg.name .. " (slot " .. cfg.slot .. ")")
+    U.log("---- start (run %s) %s [%s] ship %s slot %s", tostring(opts.runs or 1), V.label, V.note,
+        cfg.name, cfg.slot)
     if opts.recovered then U.log("restarted after: %s", tostring(opts.recovered)) end
     HW.init(cfg.ship)
     app.missing = HW.connect()

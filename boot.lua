@@ -45,7 +45,7 @@ while true do
     runs = runs + 1
     -- reload the OS fresh on every start (only its own modules)
     for _, m in ipairs({ "main", "util", "config", "hw", "est", "ctl", "flight", "ap",
-        "nav", "link", "rec", "draw", "font", "ui" }) do
+        "nav", "link", "rec", "draw", "font", "ui", "version" }) do
         package.loaded[m] = nil
     end
     local ok, result = pcall(function() return require("main").run({ recovered = last_err, runs = runs }) end)
@@ -56,7 +56,9 @@ while true do
     last_err = err
     printError("OS stopped: " .. err)
     pcall(function() require("draw").shutdown() end) -- stock colours back
+    local okv, V = pcall(require, "version")
     local lines = { "FLIGHT OS ERROR - restarting in " .. RESTART_DELAY .. " s" }
+    if okv and type(V) == "table" then lines[#lines + 1] = "build " .. tostring(V.label) end
     for _, l in ipairs(wrap(err, 48)) do lines[#lines + 1] = l end
     lines[#lines + 1] = ""
     lines[#lines + 1] = "Restart #" .. runs .. ". If this repeats, tell your engineer."
