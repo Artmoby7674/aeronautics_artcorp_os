@@ -324,7 +324,67 @@ end
 
 local function edge(k) return (app.keys[k] or 0) > 0 and not ((app.prev[k] or 0) > 0) end
 
+-- Black box columns (v2/data/bb.txt, one line per control tick in flight).
+-- t: clock s, dt: real tick s | alt vs | p r: pitch/roll deg, pr rr yr:
+-- rates deg/s | hdg | u w: fwd/right speed | pP pD pI rP rD rI: pitch/roll
+-- correction terms (prop units), dp dr: corrections sent | ysp: yaw rate
+-- wanted (- = free), yu: yaw tilt demand | L*: prop levels written to the
+-- relays | tilt | rear | ms: tick length, pose/vel/in/out: ms spent in those
+-- calls (n = count) | ph/mode/ap/cal: phases | keys held
+local BB_HEADER = "t dt ph mode ap cal alt vs p r pr rr hdg yr u w pP pD pI rP rD rI dp dr ysp yu"
+    .. " LFL LFR LRL LRR tilt rear tick_ms pose_ms vel_ms in_ms/n out_ms/n keys"
+
+local function f1(v) return v and string.format("%.1f", v) or "-" end
+local function f2(v) return v and string.format("%.2f", v) or "-" end
+
+local function blackBox(tick_ms)
+    local fl = app.fl
+    local s, c, o, st = fl.est.s, fl.ctl, fl.out or {}, HW.stats
+    local a = c.dbg_att or {}
+    local y = c.dbg_yaw
+    local lv = fl.levels or {}
+    local tl = o.tilt or {}
+    local held = {}
+    for k, v in pairs(app.keys or {}) do if (v or 0) > 0 and k ~= "PROX" then held[#held + 1] = k end end
+    table.sort(held)
+    U.bbHeader(BB_HEADER)
+    U.bb(table.concat({
+        string.format("%.2f", os.clock()), f2(app.dt), fl.phase, fl.mode,
+        fl.ap and fl.ap.phase or "-", fl.calib and tostring(fl.calib.stage) or "-",
+        f1(s.alt), f2(s.vs), f2(s.pitch), f2(s.roll), f1(s.pitch_rate), f1(s.roll_rate),
+        f1(s.heading), f1(s.yaw_rate), f2(s.u), f2(s.w),
+        f2(a.pP), f2(a.pD), f2(a.pI), f2(a.rP), f2(a.rD), f2(a.rI), f2(fl.last_dp), f2(fl.last_dr),
+        y and f1(y.sp) or "-", y and f2(y.u) or "-",
+        tostring(lv.FL or "-"), tostring(lv.FR or "-"), tostring(lv.RL or "-"), tostring(lv.RR or "-"),
+        string.format("%d%d%d%d", tl.FL or 0, tl.FR or 0, tl.RL or 0, tl.RR or 0),
+        string.format("%.0f%s", o.rear or 0, o.rear_rev and "R" or ""),
+        string.format("%.0f", tick_ms), string.format("%.0f", st.pose_ms), string.format("%.0f", st.vel_ms),
+        string.format("%.0f/%d", st.in_ms, st.in_n), string.format("%.0f/%d", st.out_ms, st.out_n),
+        #held > 0 and table.concat(held, "+") or "-",
+    }, " "), os.clock())
+end
+
+-- Every 10 s in flight: where the control loop's time goes (log.txt).
+local function timingSummary(tick_ms)
+    local tm = app.timing or { n = 0, dt = 0, dt_max = 0, tick = 0, pose = 0, vel = 0, inp = 0, out = 0, t0 = os.clock() }
+    app.timing = tm
+    local st = HW.stats
+    tm.n = tm.n + 1
+    tm.dt = tm.dt + (app.dt or DT)
+    tm.dt_max = math.max(tm.dt_max, app.dt or DT)
+    tm.tick, tm.pose, tm.vel = tm.tick + tick_ms, tm.pose + st.pose_ms, tm.vel + st.vel_ms
+    tm.inp, tm.out = tm.inp + st.in_ms, tm.out + st.out_ms
+    if os.clock() - tm.t0 >= 10 then
+        local n = tm.n
+        U.log("loop timing (%d ticks): tick every %.0f ms (max %.0f); per tick: %.0f ms working, of which pose %.0f, velocity %.0f, relay reads %.0f, relay writes %.0f",
+            n, tm.dt / n * 1000, tm.dt_max * 1000, tm.tick / n, tm.pose / n, tm.vel / n, tm.inp / n, tm.out / n)
+        app.timing = nil
+    end
+end
+
 local function controlTick()
+    local tick_t0 = HW.now_ms()
+    HW.resetStats()
     app.prev, app.keys = app.keys, HW.inputs()
     if edge("UP") then app.ui:cycleTab(-1) end
     if edge("DOWN") then app.ui:cycleTab(1) end
@@ -336,13 +396,13 @@ local function controlTick()
         if edge("SPACE") then beginBoot() end
         return
     elseif app.power == "booting" then
-        bootTick(DT)
+        bootTick(app.dt or DT)
         return
     end
 
     HW.setClutch(true) -- held while the OS is on: this is what couples the props
     HW.setStarter(false)
-    app.fl:update(DT, app.keys)
+    app.fl:update(app.dt or DT, app.keys)
     local ph = app.fl.phase
     writeState((ph == "flying" or ph == "landing" or ph == "unflip") and "air" or "ground", app.fl.gear_down)
     for _, e in ipairs(app.fl.events) do
@@ -361,6 +421,12 @@ local function controlTick()
         app.fl.msg = nil
     end
     Rec.tick(os.clock(), app.fl.est.s)
+    if app.fl.phase == "parked" then U.bbFlush(os.clock()) end
+    if app.fl.phase ~= "parked" then
+        local tick_ms = HW.now_ms() - tick_t0
+        pcall(blackBox, tick_ms)
+        timingSummary(tick_ms)
+    end
     -- flight data, once a second while not parked: what the stabiliser saw
     -- and did (dp/dr = pitch/roll correction, prop units)
     local fl = app.fl
@@ -531,6 +597,12 @@ function Main.run(opts)
                 local period = now - last_tick
                 last_tick = now
                 app.loop.ms = U.lowpass(app.loop.ms, period * 1000, period, 1)
+                -- The REAL time since the last tick. Every peripheral call can
+                -- make this loop wait for the game, so a tick takes 0.2 s or
+                -- more on the ship, not the 0.05 s the timer asks for. v2.9 and
+                -- v2.20 assumed 0.05 s: turn rates came out ~4x too big and
+                -- every time constant ran ~4x slow.
+                app.dt = U.clamp(period, DT, 0.5)
                 while #actions > 0 do
                     local a = table.remove(actions, 1)
                     local ok2, err2 = xpcall(function() act(a) end, trace)
@@ -633,6 +705,7 @@ function Main.run(opts)
     parallel.waitForAny(eventLoop, controlLoop, screenLoop)
     saveLearned(app.fl.ctl)
     D.shutdown()
+    U.bbFlush(os.clock())
     U.log("stopped (terminate)")
     print("Flight OS stopped. Outputs keep their last values; reboot to start it again.")
 end

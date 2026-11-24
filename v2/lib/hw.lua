@@ -41,12 +41,34 @@ function HW.feature(name)
     return not not f[name]
 end
 
+-- Call timing (debug): how long each kind of peripheral call keeps the
+-- control loop waiting. Real milliseconds (os.epoch "utc"); main.lua reads
+-- and resets HW.stats every tick. A call that waits for the game's main
+-- thread costs a whole game tick (50 ms) of loop time.
+local function now_ms()
+    if os.epoch then return os.epoch("utc") end
+    return os.clock() * 1000
+end
+HW.now_ms = now_ms
+HW.stats = {}
+function HW.resetStats()
+    HW.stats = { pose_ms = 0, vel_ms = 0, mass_ms = 0, in_ms = 0, in_n = 0, out_ms = 0, out_n = 0 }
+end
+HW.resetStats()
+local function stat(k, ms, nk)
+    local st = HW.stats
+    st[k] = (st[k] or 0) + ms
+    if nk then st[nk] = (st[nk] or 0) + 1 end
+end
+
 local function write(relayKey, side, value)
     local r = dev[relayKey]
     if not r or not side then return false end
     local ck = relayKey .. ":" .. side
     if cache[ck] == value then return true end
+    local t0 = now_ms()
     local ok = pcall(r.setAnalogOutput, side, value)
+    stat("out_ms", now_ms() - t0, "out_n")
     if ok then cache[ck] = value end
     return ok
 end
@@ -128,7 +150,9 @@ function HW.inputs()
         for key, side in pairs(sides) do
             local v = 0
             if r then
+                local t0 = now_ms()
                 local ok, val = pcall(r.getAnalogInput, side)
+                stat("in_ms", now_ms() - t0, "in_n")
                 if ok and type(val) == "number" then v = val end
             end
             keys[key] = v
@@ -142,7 +166,9 @@ function HW.proximity()
     if not p then return 0 end
     local r = dev[p.input_key]
     if not r then return 0 end
+    local t0 = now_ms()
     local ok, v = pcall(r.getAnalogInput, p.side)
+    stat("in_ms", now_ms() - t0, "in_n")
     if not ok or type(v) ~= "number" then return 0 end
     return U.clamp(math.floor(v), 0, 15)
 end
@@ -171,10 +197,13 @@ HW._rotate = rotate
 -- Raw ship state. The ship's local axes (as built): +X nose, +Y up, +Z right.
 -- Returned as world-space unit vectors so nothing downstream depends on any
 -- Euler convention.
+local mass, mass_n = 0, 0
 function HW.ship()
     local s = { ok = false }
     local ok, err = pcall(function()
+        local t0 = now_ms()
         local pose = sublevel.getLogicalPose()
+        stat("pose_ms", now_ms() - t0)
         local p = pose.position
         s.x, s.y, s.z = p.x, p.y, p.z
         local qx, qy, qz, qw = quatParts(pose.orientation)
@@ -185,10 +214,21 @@ function HW.ship()
         s.fx, s.fy, s.fz = rotate(qx, qy, qz, qw, 1, 0, 0)
         s.ux, s.uy, s.uz = rotate(qx, qy, qz, qw, 0, 1, 0)
         s.rx, s.ry, s.rz = rotate(qx, qy, qz, qw, 0, 0, 1)
+        t0 = now_ms()
         local v = sublevel.getLinearVelocity()
+        stat("vel_ms", now_ms() - t0)
         s.vx, s.vy, s.vz = v.x or 0, v.y or 0, v.z or 0
-        local okm, m = pcall(sublevel.getMass)
-        s.mass = okm and m or 0
+        -- mass is not used for control: read it once in a while only (each
+        -- Sable call can cost the loop a game tick)
+        mass_n = mass_n - 1
+        if mass_n <= 0 then
+            mass_n = 200
+            t0 = now_ms()
+            local okm, m = pcall(sublevel.getMass)
+            stat("mass_ms", now_ms() - t0)
+            if okm then mass = m end
+        end
+        s.mass = mass
         s.ok = true
     end)
     if not ok then s.err = tostring(err) end

@@ -30,8 +30,8 @@ function U.bearing(dx, dz)
     return U.wrap360(math.deg(U.atan2(dx, -dz)))
 end
 
-function U.hypot(a, b)
-    return math.sqrt(a * a + b * b)
+function U.hypot(a, b, c)
+    return math.sqrt(a * a + b * b + (c or 0) ^ 2)
 end
 
 -- Speed that still lets you stop within `dist` at deceleration `a`.
@@ -130,6 +130,38 @@ function U.log(fmt, ...)
     local okf, msg = pcall(string.format, tostring(fmt), ...)
     if not okf then msg = tostring(fmt) end
     append(U.LOG_PATH, LOG_MAX, msg)
+end
+
+-- Black box: one line per control tick while not parked, buffered in
+-- memory and written in one go every couple of seconds (opening the file
+-- every tick would slow the loop down). Own rotating file, header on top.
+U.BB_PATH = "v2/data/bb.txt"
+local BB_MAX = 150 * 1024
+local bb = { lines = {}, t = 0 }
+function U.bbHeader(h) bb.header = h end
+function U.bb(line, now)
+    bb.lines[#bb.lines + 1] = line
+    if now - bb.t >= 2 or #bb.lines >= 100 then U.bbFlush(now) end
+end
+function U.bbFlush(now)
+    bb.t = now or bb.t
+    if #bb.lines == 0 then return end
+    local lines = bb.lines
+    bb.lines = {}
+    pcall(function()
+        local p = U.BB_PATH
+        local fresh = not fs.exists(p)
+        if not fresh and fs.getSize(p) > BB_MAX then
+            pcall(fs.delete, p .. ".old")
+            pcall(fs.move, p, p .. ".old")
+            fresh = true
+        end
+        local f = fs.open(p, "a")
+        if not f then return end
+        if fresh and bb.header then f.writeLine(bb.header) end
+        f.write(table.concat(lines, "\n") .. "\n")
+        f.close()
+    end)
 end
 
 -- Flight data (one line a second while flying), its own rotating file.

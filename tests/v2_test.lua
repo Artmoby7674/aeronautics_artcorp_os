@@ -311,5 +311,36 @@ do
     check("dircheck: steady after fixing pitch", late < 3, f(late))
 end
 
+-- 14. The real ship's control loop runs every ~0.2 s (each Sable call waits
+--     for the game). The controller must use the real tick length: v2.9 to
+--     v2.20 assumed 0.05 s, read turn rates ~4x too big and swung itself
+--     over (reproduced here with fake_dt).
+do
+    local function kick(opts)
+        local w = World.new(opts):airborne(120, 0)
+        w.fl.ctl.roll_known, w.fl.ctl.pitch_known = 1, 1
+        w.sim.w.x = math.rad(10)
+        local late = 0
+        w:run(60, function(w)
+            local _, p, r = w.sim:attitude()
+            if w.t > 40 then late = math.max(late, math.abs(p), math.abs(r)) end
+        end)
+        return late, w
+    end
+    local ok_late, w = kick({ loop_ticks = 4, sim = { prop_tau = 1.0 } })
+    local bad_late = kick({ loop_ticks = 4, fake_dt = 0.05, sim = { prop_tau = 1.0 } })
+    print(string.format("slow loop: real dt late %.2f deg, fixed 0.05 s late %.1f deg", ok_late, bad_late))
+    check("slow loop: steady with the real tick length", ok_late < 2, f(ok_late))
+    check("slow loop: the old fixed 0.05 s reproduces the swing", bad_late > 20, f(bad_late))
+    -- turn rate from a 0.2 s tick is the real rate
+    local w2 = World.new({ loop_ticks = 4 }):airborne(120, 0)
+    w2.sim.w.y = math.rad(-10) -- body yaw (sim sign: - = heading increasing)
+    w2.fl.calib = nil
+    w2:run(0.6) -- three ticks: the estimate has caught up, no tilt acted yet
+    local truth = -math.deg(w2.sim.w.y)
+    check("slow loop: yaw rate read at its real size", math.abs(w2.fl.est.s.yaw_rate - truth) < 1.5,
+        f(w2.fl.est.s.yaw_rate) .. " vs " .. f(truth))
+end
+
 print(string.format("v2_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("v2_test FAILED", 0) end

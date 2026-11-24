@@ -29,6 +29,28 @@ function Est:update(raw, dt)
         return s
     end
     s.valid, s.err = true, nil
+    -- debug: the game's physics sometimes stalls (pose and velocity exactly
+    -- unchanged for many ticks) and then lets go (v2.20 log: frozen 22 s,
+    -- then 140 m/s). Flag both so the log shows them.
+    local pv = self.prev
+    if pv and pv.x then
+        local same = raw.x == pv.x and raw.y == pv.y and raw.z == pv.z and raw.uy == pv.uy
+        self.frozen = same and (self.frozen or 0) + dt or 0
+        if self.frozen >= 2 and not self.frozen_told then
+            self.frozen_told = true
+            U.log("telemetry: ship pose has not changed for 2 s (physics stalled?) at %.1f,%.1f,%.1f",
+                raw.x, raw.y, raw.z)
+        elseif self.frozen == 0 and self.frozen_told then
+            self.frozen_told = false
+            U.log("telemetry: ship moving again")
+        end
+        local jump = U.hypot(raw.x - pv.x, raw.z - pv.z, raw.y - pv.y)
+        local expect = (U.hypot(raw.vx, raw.vz, raw.vy) + 5) * math.max(dt, 0.05) * 3 + 2
+        if jump > expect and jump > 5 then
+            U.log("telemetry: ship jumped %.1f m in one tick (%.2f s; speed says %.1f m)", jump, dt, expect)
+        end
+    end
+    s.frozen = self.frozen or 0
     s.x, s.y, s.z = raw.x, raw.y, raw.z
     s.alt = raw.y
     s.vx, s.vy, s.vz = raw.vx, raw.vy, raw.vz
@@ -64,7 +86,8 @@ function Est:update(raw, dt)
     else
         s.pitch_rate, s.roll_rate, s.yaw_rate, s.accel = 0, 0, 0, 0
     end
-    self.prev = { pitch = pitch, roll = roll, heading = heading, vs = s.vs }
+    self.prev = { pitch = pitch, roll = roll, heading = heading, vs = s.vs,
+        x = raw.x, y = raw.y, z = raw.z, uy = raw.uy }
     s.heading, s.pitch, s.roll = heading, pitch, roll
 
     s.press = self:pressure(s.alt)

@@ -1,10 +1,12 @@
--- Flight OS version. Bumped with EVERY change that reaches the ship, with a
+-- Flight OS version. Numbering: 2.8, 2.9, 2.20, 2.21 ... 2.99, 2.100 (the part
+-- after the dot is a plain counter, never "3.0"). Bumped with EVERY change that reaches the ship, with a
 -- short keyword saying what the change aimed at, so the pilot can tell at a
 -- glance which build is running. The keyword shows on the ship terminal at
 -- start-up, in the log and on the error screen; the cockpit screen (start
 -- screen, SHIP tab) shows the number only. Newest first.
 local history = {
-    { "3.0", "CALM ROLL", "gains for a strong, 1 s late hull; fine prop steps; lag-proof direction check" },
+    { "2.21", "REAL TIME", "uses the real control tick (~0.2 s, not 0.05 s); black box + call timing logs" },
+    { "2.20", "CALM ROLL", "gains for a strong, 1 s late hull; fine prop steps; lag-proof direction check" },
     { "2.9", "DIR CHECK", "take-off check of which way pitch/roll corrections move the hull" },
     { "2.8", "GENTLE STAB", "gentler stabiliser for a naturally steady hull" },
     { "2.7", "ROLL GAINS", "separate roll gains: no roll swinging on a narrow hull" },
@@ -24,6 +26,6 @@ return {
     note = latest[3],
     date = "2026-11-24",
     history = history,
-    -- "v3.0 CALM ROLL"
+    -- "v2.21 REAL TIME"
     label = "v" .. latest[1] .. " " .. latest[2],
 }

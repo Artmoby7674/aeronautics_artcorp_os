@@ -33,19 +33,26 @@ function World.new(opts)
     self.fl = Flight.new(tune, HW, ship)
     self.fl:boot()
     self.t = 0
+    self.loop_ticks = opts.loop_ticks
+    self.fake_dt = opts.fake_dt -- reproduce v2.9-v2.20: told 0.05 s whatever the loop did
     self.trace = {}
     return self
 end
 
+-- opts.loop_ticks: game ticks per control tick (the real ship's loop runs
+-- every ~4 game ticks = 0.2 s); the controller gets the real elapsed time.
 function World:tick()
-    self.fl:update(DT, HW.inputs())
-    self.sim:step(DT)
-    self.t = self.t + DT
+    local k = self.loop_ticks or 1
+    self.fl:update(self.fake_dt or DT * k, HW.inputs())
+    for _ = 1, k do
+        self.sim:step(DT)
+        self.t = self.t + DT
+    end
 end
 
 -- run for `secs`, calling fn(world) each tick; fn returning true stops early
 function World:run(secs, fn)
-    local n = math.floor(secs / DT + 0.5)
+    local n = math.floor(secs / (DT * (self.loop_ticks or 1)) + 0.5)
     for _ = 1, n do
         self:tick()
         if fn and fn(self) then return true end

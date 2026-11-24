@@ -63,6 +63,8 @@ function AP:planAltitude(fl)
 end
 
 function AP:setPhase(p)
+    U.log("A/P %s: %s -> %s (%.0f m to go, %.0f s in %s)", self.name or "?", self.phase, p,
+        self.dist or -1, self.pt or 0, self.phase)
     self.phase = p
     self.pt = 0
 end
@@ -102,6 +104,7 @@ function AP:update(fl, s, dt)
         fl:setMode("hover")
         if not self.told_calib then
             self.told_calib = true
+            U.log("A/P %s: waiting in hover for the direction check", self.name or "?")
             fl:notify("A/P WAITS: DIRECTION CHECK")
         end
         return { alt = fl.alt_target or s.alt, damp_u = 0 }

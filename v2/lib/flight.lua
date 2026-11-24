@@ -21,6 +21,7 @@ function Flight.new(tune, hw, ship)
     self.t, self.hw, self.shipcfg = tune, hw, ship
     self.ctl = Ctl.new(tune)
     self.est = Est.new(tune)
+    self.levels = {}
     self.phase = "parked"
     self.mode = "hover"
     self.alt_target = 0
@@ -41,6 +42,12 @@ end
 
 function Flight:notify(text)
     self.msg = { text = text, t = os.clock() }
+    -- debug: every pilot message goes to the log too (repeats once a 5 s)
+    local now = os.clock()
+    if text ~= self.last_note or now - (self.last_note_t or -99) > 5 then
+        U.log("message: %s", text)
+        self.last_note, self.last_note_t = text, now
+    end
 end
 
 function Flight:feature(n) return self.hw.feature(n) end
@@ -414,6 +421,7 @@ function Flight:run(cmd, dt)
         if r > 1.5 then self.yaw_brk = true elseif r < 0.5 then self.yaw_brk = false end
         if self.yaw_brk then rate_sp = 0 end
     end
+    ctl.dbg_yaw = nil
     local yaw = rate_sp and ctl:yaw(s, dt, rate_sp) or 0
 
     local fwd = 0
@@ -657,7 +665,9 @@ function Flight:write(out)
         if self.phase == "parked" or self.phase == "estop" then self.ctl:softReset() end
     end
     for _, p in ipairs(hw.PROPS) do
-        hw.setProp(p, self:quantise(p, out[p] or 0))
+        local lvl = self:quantise(p, out[p] or 0)
+        self.levels[p] = lvl -- what the relay really got (black box)
+        hw.setProp(p, lvl)
         hw.setTilt(p, out.tilt[p] or 0)
     end
     hw.setRear(out.rear or 0, out.rear_rev)
