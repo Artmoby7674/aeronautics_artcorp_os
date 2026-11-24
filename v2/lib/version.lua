@@ -5,6 +5,7 @@
 -- start-up, in the log and on the error screen; the cockpit screen (start
 -- screen, SHIP tab) shows the number only. Newest first.
 local history = {
+    { "2.33", "GEAR UP", "autopilot raises the gear once the ground is out of sensor range" },
     { "2.32", "NO ESCAPE", "pilot can't cancel, land, E-STOP or switch off a summoned ship, or clear an ArtCorp E-STOP" },
     { "2.31", "NUDGE", "level-1 rear nudges when stalled short of the waypoint; re-aim no longer waits on altitude" },
     { "2.30", "FLEET LINK", "ArtCorp remote can scan, E-STOP, force-land, summon and lock this ship over rednet" },
@@ -37,6 +38,6 @@ return {
     note = latest[3],
     date = "2026-11-24",
     history = history,
-    -- "v2.32 NO ESCAPE"
+    -- "v2.33 GEAR UP"
     label = "v" .. latest[1] .. " " .. latest[2],
 }

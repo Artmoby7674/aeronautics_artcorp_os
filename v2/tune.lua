@@ -160,6 +160,8 @@ return {
         nudge_on = 1.5,      -- s
         nudge_period = 4,    -- s
         nudge_speed = 0.5,   -- m/s: slower than this = not making progress
+        gear_up_after = 3,   -- s with no ground in sensor range before the
+                             -- autopilot raises the gear
         heading_tol = 4,     -- deg
         shutdown_on_land = true,
         phase_timeout = 240, -- s per phase

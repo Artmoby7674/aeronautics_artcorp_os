@@ -536,5 +536,32 @@ do
     check("nudges: only level 1", max_rear <= 1.01, f(max_rear))
 end
 
+-- 21. Autopilot gear: up once the ground is out of sensor range, down
+--     again for the landing; never up while the ground is in range.
+do
+    local w = World.new({ loop_ticks = 3 })
+    local ground = w:truth().alt
+    w:startAP({ name = "GEAR", x = 0, z = -350, heading = 0 })
+    local went_up, up_low, up_alt = false, false, nil
+    local landed_down = nil
+    w:run(400, function(w)
+        if not w.fl.gear_down then
+            if not went_up then up_alt = w:truth().alt - ground end
+            went_up = true
+            if (w.fl.prox or 0) > 0 then up_low = true end
+        end
+        if w.fl.phase == "parked" and w.t > 20 then
+            landed_down = w.fl.gear_down
+            return true
+        end
+    end)
+    print(string.format("ap gear: up=%s first up %.0f m above ground, up while ground in range=%s, landed with gear down=%s",
+        tostring(went_up), up_alt or -1, tostring(up_low), tostring(landed_down)))
+    check("ap gear: raised in flight", went_up)
+    check("ap gear: only once clear of the ground (> 14 m)", up_alt and up_alt > 14, f(up_alt or -1))
+    check("ap gear: never up with ground in range", not up_low)
+    check("ap gear: down for touchdown", landed_down == true, tostring(landed_down))
+end
+
 print(string.format("v2_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("v2_test FAILED", 0) end

@@ -105,6 +105,19 @@ function AP:update(fl, s, dt)
         fl:takeoff()
         return nil
     end
+    -- Gear up once clear of the ground: the gear sensor (range 14 blocks)
+    -- has seen nothing for gear_up_after s. It comes back down on its own as
+    -- soon as ground is in range again (Flight:update) and for the landing.
+    if (fl.prox or 0) == 0 and fl.phase == "flying" then
+        self.clear_t = (self.clear_t or 0) + dt
+        if fl.gear_down and self.clear_t > (a.gear_up_after or 3) then
+            fl:setGear(false)
+            fl:notify("GEAR UP")
+        end
+    else
+        self.clear_t = 0
+    end
+
     local wp = self.wp
     local dx, dz = wp.x - s.x, wp.z - s.z
     local dist = U.hypot(dx, dz)
