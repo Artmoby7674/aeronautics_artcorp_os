@@ -9,7 +9,7 @@
 -- a moving branch silently changes what ships get, and a half-updated
 -- install is a broken ship. Bump REF deliberately when releasing, and only
 -- to a commit that is already pushed (an unpushed SHA 404s every file).
-local REF = "a1d780a77edb963637ce5ab9f6eb027787819a7c"
+local REF = "1a8a7b0533338197f370842683bcd3530ae3f713"
 local BASE_URL = "https://raw.githubusercontent.com/Artmoby7674/aeronautics_artcorp_os/" .. REF
 
 -- { repo path, path on the computer }. The launcher (boot.lua) becomes
