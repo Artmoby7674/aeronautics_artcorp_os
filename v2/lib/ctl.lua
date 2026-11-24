@@ -116,8 +116,11 @@ function Ctl:attitude(s, dt, pitch_sp, roll_sp)
     if rl > 0.1 then
         self.rear_pk = U.clamp(self.rear_pk + a.ki * 4 * ep * rl * dt, -a.max_corr, a.max_corr)
     end
+    -- separate roll gains: a long, narrow hull is far harder to pitch than
+    -- to roll, and pitch-level damping makes the light roll axis oscillate
+    local rk = a.roll or {}
     local dp = a.kp * deadband(ep, a.deadband) - a.kd * s.pitch_rate + self.pi_ + self.rear_pk * rl
-    local dr = a.kp * deadband(er, a.deadband) - a.kd * s.roll_rate + self.ri
+    local dr = (rk.kp or a.kp) * deadband(er, a.deadband) - (rk.kd or a.kd) * s.roll_rate + self.ri
     -- integrate only while the output is not pinned (anti-windup)
     if math.abs(dp) < a.max_corr then
         self.pi_ = U.clamp(self.pi_ + a.ki * ep * dt, -a.int_limit, a.int_limit)

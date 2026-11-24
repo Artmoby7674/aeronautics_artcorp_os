@@ -34,6 +34,10 @@ return {
         kd = 1.5,            -- prop units per deg/s (heavy damping: a big hull
                              -- carries momentum, so brake the swing early)
         ki = 0.03,           -- prop units per degree-second (hull trim)
+        -- ROLL has its own gains: the hull is long and narrow, so it rolls
+        -- much more easily than it pitches; pitch-level damping (kd 1.5) made
+        -- the roll axis oscillate in the sim when it is 4-8x lighter.
+        roll = { kp = 0.20, kd = 0.6 },
         int_limit = 3,
         max_corr = 5,        -- prop units per axis
         deadband = 0.3,      -- degrees (P term only)

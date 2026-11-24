@@ -175,7 +175,9 @@ do
     -- the tail fin would turn them into rotation). It lands where it drifts
     -- to: within ~15 m is the target for a hull this size.
     check("trip: on the waypoint (< 15 m)", miss < 15, f(miss))
-    check("trip: on its heading", math.abs(U.wrap180(t.heading - 200)) < 5, f(t.heading))
+    -- aligned before the descent; no heading hold on the way down (no tilt
+    -- loops), so the tail fin may turn it a little as it drifts
+    check("trip: on its heading (within 20 deg)", math.abs(U.wrap180(t.heading - 200)) < 20, f(t.heading))
     check("trip: never sank > 5 m in cruise", below < 5, f(below))
     check("trip: attitude < 8 deg", maxatt < 8, f(maxatt))
     check("trip: soft touchdown", (w.sim.touch_v or 9) < 1.2, w.sim.touch_v)

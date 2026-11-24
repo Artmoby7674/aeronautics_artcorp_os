@@ -68,7 +68,8 @@ local DEFAULTS = {
     tilt_rate = 120,               -- deg/s servo travel
     tilt_deg = 25,
     rear_accel = 0.35,             -- m/s^2 per rear level
-    rear_dy = -2,                  -- m: rear thrust line below the CoM
+    rear_dy = 0,                   -- m: rear thrust line vs the CoM (3 rear
+                                   -- thrusters around the centre: ~0)
     rear_dz = 0,                   -- m: sideways offset (+ = right)
     hull_pitch = 0,                -- deg/s^2 constant disturbances
     hull_roll = 0,
