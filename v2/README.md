@@ -66,7 +66,7 @@ Any stick or altitude input during an autopilot run cancels the run
 | Attitude corrections | Only slow props down, so every correction costs lift. | Move props in pairs (one up, one down), so lift stays the same. The mean only shifts when a prop would pass 0 or 15. |
 | Tilt | Lift loss paid back on the average. | Paid back per prop, following the tilt mechanism's travel. Turning doesn't sink the ship. |
 | Altitude | PID on altitude plus several special laws (climb law, handover slews, landing walk). | One law everywhere: altitude error → climb-rate target (with a braking curve) → PI on the measured climb rate. |
-| Tilt as on/off | Treated as proportional (the comments note it isn't). | Treated as on/off and time-modulated (sigma-delta, minimum 3-tick dwell). |
+| Tilt as on/off | Treated as proportional (the comments note it isn't). | Treated as on/off: long pulses with hysteresis (on ≥ 0.8 s, rest ≥ 1.5 s), coasting on momentum in between. |
 | Rotation rates | Angular velocity read on assumed body axes. | Derived from the attitude itself, so they're right whichever frame Sable reports in. |
 | Steady disturbances | Some trims. | Learned: pitch, roll and yaw trims, hover throttle, and feedforwards that scale with rear power (rear pitch and rear yaw). The last one cancels a "keeps turning right in cruise" torque in proportion to thrust. |
 | Rear thruster vs pitch | Rear pitch torque could pin the props: lift and pitch both run out (the step 2→3 drop). | A rear cap backs the thrust off whenever the stabiliser saturates. |
@@ -81,6 +81,14 @@ Any stick or altitude input during an autopilot run cancels the run
 Every knob is in `v2/tune.lua`, grouped and commented. These are the ones
 that depend on how the real ship behaves:
 
+- `tilt.on / off / min_on / min_off`: how the on/off prop tilt is pulsed.
+  The props are large, so every tilt flip is a big torque kick. Tilts
+  engage only on a clear demand, stay on at least `min_on` (0.8 s), and rest
+  at least `min_off` (1.5 s); in between, the ship coasts on its momentum.
+  Raise `min_off` for an even calmer ship. Lower it for more precise
+  positioning: with long pulses, autopilot landings end within about 10 m
+  of the waypoint.
+- `attitude.slew`: how fast a prop's speed may change (units/s).
 - `yaw.sign`: flip it if Q and E turn the wrong way.
 - `hover.tilt_sign`: flip it if W moves the ship backwards.
 - `attitude.kp / kd`: lower `kp` if the hull rocks; raise `kd` if it overshoots.

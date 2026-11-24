@@ -30,14 +30,16 @@ return {
     -- Pitch/roll stabiliser: prop speed DIFFERENCES, applied symmetrically
     -- (one side up, the other down) so a correction never costs lift.
     attitude = {
-        kp = 0.30,           -- prop units per degree
-        kd = 0.32,           -- prop units per deg/s
-        ki = 0.06,           -- prop units per degree-second (hull trim)
+        kp = 0.20,           -- prop units per degree
+        kd = 1.5,            -- prop units per deg/s (heavy damping: a big hull
+                             -- carries momentum, so brake the swing early)
+        ki = 0.03,           -- prop units per degree-second (hull trim)
         int_limit = 3,
         max_corr = 5,        -- prop units per axis
         deadband = 0.3,      -- degrees (P term only)
         rate_tau = 0.08,     -- s smoothing on the measured rates
         reserve = 2,         -- prop units of lift the stabiliser may borrow
+        slew = 8,            -- prop units per second a prop speed may change
     },
 
     -- Heading: binary prop tilt (any signal = full 25 deg) modulated in time.
@@ -51,17 +53,27 @@ return {
         rate_int = 0.02,     -- integral: learns constant turning torques
         int_limit = 0.6,
         manual_rate = 20,    -- deg/s while Q/E held
-        dwell_ticks = 3,     -- min ticks a tilt state is held (servo-friendly)
         sign = 1,            -- flip if Q/E turn the wrong way
+    },
+
+    -- Prop tilt is on/off and a tilt flip on props this size is a big torque
+    -- kick, so tilts are pulses with hysteresis: engage above `on`, release
+    -- below `off`, held at least min_on / min_off seconds. The ship coasts on
+    -- momentum between pulses.
+    tilt = {
+        on = 0.35,           -- demand (0..1) that engages a tilt
+        off = 0.1,           -- demand below which it releases
+        min_on = 0.8,        -- s a tilt stays engaged at least
+        min_off = 1.5,       -- s a side stays level before tilting again
     },
 
     -- Fore/aft and sideways in HOVER.
     hover = {
         brake = true,        -- hands off = hold position (tilt + bank damping)
-        fwd_gain = 0.15,     -- tilt duty per m/s of fore/aft speed error
+        fwd_gain = 0.3,      -- tilt duty per m/s of fore/aft speed error
         fwd_dead = 0.25,     -- m/s
-        lat_gain = 0.3,      -- degrees of bank per m/s of sideways drift
-        lat_max = 4,         -- degrees
+        lat_gain = 0.12,     -- degrees of bank per m/s of sideways drift
+        lat_max = 2,         -- degrees (small: banking a big hull is a big move)
         tilt_sign = 1,       -- flip if W moves the ship backwards
     },
 
@@ -96,8 +108,8 @@ return {
         speed_gain = 0.8,    -- rear levels per m/s of speed error
         speed_int = 0.15,
         turn_limit = 45,     -- deg off course in cruise: stop and turn
-        arrive_r = 2.5,      -- m
-        arrive_speed = 0.6,  -- m/s
+        arrive_r = 4,        -- m (landing then holds the exact spot)
+        arrive_speed = 1.0,  -- m/s
         heading_tol = 4,     -- deg
         shutdown_on_land = true,
         phase_timeout = 240, -- s per phase

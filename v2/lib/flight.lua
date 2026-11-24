@@ -72,6 +72,7 @@ function Flight:holdHere()
     local s = self.est.s
     self.alt_target = s.alt or 0
     self.heading_target = s.heading or 0
+    self.hold_pt = nil
 end
 
 function Flight:setMode(mode)
@@ -204,9 +205,22 @@ function Flight:pilot(dt)
         end
         if fwd ~= 0 then
             cmd.fwd = fwd
+            self.hold_pt = nil
         elseif t.hover.brake then
-            cmd.u_sp = 0
-            cmd.w_sp = 0
+            -- hold the point where the stick was let go (speed-only damping
+            -- lets a frictionless hull creep forever under the pulse
+            -- threshold); gentle gains: tilt pulses, then coast back
+            -- brake to a stop first, then hold the point where it stopped
+            if not self.hold_pt and s.hspeed < 0.5 then self.hold_pt = { s.x, s.z } end
+            if self.hold_pt then
+                local dx, dz = self.hold_pt[1] - s.x, self.hold_pt[2] - s.z
+                local df = dx * s.fwd_x + dz * s.fwd_z
+                local dl = dx * -s.fwd_z + dz * s.fwd_x
+                cmd.u_sp = U.clamp(0.1 * df, -1.5, 1.5)
+                cmd.w_sp = U.clamp(0.1 * dl, -1.5, 1.5)
+            else
+                cmd.u_sp, cmd.w_sp = 0, 0
+            end
         end
     else -- cruise
         if yaw ~= 0 then
@@ -253,6 +267,7 @@ function Flight:landingCmd(dt)
     local dl = dx * -s.fwd_z + dz * s.fwd_x
     cmd.u_sp = U.clamp(0.4 * df, -3, 3)
     cmd.w_sp = U.clamp(0.4 * dl, -3, 3)
+    cmd.fine = true -- firmer speed/drift correction for the last metres
 
     -- touchdown: the sensor says ground, or the ship stopped moving while it
     -- was being asked to sink (resting on something the sensor can't see)
@@ -412,14 +427,14 @@ function Flight:run(cmd, dt)
 
     local fwd = 0
     if self.mode == "hover" then
-        if cmd.fwd then fwd = cmd.fwd elseif cmd.u_sp then fwd = ctl:fwd(s, cmd.u_sp) end
+        if cmd.fwd then fwd = cmd.fwd elseif cmd.u_sp then fwd = ctl:fwd(s, cmd.u_sp, cmd.fine) end
     end
 
     local roll_sp = 0
     if cmd.bank then
         roll_sp = U.clamp(t.cruise.bank_gain * herr, -t.cruise.bank_max, t.cruise.bank_max)
     elseif cmd.w_sp then
-        roll_sp = ctl:lateral(s, cmd.w_sp)
+        roll_sp = ctl:lateral(s, cmd.w_sp, cmd.fine)
     end
     local dp, dr = ctl:attitude(s, dt, cmd.pitch or 0, roll_sp)
     if cmd.reverse then

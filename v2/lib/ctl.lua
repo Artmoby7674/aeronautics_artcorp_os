@@ -41,7 +41,8 @@ function Ctl:reset()
     self.rear_pk = self.rear_pk or 0
     self.rear_yk = self.rear_yk or 0
     self.rear_level = 0
-    self.sd = { L = { acc = 0, out = 0, hold = 0, frac = 0 }, R = { acc = 0, out = 0, hold = 0, frac = 0 } }
+    self.sd = { L = { frac = 0 }, R = { frac = 0 }, Y = { out = 0, t = 99 }, F = { out = 0, t = 99 } }
+    self.prev_out = nil
     self.sat = 0         -- last allocation: +1 lift capped high, -1 low
     self.margin = 15
 end
@@ -49,7 +50,6 @@ end
 -- Keep learned trims, forget transient state (used on mode changes).
 function Ctl:softReset()
     self.vi = 0
-    self.sd.L.acc, self.sd.R.acc = 0, 0
 end
 
 -- ------------------------------------------------------------ vertical
@@ -182,32 +182,42 @@ function Ctl:yaw(s, dt, rate_sp)
 end
 
 -- Fore/aft tilt duty -1..1 (+ = push forward) toward a forward speed.
-function Ctl:fwd(s, u_sp)
+function Ctl:fwd(s, u_sp, fine)
     local h = self.t.hover
     local e = u_sp - s.u
     if math.abs(e) < h.fwd_dead then return 0 end
-    return U.clamp(h.fwd_gain * e, -1, 1)
+    return U.clamp(h.fwd_gain * (fine and 2.5 or 1) * e, -1, 1)
 end
 
 -- Bank angle (deg) that cancels sideways drift toward w_sp.
-function Ctl:lateral(s, w_sp)
+function Ctl:lateral(s, w_sp, fine)
     local h = self.t.hover
-    return U.clamp(h.lat_gain * ((w_sp or 0) - s.w), -h.lat_max, h.lat_max)
+    local g, m = h.lat_gain, h.lat_max
+    if fine then g, m = g * 2, m * 1.5 end
+    return U.clamp(g * ((w_sp or 0) - s.w), -m, m)
 end
 
 -- ------------------------------------------------------------ allocation
 
-local function modulate(ch, u, dwell)
-    ch.acc = U.clamp(ch.acc + u - ch.out, -2, 2)
-    if ch.hold > 0 then
-        ch.hold = ch.hold - 1
-        return ch.out
+-- On/off tilt with hysteresis and minimum hold times. A huge hull reacts
+-- slowly, so instead of flickering the tilt many times a second (each flip
+-- is a big torque kick: the vibration), a side tilts only when the demand
+-- is clearly there, stays tilted at least `min_on`, and once released stays
+-- level at least `min_off`. Between pulses the ship coasts on momentum.
+local function modulate(ch, u, dt, tc)
+    ch.t = (ch.t or 0) + dt
+    local want = ch.out
+    if ch.out == 0 then
+        if u >= tc.on then want = 1 elseif u <= -tc.on then want = -1 end
+        if want ~= 0 and ch.t < tc.min_off then want = 0 end
+    else
+        -- keep going while the demand still points the same way
+        if u * ch.out < tc.off then want = 0 end
+        if ch.t < tc.min_on then want = ch.out end
     end
-    local want = 0
-    if ch.acc >= 0.5 then want = 1 elseif ch.acc <= -0.5 then want = -1 end
     if want ~= ch.out then
         ch.out = want
-        ch.hold = dwell - 1
+        ch.t = 0
     end
     return ch.out
 end
@@ -220,8 +230,13 @@ function Ctl:allocate(dt, lift, dp, dr, fwd, yaw, moment_sign)
     moment_sign = moment_sign or 1
     yaw = (yaw or 0) * y.sign
     fwd = (fwd or 0) * self.t.hover.tilt_sign
-    local tl = modulate(self.sd.L, U.clamp(fwd + yaw, -1, 1), y.dwell_ticks)
-    local tr = modulate(self.sd.R, U.clamp(fwd - yaw, -1, 1), y.dwell_ticks)
+    -- Two pulse channels, turn and travel; each side is their sum, so a turn
+    -- always tilts both sides at the same instant (pure rotation, no shove).
+    local tc = self.t.tilt
+    local Y = modulate(self.sd.Y, yaw, dt, tc)
+    local F = modulate(self.sd.F, fwd, dt, tc)
+    local tl = U.clamp(F + Y, -1, 1)
+    local tr = U.clamp(F - Y, -1, 1)
 
     -- lift compensation follows the mechanism's travel, not the command
     local lag = math.max(self.t.physics.tilt_lag or 0, dt)
@@ -268,8 +283,15 @@ function Ctl:allocate(dt, lift, dp, dr, fwd, yaw, moment_sign)
 
     local out = { tilt = {} }
     local margin, used = 15, 0
+    -- prop speeds change at most `slew` units/s: smooth thrust changes on a
+    -- hull this size instead of step kicks every tick
+    local slew = (a.slew or 8) * dt
+    local prev = self.prev_out or {}
+    self.prev_out = prev
     for _, p in ipairs(PROPS) do
         local v = U.clamp((lift + d[p]) / c[p], 0, 15)
+        if prev[p] then v = U.clamp(v, prev[p] - slew, prev[p] + slew) end
+        prev[p] = v
         out[p] = v
         out.tilt[p] = (LEFT[p] > 0) and tl or tr
         used = used + v * c[p]

@@ -156,19 +156,25 @@ function AP:update(fl, s, dt)
     end
 
     if self.phase == "approach" then
+        -- A heavy hull overshoots any heading change, so: far out, turn in
+        -- place first and only then travel straight in; close in (with
+        -- hysteresis) stop turning and creep onto the point. The landing
+        -- that follows holds the exact spot and turns onto the waypoint
+        -- heading on the way down.
         fl:setMode("hover")
+        if dist > 8 then self.facing = true elseif dist < 5 then self.facing = false end
+        if self.facing then self.hold_hdg = nil else self.hold_hdg = self.hold_hdg or s.heading end
+        local heading = self.facing and brg or self.hold_hdg
         local df = dx * s.fwd_x + dz * s.fwd_z
         local dl = dx * -s.fwd_z + dz * s.fwd_x
-        local near = dist < 15
-        local heading = near and wp.heading or brg
         local u_mag = math.min(a.hover_speed, U.brakeSpeed(math.abs(df), a.hover_brake),
-            0.5 * math.abs(df))
-        if not near and math.abs(herr) > 25 then u_mag = math.min(u_mag, 1) end
+            0.4 * math.abs(df))
+        if self.facing and math.abs(herr) > 15 then u_mag = 0 end -- turn first
         self.v_sp = u_mag
         local cmd = {
             alt = self.goal_alt, heading = heading,
             u_sp = U.sign(df) * u_mag,
-            w_sp = U.clamp(0.4 * dl, -3, 3),
+            w_sp = U.clamp(0.3 * dl, -2, 2),
         }
         if dist < a.arrive_r and s.hspeed < a.arrive_speed then
             fl:beginLanding({ x = wp.x, z = wp.z, heading = wp.heading,
