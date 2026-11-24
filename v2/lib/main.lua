@@ -256,7 +256,7 @@ local function alerts()
     if (fl.rear_cap or 15) < 12 then add("warn", "REAR LIMITED: PITCH AUTHORITY", string.format("CAP %.0f", fl.rear_cap)) end
     if app.loop.ms and app.loop.ms > 65 then add("warn", "CONTROL LOOP SLOW", string.format("%.0f MS", app.loop.ms)) end
     if (app.disk or 1e9) < 50000 then add("warn", "DISK NEARLY FULL", string.format("%.0f KB", app.disk / 1024)) end
-    if #app.errors > 0 then add("warn", "CODE ERROR: " .. app.errors[#app.errors]:sub(1, 34), "SEE TERMINAL") end
+    if #app.errors > 0 then add("warn", "CODE ERROR: " .. app.errors[#app.errors]:sub(1, 34), "SHIP COMPUTER LOG") end
     if not Link.online() then add("info", "KEYBOARD COMPUTER OFFLINE", "OPTIONAL") end
     return out, bad
 end
@@ -333,7 +333,8 @@ local function findMonitor()
     return m
 end
 
-function Main.run()
+function Main.run(opts)
+    opts = opts or {}
     local cfg, err = Config.load(ROOT)
     if not cfg then error(err, 0) end
     app.cfg = cfg
@@ -353,11 +354,31 @@ function Main.run()
     local mon = findMonitor()
     if mon then
         local ok, why = D.init(mon, cfg.tune.ui.palette)
-        if not ok then print("monitor: " .. tostring(why)) end
+        if ok then
+            print(string.format("monitor: %dx%d px, graphics %s, palette %s", D.W, D.H, D.path,
+                D.palette_ok and "v2" or "stock"))
+        else
+            print("monitor: " .. tostring(why))
+        end
     else
         print("no monitor found: running headless")
     end
-    print("SPACE or the screen starts the engines. Ctrl+T (hold) quits v2.")
+    -- Already in the air (restart after an error, chunk reload, reboot):
+    -- take control at once instead of sitting on the splash with the props
+    -- cut. On the ground the pilot starts the engines from the screen.
+    local thr = (cfg.ship.proximity or {}).landed_threshold or 15
+    local raw = HW.ship()
+    if raw.ok and HW.proximity() < thr then
+        app.power = "on"
+        app.fl:boot()
+        HW.setClutch(true)
+        say("AIRBORNE START: CONTROL RESUMED", D.C.warn)
+    end
+    if opts.recovered then
+        app.errors[#app.errors + 1] = "RESTARTED AFTER: " .. tostring(opts.recovered)
+        say("OS RESTARTED AFTER AN ERROR (SEE ALERT)", D.C.bad)
+    end
+    print("Ctrl+T (hold) on this computer stops the OS.")
 
     local control = os.startTimer(DT)
     local frame = os.startTimer(0.2)
@@ -391,7 +412,14 @@ function Main.run()
             frame = os.startTimer(1 / math.max(cfg.tune.ui.fps, 1))
         elseif e == "monitor_touch" then
             local px, py = (ev[3] - 1) * 6 + 3, (ev[4] - 1) * 9 + 4
-            pcall(act, app.ui:touch(px, py))
+            local a = D.ok and app.ui:touch(px, py) or nil
+            print(string.format("touch %d,%d -> %s", ev[3], ev[4], tostring(a or (D.ok and "nothing there" or "no graphics"))))
+            local ok2, err2 = pcall(act, a)
+            if not ok2 then print("[ACTION] " .. tostring(err2)) end
+        elseif e == "monitor_resize" then
+            -- monitors can be rebuilt (CC logs "Monitor is malformed, resetting")
+            local mon2 = findMonitor()
+            if mon2 and D.init(mon2, cfg.tune.ui.palette) then app.ui:invalidate() end
         elseif e == "rednet_message" then
             pcall(Link.onRednet, ev[2], ev[3])
         elseif e == "modem_message" then

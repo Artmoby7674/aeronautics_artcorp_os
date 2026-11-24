@@ -1,26 +1,26 @@
 # ArtCorp Flight OS v2
 
-A from-scratch rewrite of the ship OS, kept beside the original so the two
-can be compared on the same ship. It reads the same wiring the original
-already set up (`config/<slot>.lua` + `config/assignments_<slot>.lua`), so
-there is no setup wizard and nothing to rewire.
+The ship's flight OS. It reads the ship's wiring from `config/<slot>.lua` +
+`config/assignments_<slot>.lua`, so a ship that was already set up needs
+nothing rewired.
 
 ## Running it
 
-The original OS stays the computer's `startup`. To fly v2 instead:
+`install.lua` installs it and makes it the ship computer's `startup`, so the
+ship boots straight into it: tap **START ENGINES** on the cockpit monitor.
+The keyboard computer works with it unchanged.
 
-1. On the ground, hold **Ctrl+T** on the ship computer to stop the original OS.
-2. Type `v2/start`.
-3. Tap **START ENGINES** on the monitor, or press SPACE.
-
-Ctrl+T again stops v2. Reboot to go back to the original. The keyboard
-computer (computer 10) works with both and needs no change.
+The ship computer is never needed in flight. If the OS stops on an error,
+the launcher shows the error on the monitor and restarts it 2 s later; if
+the ship is in the air at that moment the OS takes control straight away
+(clutch kept in, props driven) and the error is listed on the ALERT tab.
+Ctrl+T on the ship computer itself (maintenance) stops it.
 
 v2 keeps its own state in `v2/data/`:
 
 | File | Contents |
 | --- | --- |
-| `waypoints.lua` | Waypoints. The original's list is imported on first run; headings are converted to compass degrees. |
+| `waypoints.lua` | Waypoints. An older `config/wp_<slot>.lua` list is imported on first run; headings are converted to compass degrees. |
 | `learned.lua` | What the controller learned in flight. Saved at power-off. |
 | `slot` | Which ship config was used. |
 | `tune_local.lua` | Optional overrides for anything in `v2/tune.lua`. |
@@ -34,6 +34,7 @@ v2 keeps its own state in `v2/data/`:
 | SPACE / CTRL | Tap: altitude goal +5 / −5 m. Hold: climb / descend smoothly. | Same. |
 | SHIFT | Switch HOVER ↔ CRUISE. | Same. |
 | SPACE while parked | Take off (to 6 m). | – |
+| START ENGINES (screen) | Engine start + clutch, from the splash screen. | – |
 | SPACE in e-stop | Clear the e-stop and hold where the ship is. | – |
 | OFF button | In the air: land, then power off. Press again within 3 s: off now. | Same. |
 | UP / DOWN | Change tab. | Same. |
@@ -70,7 +71,7 @@ Any stick or altitude input during an autopilot run cancels the run
 | Steady disturbances | Some trims. | Learned: pitch, roll and yaw trims, hover throttle, and feedforwards that scale with rear power (rear pitch and rear yaw). The last one cancels a "keeps turning right in cruise" torque in proportion to thrust. |
 | Rear thruster vs pitch | Rear pitch torque could pin the props: lift and pitch both run out (the step 2→3 drop). | A rear cap backs the thrust off whenever the stabiliser saturates. |
 | Autopilot | Climb first, then turn, at a ceiling learned where props reach 13/15. | Turn first at the current (low) altitude, then climb to a travel altitude that leaves 3.5 units spare (about y230 for this ship). The speed profile plans its own stop. |
-| Landing | Walking target (fixed in v1 this session). | Sink-rate profile on the gear sensor, position hold over the touchdown point, aligned to the waypoint heading while descending. |
+| Landing | Walking target down to the ground. | Sink-rate profile on the gear sensor, position hold over the touchdown point, aligned to the waypoint heading while descending. |
 | Hover hands-off | Coasts. | Brakes to a stop and damps sideways drift by banking (POSITION HOLD can be turned off). |
 | OFF in the air | Ship falls. | Lands, then powers off. A second press forces it. |
 | Screen | Tabbed, 16 stock colours. | Tabbed, its own 16-colour palette (falls back to stock if the monitor refuses), attitude indicator, map. |

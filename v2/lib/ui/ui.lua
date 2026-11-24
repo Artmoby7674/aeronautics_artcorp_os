@@ -694,7 +694,6 @@ function UI:splash(m)
             bar(W / 2 - 100, by, 200, 8, m.boot_frac or 0, C.accent)
         else
             self:button(W / 2 - 75, by - 8, 150, 30, "START ENGINES", "boot", "primary")
-            D.text(W / 2, by + 30, "OR PRESS SPACE", C.dim, C.bg, 1, "c")
         end
         if m.missing and #m.missing > 0 then
             D.text(W / 2, H - 22, "MISSING: " .. table.concat(m.missing, " "):upper(), C.bad, C.bg, 1, "c")

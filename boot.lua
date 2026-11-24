@@ -1,76 +1,65 @@
--- ArtCorpOS boot launcher. Installed as the computer's `startup`.
+-- ArtCorp Flight OS launcher. Installed as the ship computer's `startup`.
 --
--- Boots ArtCorp Flight OS v2 by default. For 2 seconds it waits for a key:
---   1  start the original OS (startup_v1) this time
---   2  start v2 now (skip the wait)
--- The default is stored in config/boot ("v1" or "v2"); `boot v1` / `boot v2`
--- from the shell changes it permanently.
---
--- v2 has no setup wizard: it flies with the wiring the original OS's wizard
--- saved (config/assignments_<ship>.lua). Until such a save exists, the
--- original OS runs so the wizard can set the ship up.
-local args = { ... }
-local CHOICE = "config/boot"
+-- The ship computer sits in a server room the pilot cannot reach in
+-- flight, so this never waits for terminal input. It starts the OS, and if
+-- the OS ever stops on an error it shows the error on the cockpit monitor
+-- and starts it again 2 s later. If the ship is in the air at that point the
+-- OS takes control straight away (no splash, engines kept running). Ctrl+T on the ship computer
+-- itself (maintenance only) stops it for good.
+local RESTART_DELAY = 2 -- short: in flight the props hold their last outputs meanwhile
 
-local function readChoice()
-    if not fs.exists(CHOICE) then return "v2" end
-    local f = fs.open(CHOICE, "r")
-    local v = f and f.readAll() or ""
-    if f then f.close() end
-    v = v:gsub("%s", "")
-    return (v == "v1") and "v1" or "v2"
+package.path = "/v2/lib/?.lua;/v2/lib/ui/?.lua;" .. package.path
+
+-- Show a message on the cockpit monitor in plain text (works even when the
+-- graphics layer is what failed).
+local function showOnMonitor(lines, color)
+    pcall(function()
+        local mon = peripheral.find("monitor")
+        if not mon then return end
+        pcall(mon.setGraphicsMode, 0)
+        pcall(mon.setTextScale, 1)
+        mon.setBackgroundColor(colors.black)
+        mon.clear()
+        for i, l in ipairs(lines) do
+            mon.setCursorPos(2, i + 1)
+            mon.setTextColor(i == 1 and (color or colors.red) or colors.white)
+            mon.write(l)
+        end
+    end)
 end
 
-local function writeChoice(v)
-    if not fs.exists("config") then fs.makeDir("config") end
-    local f = fs.open(CHOICE, "w")
-    if f then f.write(v) f.close() end
-end
-
-if args[1] == "v1" or args[1] == "v2" then
-    writeChoice(args[1])
-    print("Default OS is now " .. args[1] .. ". Reboot to use it.")
-    return
-end
-
-local function hasWiring()
-    if not fs.isDir("config") then return false end
-    for _, f in ipairs(fs.list("config")) do
-        if f:match("^assignments_.+%.lua$") then return true end
+local function wrap(text, width)
+    local out = {}
+    text = tostring(text)
+    while #text > width do
+        out[#out + 1] = text:sub(1, width)
+        text = text:sub(width + 1)
     end
-    return false
+    out[#out + 1] = text
+    return out
 end
 
-local function run(which)
-    if which == "v2" then
-        shell.run("/v2/start.lua")
-    else
-        shell.run("/startup_v1")
-    end
-end
-
-local default = readChoice()
-if default == "v2" and not hasWiring() then
-    print("No ship wiring saved yet: starting the original OS setup.")
-    print("Next boot starts v2.")
-    run("v1")
-    return
-end
-if default == "v2" and not fs.exists("/v2/start.lua") then default = "v1" end
-
-term.clear()
-term.setCursorPos(1, 1)
-print("ArtCorpOS launcher")
-print("Starting " .. (default == "v2" and "v2" or "the original OS") .. " in 2 s")
-print("  1 = original OS   2 = v2")
-local timer = os.startTimer(2)
-local pick = default
+local runs = 0
+local last_err = nil
 while true do
-    local ev, a = os.pullEvent()
-    if ev == "timer" and a == timer then break end
-    if ev == "char" and (a == "1" or a == "2") then
-        pick = (a == "1") and "v1" or "v2"
-        break
+    runs = runs + 1
+    -- reload the OS fresh on every start (only its own modules)
+    for _, m in ipairs({ "main", "util", "config", "hw", "est", "ctl", "flight", "ap",
+        "nav", "link", "rec", "draw", "font", "ui" }) do
+        package.loaded[m] = nil
     end
+    local ok, result = pcall(function() return require("main").run({ recovered = last_err, runs = runs }) end)
+    if ok and result ~= "restart" then
+        return -- stopped on purpose (Ctrl+T on the ship computer)
+    end
+    local err = ok and "restart requested" or tostring(result)
+    last_err = err
+    printError("OS stopped: " .. err)
+    pcall(function() require("draw").shutdown() end) -- stock colours back
+    local lines = { "FLIGHT OS ERROR - restarting in " .. RESTART_DELAY .. " s" }
+    for _, l in ipairs(wrap(err, 48)) do lines[#lines + 1] = l end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Restart #" .. runs .. ". If this repeats, tell your engineer."
+    showOnMonitor(lines)
+    sleep(RESTART_DELAY)
 end
-run(pick)

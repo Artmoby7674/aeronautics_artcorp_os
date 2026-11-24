@@ -2,7 +2,7 @@
 -- Paste this into CC terminal: edit install
 -- Then run: install
 --
--- After install: reboot. The ship starts ArtCorp OS v2 by itself.
+-- After install: reboot. The ship starts the flight OS by itself.
 -- On the KEYBOARD computer run: install kbd
 
 -- Pinned ref (commit SHA on origin/master). NEVER install from "master":
@@ -12,28 +12,11 @@
 local REF = "223971d14810d5f59abb5f48cd5f4c701d6ed6d9"
 local BASE_URL = "https://raw.githubusercontent.com/Artmoby7674/aeronautics_artcorp_os/" .. REF
 
--- { repo path, path on the computer }. The original OS's `startup` becomes
--- `startup_v1`; the launcher (boot.lua) becomes `startup`, so the computer
--- boots v2 on its own right after install (and runs the original's setup
--- wizard first on a computer that has no ship wiring yet).
+-- { repo path, path on the computer }. The launcher (boot.lua) becomes
+-- `startup`: the ship boots straight into the flight OS after install.
 local files = {
     { "boot.lua", "startup" },
-    { "boot.lua", "boot" },         -- `boot v1` / `boot v2` sets the default OS
-    { "startup", "startup_v1" },
-    { "ship.lua", "ship.lua" },
     { "config/atlas.lua", "config/atlas.lua" },
-    { "lib/pid.lua", "lib/pid.lua" },
-    { "lib/hardware.lua", "lib/hardware.lua" },
-    { "lib/flight.lua", "lib/flight.lua" },
-    { "lib/os_main.lua", "lib/os_main.lua" },
-    { "lib/hud.lua", "lib/hud.lua" },
-    { "lib/gfx.lua", "lib/gfx.lua" },
-    { "lib/font.lua", "lib/font.lua" },
-    { "lib/record.lua", "lib/record.lua" },
-    { "lib/report.lua", "lib/report.lua" },
-    { "lib/kbd.lua", "lib/kbd.lua" },
-    { "lib/waypoints.lua", "lib/waypoints.lua" },
-    { "mkconfig.lua", "mkconfig.lua" },
     { "v2/start.lua", "v2/start.lua" },
     { "v2/tune.lua", "v2/tune.lua" },
     { "v2/lib/ap.lua", "v2/lib/ap.lua" },
@@ -51,9 +34,22 @@ local files = {
     { "v2/lib/ui/font.lua", "v2/lib/ui/font.lua" },
     { "v2/lib/ui/ui.lua", "v2/lib/ui/ui.lua" },
 }
--- The KEYBOARD computer only needs kbd.lua: `install kbd` installs just that.
-if ({ ... })[1] == "kbd" then
+
+-- Program files left behind by earlier releases. Removed after a successful
+-- install. Ship data in config/ (wiring, saves, waypoints) is never touched.
+local leftovers = {
+    "startup_v1", "boot", "ship.lua", "mkconfig.lua", "gfxcheck", "stab_log.txt",
+    "lib/pid.lua", "lib/hardware.lua", "lib/flight.lua", "lib/os_main.lua", "lib/hud.lua",
+    "lib/gfx.lua", "lib/font.lua", "lib/record.lua", "lib/report.lua", "lib/kbd.lua",
+    "lib/waypoints.lua",
+}
+
+-- The KEYBOARD computer (on top of the cockpit screen) only needs kbd.lua:
+-- `install kbd` installs just that.
+local kbd_only = ({ ... })[1] == "kbd"
+if kbd_only then
     files = { { "kbd.lua", "kbd.lua" } }
+    leftovers = {}
 end
 
 -- config/atlas.lua is the TEMPLATE new save slots are copied from. If a save
@@ -64,7 +60,7 @@ local function isLiveConfig(path)
 end
 
 print("=============================")
-print("   ArtCorpOS Installer")
+print("   ArtCorp Flight OS Installer")
 print("   Flight Stabilization")
 print("=============================")
 print("")
@@ -73,6 +69,15 @@ for _, f in ipairs(files) do
     local note = isLiveConfig(f[2]) and "  (kept: live ship config)" or ""
     if f[1] ~= f[2] then note = " (from " .. f[1] .. ")" .. note end
     print("  " .. f[2] .. note)
+end
+local present = {}
+for _, f in ipairs(leftovers) do
+    if fs.exists(f) then present[#present + 1] = f end
+end
+if #present > 0 then
+    print("")
+    print("Old program files that will be removed:")
+    for _, f in ipairs(present) do print("  " .. f) end
 end
 print("")
 print("Files will be downloaded from:")
@@ -225,13 +230,17 @@ local lines = { "  Installed " .. swapped .. "/" .. #staged .. " files from ref 
 if swapped < #staged then
     lines[#lines + 1] = "  SOME FILES DID NOT SWAP IN - re-run install."
 else
+    local removed = 0
+    for _, f in ipairs(present) do
+        if pcall(fs.delete, f) and not fs.exists(f) then removed = removed + 1 end
+    end
+    if fs.isDir("lib") and #fs.list("lib") == 0 then pcall(fs.delete, "lib") end
+    if removed > 0 then lines[#lines + 1] = "  Removed " .. removed .. " old program file(s)." end
     lines[#lines + 1] = ""
-    if #files > 1 then
-        lines[#lines + 1] = "  Reboot: the ship starts ArtCorp OS v2 by itself"
-        lines[#lines + 1] = "  (press 1 at boot for the original OS;"
-        lines[#lines + 1] = "  'boot v1' makes the original the default)."
-    else
+    if kbd_only then
         lines[#lines + 1] = "  Run 'kbd' (or rename it to startup)."
+    else
+        lines[#lines + 1] = "  Reboot: the ship starts the flight OS by itself."
     end
 end
 banner(lines)

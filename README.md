@@ -11,33 +11,38 @@ A ComputerCraft flight stabilization and control system for Create:Aeronautics s
 
 ## Quick Install
 
-In a ComputerCraft terminal:
+On the **ship computer** (ComputerCraft terminal):
 
 ```
 wget run https://raw.githubusercontent.com/Artmoby7674/aeronautics_artcorp_os/master/install.lua
+reboot
 ```
 
-Also drop in the ship identity file for your hull (Atlas example ships with the repo as `ship.lua`):
+The ship boots straight into the flight OS: the cockpit monitor shows the
+**START ENGINES** button. Everything after that is done from the touchscreen,
+the pilot's relay keys, and the small keyboard computer (text input). The
+ship computer itself is never needed in flight: if the OS ever stops on an
+error it shows the error on the monitor and restarts on its own, and an
+airborne restart takes control immediately.
+
+On the **keyboard computer** (the small one on top of the cockpit screen):
 
 ```
-ship.lua   -- return { id="Atlas", name="Atlas", profile="atlas" }
+wget run https://raw.githubusercontent.com/Artmoby7674/aeronautics_artcorp_os/master/install.lua kbd
 ```
 
-Then run:
+The installer stages every file before swapping it in (a failed download or
+a full disk leaves the existing install untouched), removes program files
+left by earlier releases, and never touches `config/` (ship wiring, saves).
 
-```
-startup
-```
+### Ship wiring
 
-### First-time setup flow
+The OS flies with the wiring in `config/<ship>.lua` plus the real
+peripheral names in `config/assignments_<ship>.lua`. A ship that was set up
+before keeps working as it is. For a new ship, put the network names of its
+relays and monitor in the `peripherals` table of `config/atlas.lua`.
 
-1. Build the ship  
-2. Install the OS + `ship.lua` (identifies the computer as that ship)  
-3. `startup` — shows **which ship** you are on  
-4. Save-slot menu: load a config, or create a new save in an empty slot  
-5. Setup wizard: plug each relay **one at a time** (includes **engine relay**), then the optional network steps: **[3c] printer** (connect it → wizard pins its network name, or skip → runtime auto-find) and **[3d] keyboard computer** (run `kbd` on the second computer — the ship waits for its hello to pair, or skip)  
-6. Attach a **wired modem** to the ship computer for that network (printer + keyboard are found over it)  
-7. Jump in the pilot seat → splash → **boot** button  
+See `v2/README.md` for the controls, the screens and the tuning knobs.
 
 ### Save-slot menu (setup phase only)
 

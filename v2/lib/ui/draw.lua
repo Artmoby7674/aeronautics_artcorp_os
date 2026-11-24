@@ -22,24 +22,74 @@ D.PALETTE = PALETTE
 local mon
 local STOCK
 
+-- Graphics calls go through `dev`: the monitor itself when CC:Graphics adds
+-- its methods to monitor peripherals, otherwise the terminal API redirected
+-- to the monitor (the original OS supported both; the gfxcheck tool existed
+-- to tell them apart). Without this fallback v2 would run headless on such
+-- a monitor: nothing drawn, so the old screen stays up and no taps register.
+local dev
+
+local function viaTerm(m)
+    local function wrap(name)
+        return function(...)
+            local f = term[name]
+            if type(f) ~= "function" then error(name .. " not on term", 0) end
+            local old = term.redirect(m)
+            local r = table.pack(pcall(f, ...))
+            term.redirect(old)
+            if not r[1] then error(r[2], 0) end
+            return table.unpack(r, 2, r.n)
+        end
+    end
+    local d = {}
+    for _, n in ipairs({ "setGraphicsMode", "drawPixels", "setFrozen", "setPaletteColor", "getPaletteColor" }) do
+        d[n] = wrap(n)
+    end
+    return d
+end
+
+local function pixelSize(m)
+    local ok, w, h = pcall(m.getSize, 2)
+    local okt, tw, th = pcall(m.getSize)
+    if ok and type(w) == "number" and okt and (w ~= tw or h ~= th) then return w, h end
+    if okt and type(tw) == "number" then return tw * 6, th * 9 end
+    return 0, 0
+end
+
 function D.init(m, use_palette)
     mon = m
     pcall(m.setTextScale, 0.5)
-    if type(m.setGraphicsMode) ~= "function" or not pcall(m.setGraphicsMode, 2) then
-        return false, "monitor has no CC:Graphics mode 2"
+    D.path, dev, D.ok = nil, nil, false
+    if type(m.setGraphicsMode) == "function" and type(m.drawPixels) == "function"
+        and pcall(m.setGraphicsMode, 2) then
+        dev, D.path = m, "direct"
+    elseif type(term.setGraphicsMode) == "function" then
+        local d = viaTerm(m)
+        if pcall(d.setGraphicsMode, 2) then dev, D.path = d, "redirect" end
     end
-    local ok, w, h = pcall(m.getSize, 2)
-    if not ok or type(w) ~= "number" then
-        local tw, th = m.getSize()
-        w, h = tw * 6, th * 9
+    if not dev then
+        -- no pixel graphics at all: say so on the monitor instead of leaving
+        -- the previous OS's picture up (which looks like a frozen screen)
+        pcall(function()
+            m.setBackgroundColor(colors.black)
+            m.clear()
+            m.setCursorPos(2, 2)
+            m.setTextColor(colors.red)
+            m.write("ArtCorp OS v2: no CC:Graphics on this monitor")
+            m.setCursorPos(2, 4)
+            m.setTextColor(colors.white)
+            m.write("Pilot keys still work: SPACE starts the engines.")
+        end)
+        return false, "monitor has no CC:Graphics mode 2 (direct or via term)"
     end
-    D.W, D.H, D.ok = w, h, true
+    D.W, D.H = pixelSize(m)
+    D.ok = D.W > 0
     D.palette_ok = use_palette ~= false and D.setPalette()
     if not D.palette_ok then
         -- the stock 16 colours, mapped to the closest roles
         for k, v in pairs(STOCK) do D.C[k] = v end
     end
-    return true
+    return D.ok
 end
 
 -- stock CC colour index (log2 of colors.X) for each role
@@ -57,10 +107,10 @@ function D.setPalette()
         local good = true
         for i, rgb in pairs(PALETTE) do
             local r, g, b = rgb3(rgb)
-            if not pcall(mon.setPaletteColor, idx(i), r, g, b) then good = false break end
+            if not pcall(dev.setPaletteColor, idx(i), r, g, b) then good = false break end
         end
-        if good and type(mon.getPaletteColor) == "function" then
-            local ok, r = pcall(mon.getPaletteColor, idx(7))
+        if good and type(dev.getPaletteColor) == "function" then
+            local ok, r = pcall(dev.getPaletteColor, idx(7))
             local want = rgb3(PALETTE[7])
             if not ok or type(r) ~= "number" or math.abs(r - want) > 0.02 then good = false end
         end
@@ -70,18 +120,18 @@ function D.setPalette()
 end
 
 function D.shutdown()
-    if not mon then return end
+    if not dev then return end
     for i = 0, 15 do
         local okn, r, g, b = pcall(term.nativePaletteColour, 2 ^ i)
-        if okn and r then pcall(mon.setPaletteColor, i, r, g, b) end
+        if okn and r then pcall(dev.setPaletteColor, i, r, g, b) end
     end
-    pcall(mon.setGraphicsMode, 0)
-    pcall(mon.setFrozen, false)
+    pcall(dev.setFrozen, false)
+    pcall(dev.setGraphicsMode, 0)
     D.ok = false
 end
 
-function D.begin() pcall(mon.setFrozen, true) end
-function D.finish() pcall(mon.setFrozen, false) end
+function D.begin() pcall(dev.setFrozen, true) end
+function D.finish() pcall(dev.setFrozen, false) end
 
 local function clip(x, y, w, h)
     x, y, w, h = math.floor(x), math.floor(y), math.floor(w), math.floor(h)
@@ -95,7 +145,7 @@ end
 
 function D.rect(x, y, w, h, c)
     local cx, cy, cw, ch = clip(x, y, w, h)
-    if cx then mon.drawPixels(cx, cy, c, cw, ch) end
+    if cx then dev.drawPixels(cx, cy, c, cw, ch) end
 end
 
 function D.frame(x, y, w, h, c)
@@ -118,7 +168,7 @@ function D.blit(x, y, rows)
         end
         rows = cut
     end
-    mon.drawPixels(math.floor(x), math.floor(y), rows)
+    dev.drawPixels(math.floor(x), math.floor(y), rows)
 end
 
 function D.textW(str, scale) return Font.width(tostring(str), scale) end

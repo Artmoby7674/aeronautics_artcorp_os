@@ -103,14 +103,14 @@ peripheral.getNames = function() return {} end
 peripheral.find = function() return nil end
 
 -- ---------------------------------------------------------------- event script
-local timers, next_id = {}, 0
+timers, next_id = {}, 0
 os.startTimer = function(d)
     next_id = next_id + 1
     timers[next_id] = sim.t + d
     return next_id
 end
 
-local script = {}   -- { t = time, fn = function() return event or nil end }
+script = {}   -- { t = time, fn = function() return event or nil end }
 local function at(t, fn) script[#script + 1] = { t = t, fn = fn } end
 local function touchCell(px, py) return { "monitor_touch", "main_monitor", math.floor(px / 6) + 1, math.floor(py / 9) + 1 } end
 
@@ -148,7 +148,7 @@ at(21, function()
 end)
 at(300, function() return { "terminate" } end)
 
-local si = 1
+si = 1
 local pending = {}
 os.pullEventRaw = function()
     while true do
@@ -195,6 +195,35 @@ local errs = 0
 for _, l in ipairs(printed) do if l:find("ERROR") or l:find("%[UI%]") then errs = errs + 1 print("  log: " .. l) end end
 check("no runtime errors logged", errs == 0, errs)
 check("no draw errors", #mon.errors == 0, mon.errors[1])
+
+-- ---------------------------------------------------------------- airborne start
+-- A restart in the air (error, chunk reload) must take control at once:
+-- clutch held, props driven, altitude kept. No splash, no cut props.
+for _, m in ipairs({ "main", "config", "nav", "link", "rec", "draw", "ui", "font", "flight", "ctl", "est", "ap" }) do
+    package.loaded[m] = nil
+end
+w:airborne(120, 0)
+mon.errors = {}
+timers, script, si = {}, {}, 1
+local t0 = sim.t
+at(t0 + 8, function()
+    states.air_alt = sim.pos.y
+    local e = cfg.engine
+    states.air_clutch = sim:relay(cfg.peripherals[e.relay_key]).out[e.clutch_side]
+    states.air_props = sim:readOutputs().FL
+    return { "terminate" }
+end)
+printed = {}
+_G.print = function(...) printed[#printed + 1] = table.concat({ ... }, " ") end
+local ok2, err2 = pcall(require("main").run, { recovered = "test error", runs = 2 })
+_G.print = real_print
+check("airborne start: ran", ok2, err2)
+check("airborne start: clutch held", states.air_clutch == 15, states.air_clutch)
+check("airborne start: props driven", (states.air_props or 0) > 2, states.air_props)
+check("airborne start: altitude kept", math.abs((states.air_alt or 0) - 120) < 3, states.air_alt)
+local said = false
+for _, l in ipairs(printed) do if l:find("RESTARTED AFTER AN ERROR") then said = true end end
+check("airborne start: tells the pilot it restarted", said)
 
 _G.loadfile, _G.dofile, _G.fs = saved.loadfile, saved.dofile, saved.fs
 print(string.format("v2_main_test: %d passed, %d failed", passed, failed))

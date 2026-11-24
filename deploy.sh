@@ -4,8 +4,7 @@
 # Standing rule: computer 5 = MAIN flight computer, computer 10 = KEYBOARD.
 # This script encodes that split so it can never be got wrong by hand.
 #
-#   computer 5  (main)   : lib/*.lua, startup (launcher), startup_v1, boot,
-#                          v2/, install.lua, mkconfig.lua
+#   computer 5  (main)   : startup (launcher), v2/, install.lua
 #   computer 10 (keyboard): kbd.lua  ONLY
 #
 # Footgun this script deliberately avoids: computer 10 has its OWN tiny
@@ -82,21 +81,11 @@ echo "  kbd   (computer 10): $KBD"
 [ "$DRY" = "1" ] && echo "  (DRY RUN — nothing written)"
 echo
 
-# --- MAIN: computer 5 ---
+# --- MAIN: computer 5 --- (same layout install.lua produces)
 echo "computer 5 (main):"
-for f in "$REPO"/lib/*.lua; do
-  deploy_file "$f" "$MAIN/lib/$(basename "$f")" "lib/$(basename "$f")"
-done
-# Same layout as install.lua: the original OS's startup runs as startup_v1,
-# the launcher (boot.lua) is `startup` (boots v2, 1 = original) and `boot`.
-deploy_file "$REPO/startup" "$MAIN/startup_v1" "startup_v1"
 deploy_file "$REPO/boot.lua" "$MAIN/startup" "startup"
-deploy_file "$REPO/boot.lua" "$MAIN/boot" "boot"
-for f in install.lua mkconfig.lua; do
-  deploy_file "$REPO/$f" "$MAIN/$f" "$f"
-done
-# v2 OS (run with `v2/start`; never replaces startup). v2/data/ is the
-# ship's own state (waypoints, learned values) and is never touched.
+deploy_file "$REPO/install.lua" "$MAIN/install.lua" "install.lua"
+# v2/data/ is the ship's own state (waypoints, learned values): never touched.
 for f in "$REPO"/v2/start.lua "$REPO"/v2/tune.lua "$REPO"/v2/lib/*.lua "$REPO"/v2/lib/ui/*.lua; do
   rel="${f#"$REPO"/}"
   deploy_file "$f" "$MAIN/$rel" "$rel"

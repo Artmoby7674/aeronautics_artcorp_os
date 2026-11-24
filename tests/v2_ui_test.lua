@@ -74,5 +74,42 @@ end
 -- the palette is set on init
 check("palette applied", SC.mon.palette[0] ~= nil and SC.mon.palette[15] ~= nil)
 
+-- monitor WITHOUT CC:Graphics methods: drawing must go through term.redirect
+do
+    local D = SC.D
+    local real = SC.mon
+    local plain = {
+        setTextScale = function() end,
+        getSize = real.getSize,
+        setBackgroundColor = function() end, clear = function() end,
+        setCursorPos = function() end, setTextColor = function() end, write = function() end,
+    }
+    local target = nil
+    local savedTerm = term
+    term = {
+        redirect = function(t) local o = target target = t return o end,
+        setGraphicsMode = function(m) assert(target == plain, "not redirected") return real.setGraphicsMode(m) end,
+        drawPixels = function(...) assert(target == plain, "not redirected") return real.drawPixels(...) end,
+        setFrozen = function(...) return real.setFrozen(...) end,
+        setPaletteColor = function(...) return real.setPaletteColor(...) end,
+        nativePaletteColour = function() return 0, 0, 0 end,
+    }
+    real.errors = {}
+    local ok = D.init(plain, true)
+    check("redirect path: init ok", ok and D.path == "redirect", tostring(D.path))
+    local before = real.calls
+    local rok, rerr = pcall(frame, worlds.hover, "ctrl")
+    check("redirect path: renders", rok and real.calls > before, rerr)
+    check("redirect path: no draw errors", #real.errors == 0, real.errors[1])
+    check("redirect path: taps work", SC.ui:touch(W / 2, H - 8) ~= nil)
+    check("redirect path: terminal restored", target == nil)
+    -- no graphics at all: init reports failure (and v2 runs headless)
+    term = { redirect = function(t) return nil end, nativePaletteColour = term.nativePaletteColour }
+    _G.colors = { black = 32768, red = 16384, white = 1 }
+    check("no graphics: init fails cleanly", D.init(plain, true) == false)
+    term = savedTerm
+    D.init(real, true)
+end
+
 print(string.format("v2_ui_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("v2_ui_test FAILED", 0) end
