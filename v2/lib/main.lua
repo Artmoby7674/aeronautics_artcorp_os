@@ -422,6 +422,22 @@ function Main.run(opts)
     for _, n in ipairs(peripheral.getNames()) do seen[#seen + 1] = n .. "=" .. tostring(peripheral.getType(n)) end
     table.sort(seen)
     U.log("peripherals on the network: %s", #seen > 0 and table.concat(seen, ", ") or "none")
+    -- Wiring check: what each relay face is RECEIVING right now (finds the
+    -- face a sensor or a pilot key actually arrives on).
+    local SIDES = { "top", "bottom", "left", "right", "front", "back" }
+    for key, name in pairs(cfg.ship.peripherals) do
+        local dev = HW.device(key)
+        if dev and type(dev.getAnalogInput) == "function" then
+            local parts = {}
+            for _, side in ipairs(SIDES) do
+                local ok, v = pcall(dev.getAnalogInput, side)
+                parts[#parts + 1] = side .. "=" .. (ok and tostring(v) or "?")
+            end
+            U.log("relay %s (%s) inputs: %s", key, tostring(name), table.concat(parts, " "))
+        end
+    end
+    local pc = cfg.ship.proximity or {}
+    U.log("ground sensor is read from %s face '%s'", tostring(pc.input_key), tostring(pc.side))
     app.fl = Flight.new(cfg.tune, HW, cfg.ship)
     loadLearned(app.fl.ctl)
     Nav.init(ROOT, cfg.slot)
