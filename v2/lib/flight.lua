@@ -396,7 +396,8 @@ function Flight:run(cmd, dt)
     end
     local lift = ctl:lift(s, dt, vs_sp)
 
-    ctl.rear_level = self.rear
+    -- signed: reverse thrust tips (and yaws) the hull the other way
+    ctl.rear_level = (self.rear_rev and -1 or 1) * (self.rear or 0)
     -- Heading: a commanded turn rate (Q/E), a heading to hold (autopilot),
     -- or neither: then a rotation is only braked to a stop (hysteresis
     -- 1.5 / 0.5 deg/s) and the tilts are otherwise left alone.
@@ -451,8 +452,11 @@ function Flight:run(cmd, dt)
     -- of prop range holding that (props pinned AND pitch off), the rear cap
     -- backs off instead of letting the ship sink nose-up. That is the
     -- original's "drops out of the sky going from step 2 to 3".
-    local pitch_off = math.abs(s.pitch - (cmd.pitch or 0)) > 2
-    if ctl.sat ~= 0 and pitch_off and self.rear > 0 then
+    local pitch_err = math.abs(s.pitch - (cmd.pitch or 0))
+    -- the rear thrust tips the hull: ease off while the stabiliser is out of
+    -- room, or once the hull is clearly tipped (the stabiliser is gentle on
+    -- purpose and needs the thrust to come off to catch up)
+    if self.rear > 0 and ((ctl.sat ~= 0 and pitch_err > 2) or pitch_err > 6) then
         self.rear_cap = math.max(1, (self.rear_cap or 15) - 4 * dt)
     else
         self.rear_cap = math.min(15, (self.rear_cap or 15) + 0.5 * dt)
@@ -483,13 +487,16 @@ end
 -- Direction check, run once after a take-off (until both axes are known).
 -- A correction that pushes the wrong way turns the stabiliser into an
 -- amplifier: on a self-righting hull that shows as roll swings that grow
--- every time. So the ship nudges itself: +D for 1 s, then -D for 1 s, on
--- roll then pitch, and compares how the turn rate changed. The ship being
--- steady, a 1-2 deg nudge is all it takes.
--- Nudges get longer and firmer while the answer stays unclear (a heavy
--- pitch axis barely reacts to a short one): {prop units, seconds}.
-local CAL_STEPS = { { 2.0, 1.0 }, { 3.0, 2.0 }, { 4.0, 3.0 } }
-local CAL_MIN = 0.3 -- deg/s of rate difference that counts as an answer
+-- every time. So the ship nudges itself and watches what happens.
+-- The real ship answers about a second LATE, so each nudge (+D then -D, a
+-- doublet that leaves no spin behind) is followed by a hands-off watch long
+-- enough to see the whole answer, then the mirror nudge (-D then +D). The
+-- answer is the first swing each one causes; both must agree.
+-- Nudges start tiny (the real roll axis reacts strongly) and get firmer
+-- only while the answer stays unclear: {prop units, seconds}.
+local CAL_STEPS = { { 0.5, 0.4 }, { 1.0, 0.6 }, { 2.0, 1.0 }, { 3.0, 1.5 }, { 4.0, 2.0 } }
+local CAL_WATCH = 2.5 -- s hands-off after each nudge (covers the lag)
+local CAL_MIN = 0.3   -- deg/s of rate change that counts as an answer
 
 function Flight:calibStep(s, dt, dp, dr)
     local c, ctl = self.calib, self.ctl
@@ -499,59 +506,100 @@ function Flight:calibStep(s, dt, dp, dr)
         if (ctl.roll_known or 0) == 0 and not c.done_roll then return "roll" end
         if (ctl.pitch_known or 0) == 0 and not c.done_pitch then return "pitch" end
     end
+    -- the nudge rides on top of what the stabiliser was giving when the
+    -- ship was still (its trim: dropping that would tip the hull by itself)
+    local function out(push)
+        push = (c.base or 0) + push
+        if c.axis == "roll" then return dp, push end
+        return push, dr
+    end
     if c.stage == "wait" or c.stage == "settle" then
-        local steady = math.abs(s.vs) < 1.5 and math.abs(s.roll) < 5 and math.abs(s.pitch) < 5
-            and s.alt > c.alt0 + 3
-        if c.t > (c.stage == "wait" and 3 or 3) and steady then
+        -- truly still: level AND not swinging, held for 2 s (v2.9 started
+        -- its nudges mid-swing and measured the swing, not the nudge)
+        local still = math.abs(s.vs) < 1.5 and math.abs(s.roll) < 4 and math.abs(s.pitch) < 4
+            and math.abs(s.roll_rate) < 2 and math.abs(s.pitch_rate) < 2 and s.alt > c.alt0 + 3
+        c.still = still and (c.still or 0) + dt or 0
+        if c.t > 3 and c.still >= 2 then
             local ax = nextAxis()
             if not ax then self.calib = nil return dp, dr end
             if ax ~= c.axis then c.axis, c.try = ax, 1 end
-            c.stage, c.t, c.r0 = "plus", 0, rate(c.axis)
+            c.base = (ax == "roll") and dr or dp
+            c.stage, c.t, c.r0, c.pk, c.lock = "plus", 0, rate(c.axis), 0, false
         elseif c.t > 25 then
             U.log("direction check: ship never steady enough, skipped")
             self.calib = nil
         end
         return dp, dr
     end
+    -- a nudge that sets the ship moving too much is cut short: answer unclear
+    local ang = (c.axis == "roll") and s.roll or s.pitch
+    if math.abs(ang) > 5 or math.abs(rate(c.axis)) > 8 then
+        U.log("%s direction check: ship moving too much (%.1f deg, %.1f deg/s), stopped the nudge",
+            c.axis, ang, rate(c.axis))
+        c["done_" .. c.axis] = true
+        c.stage, c.t, c.still = "settle", 0, 0
+        return dp, dr
+    end
+    -- the FIRST swing's peak rate change since this nudge began (signed);
+    -- once it has clearly passed, the hull's own return swing is ignored
+    local d = rate(c.axis) - c.r0
+    if not c.lock then
+        if math.abs(d) > math.abs(c.pk) then c.pk = d
+        elseif math.abs(c.pk) > 0.02 and math.abs(d) < 0.6 * math.abs(c.pk) then c.lock = true end
+    end
     local step = CAL_STEPS[c.try or 1]
     local D = step[1] * (ctl.att_scale or 1)
-    local push = (c.stage == "plus") and D or -D
-    if c.t >= step[2] then
-        if c.stage == "plus" then
-            c.d1 = rate(c.axis) - c.r0
-            c.stage, c.t, c.r0 = "minus", 0, rate(c.axis)
-        else
-            local effect = c.d1 - (rate(c.axis) - c.r0) -- deg/s, + = as designed
-            local key = c.axis .. "_sign"
-            local msg
-            if math.abs(effect) < CAL_MIN then
-                msg = string.format("%s direction check: unclear (%.2f deg/s) at nudge %d", c.axis, effect, c.try or 1)
-                if (c.try or 1) < #CAL_STEPS then
-                    c.try = (c.try or 1) + 1
-                    U.log(msg .. ", trying a firmer one")
-                    c.stage, c.t = "settle", 0
-                    return dp, dr
-                end
-                msg = msg .. ", giving up until next take-off"
-            else
-                local sign = effect > 0 and 1 or -1
-                local flipped = sign ~= ctl[key]
-                ctl[key] = sign
-                ctl[c.axis .. "_known"] = 1
-                if flipped then
-                    if c.axis == "roll" then ctl.ri = 0 else ctl.pi_ = 0 end
-                end
-                msg = string.format("%s direction check: %s (%.2f deg/s)", c.axis,
-                    sign == 1 and "as designed" or "REVERSED, corrected", effect)
-                self:notify((c.axis .. (sign == 1 and " direction OK" or " direction reversed: fixed")):upper())
-            end
-            U.log(msg)
-            c["done_" .. c.axis] = true
-            c.stage, c.t = "settle", 0
-        end
+    -- each nudge is a DOUBLET: push for T, then the opposite for T, so the
+    -- hull ends with no spin of its own; the first swing it makes (seen up
+    -- to a second later) is the answer to the first half
+    if c.stage == "plus" or c.stage == "minus" then
+        if c.t < step[2] then return out(c.stage == "plus" and D or -D) end
+        c.stage, c.t = c.stage .. "2", 0
     end
-    if c.axis == "roll" then return dp, push end
-    return push, dr
+    if c.stage == "plus2" or c.stage == "minus2" then
+        if c.t < step[2] then return out(c.stage == "plus2" and -D or D) end
+        c.stage = (c.stage == "plus2") and "watch1" or "watch2"
+        c.t = 0
+        return out(0)
+    end
+    if c.t < CAL_WATCH then return out(0) end
+    if c.stage == "watch1" then
+        c.d1 = c.pk
+        c.stage, c.t, c.r0, c.pk, c.lock = "minus", 0, rate(c.axis), 0, false
+        return out(-D)
+    end
+    -- watch2 over: decide
+    local d1, d2 = c.d1, c.pk
+    local key = c.axis .. "_sign"
+    local msg
+    local agree = (d1 > 0) ~= (d2 > 0)
+    local effect = (d1 - d2) / 2 -- deg/s, + = as designed
+    if not agree or math.abs(d1) < CAL_MIN or math.abs(d2) < CAL_MIN then
+        msg = string.format("%s direction check: unclear (%.2f / %.2f deg/s) at nudge %d",
+            c.axis, d1, d2, c.try or 1)
+        if (c.try or 1) < #CAL_STEPS then
+            c.try = (c.try or 1) + 1
+            U.log(msg .. ", trying a firmer one")
+            c.stage, c.t, c.still = "settle", 0, 0
+            return dp, dr
+        end
+        msg = msg .. ", giving up until next take-off"
+    else
+        local sign = effect > 0 and 1 or -1
+        local flipped = sign ~= ctl[key]
+        ctl[key] = sign
+        ctl[c.axis .. "_known"] = 1
+        if flipped then
+            if c.axis == "roll" then ctl.ri = 0 else ctl.pi_ = 0 end
+        end
+        msg = string.format("%s direction check: %s (%.2f deg/s)", c.axis,
+            sign == 1 and "as designed" or "REVERSED, corrected", effect)
+        self:notify((c.axis .. (sign == 1 and " direction OK" or " direction reversed: fixed")):upper())
+    end
+    U.log(msg)
+    c["done_" .. c.axis] = true
+    c.stage, c.t, c.still = "settle", 0, 0
+    return dp, dr
 end
 
 -- Fore/aft speed hold with the REAR thruster (forward thrust, or reverse
@@ -576,6 +624,29 @@ function Flight:rearBrake(s, u_sp, tight)
     return U.clamp(h.rear_gain * a, 1, h.rear_max), rev
 end
 
+-- Prop speeds are whole redstone levels, but the gentle stabiliser asks for
+-- fractions (0.2 of a level is a real correction on this ship): plain
+-- rounding threw those away and let the hull lean 2-3 degrees unopposed,
+-- sliding sideways. So each prop carries what rounding dropped into the
+-- next tick (error diffusion): it steps between two neighbouring levels, and
+-- the props, taking about a second to spin up, average that into the speed
+-- in between. A change of a whole level or more goes through at once.
+function Flight:quantise(p, v)
+    local q = self.quant or {}
+    self.quant = q
+    v = U.clamp(v, 0, 15)
+    local st = q[p]
+    if not st or math.abs(v - st.lvl) >= 1 then
+        st = { lvl = math.floor(v + 0.5), carry = 0 }
+        q[p] = st
+        return st.lvl
+    end
+    local e = v + st.carry
+    st.lvl = U.clamp(math.floor(e + 0.5), 0, 15)
+    st.carry = U.clamp(e - st.lvl, -0.5, 0.5)
+    return st.lvl
+end
+
 -- Push outputs to the hardware. nil = parked/estop/no telemetry.
 function Flight:write(out)
     local hw = self.hw
@@ -586,7 +657,7 @@ function Flight:write(out)
         if self.phase == "parked" or self.phase == "estop" then self.ctl:softReset() end
     end
     for _, p in ipairs(hw.PROPS) do
-        hw.setProp(p, out[p])
+        hw.setProp(p, self:quantise(p, out[p] or 0))
         hw.setTilt(p, out.tilt[p] or 0)
     end
     hw.setRear(out.rear or 0, out.rear_rev)

@@ -263,6 +263,9 @@ for _, m in ipairs({ "main", "config", "nav", "link", "rec", "draw", "ui", "font
 end
 w:airborne(120, 0)
 files["v2/data/state"] = "return { where = \"air\", gear = false }" -- it was flying
+-- learned values saved by v2.9 (no format tag): the wound-up roll trim and
+-- the mid-swing direction answer must not come back
+files["v2/data/learned.lua"] = "return { hover = 5.6, ri = 1.8, pi_ = 0.5, rear_pk = -0.4, roll_sign = -1, roll_known = 1, yaw_brake = 0.7 }"
 mon.errors = {}
 timers, script, si = {}, {}, 1
 local t0 = sim.t
@@ -284,6 +287,12 @@ check("airborne start: altitude kept", math.abs((states.air_alt or 0) - 120) < 3
 local said = false
 for _, l in ipairs(printed) do if l:find("RESTARTED AFTER AN ERROR") then said = true end end
 check("airborne start: tells the pilot it restarted", said)
+local L = load(files["v2/data/learned.lua"] or "return {}")()
+check("old learned values: format tagged on save", L.fmt == 2, L.fmt)
+check("old learned values: roll trim not reloaded", math.abs(L.ri or 0) < 0.5, L.ri)
+check("old learned values: direction check starts over", (L.roll_known or 0) == 0 and L.roll_sign == 1,
+    tostring(L.roll_known) .. "/" .. tostring(L.roll_sign))
+check("old learned values: yaw braking kept", math.abs((L.yaw_brake or 0) - 0.7) < 0.2, L.yaw_brake)
 
 _G.loadfile, _G.dofile, _G.fs = saved.loadfile, saved.dofile, saved.fs
 print(string.format("v2_main_test: %d passed, %d failed", passed, failed))

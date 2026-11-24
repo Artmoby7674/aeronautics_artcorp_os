@@ -118,20 +118,20 @@ function Ctl:attitude(s, dt, pitch_sp, roll_sp)
     -- gain (adaptive feedforward, regressor = rear level) so the correction
     -- arrives with the thrust instead of after the integrator catches up
     local rl = (self.rear_level or 0) / 15
-    if rl > 0.1 then
+    if math.abs(rl) > 0.1 then
         self.rear_pk = U.clamp(self.rear_pk + a.ki * 4 * ep * rl * dt, -a.max_corr, a.max_corr)
     end
     -- separate roll gains: a long, narrow hull is far harder to pitch than
     -- to roll, and pitch-level damping makes the light roll axis oscillate
     local rk = a.roll or {}
     local dp = a.kp * deadband(ep, a.deadband) - a.kd * s.pitch_rate + self.pi_ + self.rear_pk * rl
-    local dr = (rk.kp or a.kp) * deadband(er, a.deadband) - (rk.kd or a.kd) * s.roll_rate + self.ri
+    local dr = (rk.kp or a.kp) * deadband(er, rk.deadband or a.deadband) - (rk.kd or a.kd) * s.roll_rate + self.ri
     -- integrate only while the output is not pinned (anti-windup)
     if math.abs(dp) < a.max_corr then
         self.pi_ = U.clamp(self.pi_ + a.ki * ep * dt, -a.int_limit, a.int_limit)
     end
     if math.abs(dr) < a.max_corr then
-        self.ri = U.clamp(self.ri + a.ki * er * dt, -a.int_limit, a.int_limit)
+        self.ri = U.clamp(self.ri + (rk.ki or a.ki) * er * dt, -a.int_limit, a.int_limit)
     end
     dp = U.clamp(dp, -a.max_corr, a.max_corr) * scale
     dr = U.clamp(dr, -a.max_corr, a.max_corr) * scale
@@ -158,7 +158,7 @@ function Ctl:yaw(s, dt, rate_sp)
     -- change is a small lift transient on that side)
     if rate_sp == 0 and math.abs(s.yaw_rate) < 1 then return 0 end
     local rl = (self.rear_level or 0) / 15
-    if rl > 0.1 and math.abs(err) < 4 then
+    if math.abs(rl) > 0.1 and math.abs(err) < 4 then
         self.rear_yk = U.clamp(self.rear_yk + y.rate_int * 4 * err * rl * dt, -1, 1)
     end
     local u = y.rate_gain * err + self.yi + self.rear_yk * rl

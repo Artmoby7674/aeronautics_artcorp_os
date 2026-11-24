@@ -61,10 +61,13 @@ end
 
 local DEFAULTS = {
     g = 11, hover = 6, airflow = 25, press_k = 0.004, press_ref = 63,
-    inertia = { 300, 400, 300 },   -- m^2 about body x(roll) y(yaw) z(pitch)
+    -- m^2 about body x(roll) y(yaw) z(pitch). Matched to the real ship's
+    -- flight data (v2.9 log): roll reacts ~13 deg/s^2 per prop unit, so the
+    -- roll axis is light; pitch is heavier (long hull).
+    inertia = { 30, 400, 100 },
     ang_damp = 0.15,               -- 1/s
     drag = 0.03,                   -- 1/s linear
-    prop_tau = 0.25,               -- s spin-up lag
+    prop_tau = 0.6,                -- s spin-up lag (real ship: ~1 s to respond)
     tilt_rate = 120,               -- deg/s servo travel
     tilt_deg = 25,
     rear_accel = 0.35,             -- m/s^2 per rear level

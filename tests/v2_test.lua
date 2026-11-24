@@ -63,7 +63,8 @@ do
     check("boot on the ground = parked", w.fl.phase == "parked", w.fl.phase)
     w:tap("SPACE")
     local maxatt = 0
-    w:run(25, function(w)
+    -- long enough for the take-off direction check to finish its nudges
+    w:run(70, function(w)
         local t = w:truth()
         maxatt = math.max(maxatt, math.abs(t.pitch), math.abs(t.roll))
     end)
@@ -152,7 +153,9 @@ end
 -- 8. Long autopilot trip with an off-centre rear thruster (pitches the nose
 --    AND yaws right), from the ground, ending landed on the waypoint heading
 do
-    local w = World.new({ sim = { drag = 0.08, rear_dz = 0.4, rear_dy = -2, hull_pitch = 0.3 } })
+    -- rear_dy -0.7 with pitch inertia 100 tips the hull as hard as -2 did
+    -- with the old 300 (the real three rear thrusters sit around the centre)
+    local w = World.new({ sim = { drag = 0.08, rear_dz = 0.4, rear_dy = -0.7, hull_pitch = 0.3 } })
     w:startAP({ name = "FAR", x = 1200, z = -800, heading = 200 })
     local maxatt, below, phases = 0, 0, {}
     w:run(600, function(w)
@@ -251,8 +254,8 @@ do
     for _, inertia in ipairs({ 0.5, 1, 2 }) do
         for _, tau in ipairs({ 0.1, 0.25, 0.5 }) do
             for _, delay in ipairs({ 1, 2 }) do
-                local w = World.new({ sim = { inertia = { 300 * inertia, 400 * inertia, 300 * inertia },
-                    prop_tau = tau, delay_ticks = delay, hull_pitch = 0.4 } }):airborne(150, 45)
+                local w = World.new({ sim = { inertia = { 30 * inertia, 400 * inertia, 100 * inertia },
+                    prop_tau = tau * 2.4, delay_ticks = delay, hull_pitch = 0.4 } }):airborne(150, 45)
                 w.sim.vel.x = 3
                 local mx = 0
                 w:run(40, function(w)
@@ -275,8 +278,8 @@ end
 --     correctly wired ship alone.
 do
     local function flight(swap_lr, swap_fb)
-        local w = World.new({ sim = { inertia = { 150, 1600, 3000 }, prop_tau = 0.4,
-            self_level = 0.5, self_level_roll = 0.5 } })
+        -- real-ship-like response (strong, ~1 s late), pitch 3x heavier
+        local w = World.new({ sim = { inertia = { 30, 400, 300 }, prop_tau = 0.6 } })
         if swap_lr or swap_fb then
             local raw = w.sim.readOutputs
             w.sim.readOutputs = function(self)
@@ -287,10 +290,10 @@ do
             end
         end
         w:tap("SPACE")
-        w:run(40)
+        w:run(80)
         w.sim.w.x = math.rad(2) -- a roll kick after the check
         local late = 0
-        w:run(60, function(w) if w.t > 70 then local _, p, r = w.sim:attitude(); late = math.max(late, math.abs(r), math.abs(p)) end end)
+        w:run(60, function(w) if w.t > 110 then local _, p, r = w.sim:attitude(); late = math.max(late, math.abs(r), math.abs(p)) end end)
         return w.fl.ctl, late
     end
     local c, late = flight(false, false)

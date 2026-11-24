@@ -30,17 +30,23 @@ return {
     -- Pitch/roll stabiliser: prop speed DIFFERENCES, applied symmetrically
     -- (one side up, the other down) so a correction never costs lift.
     attitude = {
-        kp = 0.12,           -- prop units per degree (gentle: the hull is
-                             -- naturally steady and rights itself)
-        kd = 0.8,            -- prop units per deg/s (damps the swing early)
-        ki = 0.03,           -- prop units per degree-second (hull trim: holds
-                             -- off the natural slight nose-down pitch)
-        -- ROLL has its own gains: the hull is long and narrow, so it rolls
-        -- much more easily than it pitches; pitch-level damping (kd 1.5) made
-        -- the roll axis oscillate in the sim when it is 4-8x lighter.
-        roll = { kp = 0.10, kd = 0.4 },
-        int_limit = 3,
-        max_corr = 5,        -- prop units per axis
+        -- Measured on the real ship (v2.9 flight data): a correction acts
+        -- STRONGLY (5 units changed the roll rate by 25-50 deg/s within a
+        -- second) and about a second LATE. Stronger gains overshoot every
+        -- time and the swing grows until the ship rolls over. Simulated
+        -- over roll/pitch responses 4-25 deg/s^2 per unit and 0.6-1.5 s
+        -- spin-up plus delay, a 10-15 deg/s kick settles within 1 deg.
+        kp = 0.05,           -- pitch: prop units per degree
+        kd = 0.30,           -- pitch: prop units per deg/s
+        -- roll: lighter axis, and damping that arrives a second late feeds
+        -- the swing, so roll damping is kept low (kd 0.24 swung 15-35 deg
+        -- in the laggiest cases; 0.12 settles). Smaller deadband: on this
+        -- ship a lean of under a degree already slides it sideways.
+        roll = { kp = 0.02, kd = 0.12, deadband = 0.4 },
+        ki = 0.005,          -- prop units per degree-second (slow hull trim:
+                             -- holds off the natural slight nose-down pitch)
+        int_limit = 2,
+        max_corr = 2.5,      -- prop units per axis
         deadband = 1.0,      -- degrees (P term only): leave a steady hull alone
         rate_tau = 0.08,     -- s smoothing on the measured rates
         reserve = 2,         -- prop units of lift the stabiliser may borrow
@@ -113,10 +119,11 @@ return {
         cruise_speed = 40,   -- m/s cap
         hop_speed = 8,       -- m/s cap for hops
         creep_speed = 3,     -- m/s cap when creeping back after a miss
-        cruise_brake = 1.0,  -- m/s^2 assumed when planning the stop (rear reverse)
+        cruise_brake = 0.6,  -- m/s^2 assumed when planning the stop (rear reverse;
+                             -- low: braking starts early, the approach is slow)
         stop_margin = 2,     -- m: plan to stop this short of the point
         face_r = 40,         -- m: closer than this, no more steering (straight in)
-        retry_r = 10,        -- m: stopped further than this = re-aim and creep
+        retry_r = 6,         -- m: stopped further than this = re-aim and creep
         retries = 2,
         speed_gain = 0.8,    -- rear levels per m/s of speed error
         speed_int = 0.15,

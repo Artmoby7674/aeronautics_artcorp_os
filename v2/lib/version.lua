@@ -4,6 +4,7 @@
 -- start-up, in the log and on the error screen; the cockpit screen (start
 -- screen, SHIP tab) shows the number only. Newest first.
 local history = {
+    { "3.0", "CALM ROLL", "gains for a strong, 1 s late hull; fine prop steps; lag-proof direction check" },
     { "2.9", "DIR CHECK", "take-off check of which way pitch/roll corrections move the hull" },
     { "2.8", "GENTLE STAB", "gentler stabiliser for a naturally steady hull" },
     { "2.7", "ROLL GAINS", "separate roll gains: no roll swinging on a narrow hull" },
@@ -23,6 +24,6 @@ return {
     note = latest[3],
     date = "2026-11-24",
     history = history,
-    -- "v2.8 GENTLE STAB"
+    -- "v3.0 CALM ROLL"
     label = "v" .. latest[1] .. " " .. latest[2],
 }

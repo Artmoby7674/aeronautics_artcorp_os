@@ -49,16 +49,27 @@ local LEARN_PATH = ROOT .. "/data/learned.lua"
 local LEARN_KEYS = { "hover", "pi_", "ri", "yi", "rear_pk", "rear_yk", "yaw_brake",
     "roll_sign", "pitch_sign", "roll_known", "pitch_known" }
 
+-- Bumped when what the stabiliser learns changes meaning. Values saved by
+-- an older format keep only what is plain physics (hover throttle, yaw
+-- braking); trims, feedforwards and the direction check start over.
+-- 2 (v3.0): trims learned under the v2.9 roll swing were wound up to the
+-- limit, its direction check measured mid-swing, and the rear feedforwards
+-- now follow the thrust direction (reverse = negative).
+local LEARN_FMT = 2
+local LEARN_KEEP = { hover = true, yaw_brake = true }
+
 local function loadLearned(ctl)
     local t = U.loadTable(LEARN_PATH)
     if not t then return end
+    local old = t.fmt ~= LEARN_FMT
+    if old then U.log("learned values from an older version: kept hover and yaw braking, the rest starts over") end
     for _, k in ipairs(LEARN_KEYS) do
-        if type(t[k]) == "number" then ctl[k] = t[k] end
+        if type(t[k]) == "number" and (not old or LEARN_KEEP[k]) then ctl[k] = t[k] end
     end
 end
 
 local function saveLearned(ctl)
-    local t = {}
+    local t = { fmt = LEARN_FMT }
     for _, k in ipairs(LEARN_KEYS) do t[k] = ctl[k] end
     U.saveTable(LEARN_PATH, t)
 end
