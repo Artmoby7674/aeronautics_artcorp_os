@@ -376,8 +376,20 @@ local function doRemote(cmd)
         end
         say("ARTCORP OVERRIDE: FORCED LANDING", D.C.bad)
         U.log("artcorp: force-land by remote %s", tostring(cmd.by))
+    elseif cmd.cmd == "goto" then
+        -- dispatch: a normal, cancelable trip to one of this ship's own
+        -- waypoints (the pilot keeps full control)
+        local w = Nav.list[tonumber(cmd.idx) or 0]
+        if not w then return false, "NO SUCH WAYPOINT" end
+        if app.lock then return false, "SHIP IS LOCKED" end
+        if app.power ~= "on" then return false, "ENGINES OFF" end
+        if fl.phase == "estop" or fl.phase == "unflip" then return false, "SHIP IN " .. fl.phase:upper() end
+        if fl.phase == "landing" then fl:cancelLanding("") end
+        fl.ap = AP.new(fl, w)
+        say("ARTCORP DISPATCH: A/P TO " .. tostring(w.name), D.C.ap)
+        U.log("artcorp: dispatched to %s by remote %s", tostring(w.name), tostring(cmd.by))
     elseif cmd.cmd == "summon" then
-        if not (cmd.x and cmd.z) then return false end
+        if not (cmd.x and cmd.z) then return false, "NO COORDINATES" end
         setLock("summon", "summon", cmd.x, cmd.z, cmd.by)
         if app.power == "on" and fl.phase ~= "parked" then
             fl:remoteSummon(cmd.x, cmd.z)
@@ -387,7 +399,7 @@ local function doRemote(cmd)
         say(string.format("ARTCORP SUMMON: EN ROUTE TO %d, %d", cmd.x, cmd.z), D.C.bad)
         U.log("artcorp: summon to %s,%s by remote %s", tostring(cmd.x), tostring(cmd.z), tostring(cmd.by))
     else
-        return false
+        return false, "UNKNOWN COMMAND"
     end
     app.ui:invalidate()
     return app.cfg.name
@@ -396,15 +408,26 @@ end
 local function initRemote()
     Remote.init({
         snapshot = function()
-            local s = app.fl.est.s
+            local fl = app.fl
+            local s = fl.est.s
+            local wps = {}
+            for i, w in ipairs(Nav.list) do
+                if i > 16 then break end
+                wps[i] = tostring(w.name)
+            end
+            local ap = fl.ap
             return {
                 name = app.cfg.name, slot = app.cfg.slot, os = V.label,
-                phase = (app.power == "on") and app.fl.phase or app.power,
+                phase = (app.power == "on") and fl.phase or app.power,
                 locked = app.lock and app.lock.reason or false,
                 x = s and s.x, y = s and s.alt, z = s and s.z,
+                heading = s and s.heading, speed = s and s.hspeed, gear = fl.gear_down,
+                ap = ap and { name = ap.name, phase = ap.phase, dist = ap.dist, locked = ap.locked } or nil,
+                wps = wps, nwps = #Nav.list,
             }
         end,
         onCommand = doRemote,
+        waypoints = function() return Nav.list end,
     })
 end
 

@@ -325,14 +325,44 @@ at(t0 + 7, function() return tapAction("ctl:power") end)
 at(t0 + 8, function() return tapAction("ctl:power") end) -- the "tap again" confirm
 at(t0 + 10, function() return tapAction("tab:auto") end)
 at(t0 + 12, function() return tapAction("ap:cancel") end)
-at(t0 + 60, function()
-    states.d60 = dist()
-    return { "terminate" }
-end)
+at(t0 + 60, function() states.d60 = dist() end)
+-- then the remote: RELEASE, DISPATCH to waypoint 1, SCAN
+local sent3 = {}
+local rednet_saved = _G.rednet
+_G.rednet = { open = function() end, broadcast = function() end,
+    send = function(to, m) sent3[#sent3 + 1] = m return true end }
+local function rn(m) m.proto = "artcorp" return { "rednet_message", 11, m, "artcorp" } end
+at(t0 + 61, function() return rn({ op = "cmd", cmd = "unlock" }) end)
+at(t0 + 62, function() states.lock_after_release = files["v2/data/artcorp_lock.lua"] end)
+at(t0 + 63, function() return rn({ op = "cmd", cmd = "goto", idx = 1 }) end)
+at(t0 + 65, function() return rn({ op = "cmd", cmd = "goto", idx = 99 }) end)
+at(t0 + 67, function() return rn({ op = "scan" }) end)
+at(t0 + 68, function() return rn({ op = "wps" }) end)
+at(t0 + 70, function() return { "terminate" } end)
 printed = {}
 _G.print = function(...) printed[#printed + 1] = table.concat({ ... }, " ") end
 local ok3, err3 = pcall(require("main").run, { runs = 3 })
 _G.print = real_print
+_G.rednet = rednet_saved
+local acks, here = {}, nil
+for _, m in ipairs(sent3) do
+    if m.op == "ack" then acks[#acks + 1] = m end
+    if m.op == "here" then here = m end
+    if m.op == "wps" then states.wps_reply = m end
+end
+check("remote: release acked", acks[1] and acks[1].cmd == "unlock" and acks[1].ok == true)
+check("remote: release removed the lock file", states.lock_after_release == nil)
+check("remote: dispatch acked", acks[2] and acks[2].cmd == "goto" and acks[2].ok == true)
+check("remote: bad dispatch refused with a reason", acks[3] and acks[3].ok == false and acks[3].why == "NO SUCH WAYPOINT",
+    acks[3] and tostring(acks[3].why))
+check("remote: scan reply lists the waypoints", here and type(here.wps) == "table" and here.wps[1] ~= nil)
+local wr = states.wps_reply
+check("remote: full waypoint list answered", wr and type(wr.list) == "table" and #wr.list >= 1
+    and wr.list[1].i == 1 and wr.list[1].name ~= nil and wr.list[1].x ~= nil and wr.list[1].z ~= nil,
+    wr and wr.list and #wr.list)
+check("remote: scan tells how many waypoints", here and here.nwps == (wr and wr.list and #wr.list), here and here.nwps)
+check("remote: scan reply shows the dispatch route", here and here.ap and here.ap.name ~= nil,
+    here and here.ap and here.ap.name)
 local refused = 0
 for _, l in ipairs(printed) do if l:find("LOCKED BY ARTCORP") then refused = refused + 1 end end
 print(string.format("summon lock: %.0f m -> %.0f m from the CEO, %d taps refused, missing hits: %s",
@@ -341,7 +371,7 @@ check("summon lock: ran", ok3, err3)
 check("summon lock: the pilot's taps were refused", refused >= 3, refused)
 check("summon lock: still flying to the CEO", (states.d60 or 1e9) < (states.d0 or 0) - 100,
     string.format("%.0f -> %.0f", states.d0 or -1, states.d60 or -1))
-check("summon lock: lock still on disk", (files["v2/data/artcorp_lock.lua"] or ""):find("summon") ~= nil)
+
 
 _G.loadfile, _G.dofile, _G.fs = saved.loadfile, saved.dofile, saved.fs
 print(string.format("v2_main_test: %d passed, %d failed", passed, failed))
