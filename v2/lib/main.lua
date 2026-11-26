@@ -49,7 +49,7 @@ end
 
 local LEARN_PATH = ROOT .. "/data/learned.lua"
 local LEARN_KEYS = { "hover", "pi_", "ri", "yi", "rear_pk", "rear_yk", "yaw_brake",
-    "roll_sign", "pitch_sign", "roll_known", "pitch_known" }
+    "roll_sign", "pitch_sign", "roll_known", "pitch_known", "calibrated" }
 
 -- Bumped when what the stabiliser learns changes meaning. Values saved by
 -- an older format keep only what is plain physics (hover throttle, yaw
@@ -303,12 +303,11 @@ local function act(a)
     end
     if a == "ship:reset" then
         local c = fl.ctl
-        c.hover = fl.t.ship.hover_throttle
-        c.pi_, c.ri, c.yi, c.rear_pk, c.rear_yk, c.yaw_brake = 0, 0, 0, 0, 0, nil
-        c.roll_sign, c.pitch_sign, c.roll_known, c.pitch_known = 1, 1, 0, 0 -- re-checked at next take-off
-        fl.atmos:reset() -- the air is measured again from scratch
+        c:clearTrims() -- calibration needed again (hover hands-off)
+        -- the measured air is KEPT: it belongs to the world, not the trims
+        -- (wiping it left the ship ~11 % short of lift until relearned)
         saveLearned(c)
-        return say("LEARNED VALUES RESET")
+        return say("RESET: HOVER HANDS-OFF TO CALIBRATE")
     end
     -- ship backup on a floppy in any disk drive on the network
     if a == "ship:disksave" then
@@ -438,6 +437,10 @@ local function alerts()
     local function add(level, text, hint)
         out[#out + 1] = { level = level, text = text, hint = hint }
         if level == "bad" then bad = true end
+    end
+    if (fl.ctl.calibrated or 0) == 0 and fl.phase == "flying" then
+        add("info", fl.cal and "CALIBRATING: KEEP HANDS OFF" or "NOT CALIBRATED: HOVER HANDS-OFF",
+            fl.cal and string.format("%d%%", math.floor((fl.cal.progress or 0) * 100)) or nil)
     end
     if app.lock then add("bad", "LOCKED BY ARTCORP", (tostring(app.lock.reason)):upper() .. " / REMOTE") end
     if fl.phase == "estop" then add("bad", "E-STOP: ALL LIFT CUT", "SPACE RESETS") end
@@ -578,6 +581,7 @@ local function controlTick()
     HW.setClutch(true) -- held while the OS is on: this is what couples the props
     HW.setStarter(false)
     app.fl:update(app.dt or DT, app.keys)
+    if app.fl.save_learned then app.fl.save_learned = false saveLearned(app.fl.ctl) end
     local ph = app.fl.phase
     writeState((ph == "flying" or ph == "landing" or ph == "unflip") and "air" or "ground", app.fl.gear_down)
     for _, e in ipairs(app.fl.events) do

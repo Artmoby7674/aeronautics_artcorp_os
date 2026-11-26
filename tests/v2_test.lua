@@ -275,43 +275,44 @@ do
     print(string.format("robustness: worst steady attitude %.2f deg", worst))
 end
 
--- 13. Direction self-check at take-off. A correction that pushes the wrong
---     way makes a self-righting hull swing wider every time (the reported
---     roll); the take-off check must detect it and fix it, and must leave a
---     correctly wired ship alone.
+-- 13. Calibration after RESET (the take-off direction check is retired):
+--     hands-off hover learns the trims, freezes them once they stop moving;
+--     the trims survive an engine restart; RESET keeps the measured air.
 do
-    local function flight(swap_lr, swap_fb)
-        -- real-ship-like response (strong, ~1 s late), pitch 3x heavier
-        local w = World.new({ sim = { inertia = { 30, 400, 300 }, prop_tau = 0.6 } })
-        if swap_lr or swap_fb then
-            local raw = w.sim.readOutputs
-            w.sim.readOutputs = function(self)
-                local o = raw(self)
-                if swap_lr then o.FL, o.FR, o.RL, o.RR = o.FR, o.FL, o.RR, o.RL end
-                if swap_fb then o.FL, o.RL, o.FR, o.RR = o.RL, o.FL, o.RR, o.FR end
-                return o
-            end
-        end
-        w:tap("SPACE")
-        w:run(80)
-        w.sim.w.x = math.rad(2) -- a roll kick after the check
-        local late = 0
-        w:run(60, function(w) if w.t > 110 then local _, p, r = w.sim:attitude(); late = math.max(late, math.abs(r), math.abs(p)) end end)
-        return w.fl.ctl, late
-    end
-    local c, late = flight(false, false)
-    print(string.format("dircheck correct: roll %+d pitch %+d known %s/%s late %.2f", c.roll_sign, c.pitch_sign, tostring(c.roll_known), tostring(c.pitch_known), late))
-    check("dircheck: correct wiring kept", c.roll_sign == 1 and c.pitch_sign == 1)
-    check("dircheck: both axes checked", (c.roll_known or 0) > 0 and (c.pitch_known or 0) > 0)
-    check("dircheck: steady after", late < 3, f(late))
-    c, late = flight(true, false)
-    print(string.format("dircheck L/R swapped: roll %+d pitch %+d late %.2f", c.roll_sign, c.pitch_sign, late))
-    check("dircheck: reversed roll detected", c.roll_sign == -1 and c.pitch_sign == 1)
-    check("dircheck: steady after fixing roll", late < 3, f(late))
-    c, late = flight(false, true)
-    print(string.format("dircheck F/B swapped: roll %+d pitch %+d late %.2f", c.roll_sign, c.pitch_sign, late))
-    check("dircheck: reversed pitch detected", c.pitch_sign == -1 and c.roll_sign == 1)
-    check("dircheck: steady after fixing pitch", late < 3, f(late))
+    local w = World.new({ loop_ticks = 3, sim = { hull_pitch = 0.5, hull_roll = -0.3, hull_yaw = 0.2 } }):airborne(150, 0)
+    w.fl.ctl:clearTrims()
+    local t_done
+    w:run(300, function(w)
+        if (w.fl.ctl.calibrated or 0) > 0 and not t_done then t_done = w.t return true end
+    end)
+    local c = w.fl.ctl
+    local pi0, ri0, yi0 = c.pi_, c.ri, c.yi
+    local mx = 0
+    w:run(60, function(w)
+        local _, p, r = w.sim:attitude()
+        mx = math.max(mx, math.abs(p), math.abs(r))
+    end)
+    print(string.format("calibration: done at %s s, trims p%.3f r%.3f y%.3f, then max attitude %.2f, frozen=%s",
+        tostring(t_done and math.floor(t_done)), pi0, ri0, yi0, mx,
+        tostring(c.pi_ == pi0 and c.ri == ri0 and c.yi == yi0)))
+    check("calibration: converges hands-off (< 200 s)", t_done and t_done < 200, t_done)
+    check("calibration: trims frozen afterwards", c.pi_ == pi0 and c.ri == ri0 and c.yi == yi0)
+    check("calibration: level after (< 3 deg)", mx < 3, f(mx))
+    check("calibration: no take-off direction check", w.fl.calib == nil)
+
+    -- trims survive an engine start (fl:boot used to zero them)
+    w.fl:boot("ground")
+    check("trims kept across an engine start", c.pi_ == pi0 and c.ri == ri0 and (c.calibrated or 0) == 1)
+
+    -- pilot input pauses calibration
+    local w2 = World.new({ loop_ticks = 3 }):airborne(150, 0)
+    w2.fl.ctl:clearTrims()
+    w2.sim:press("Q", true)
+    w2:run(20)
+    check("calibration: pauses while the pilot flies", w2.fl.ctl.calibrating ~= true and w2.fl.cal == nil)
+    w2.sim:press("Q", false)
+    w2:run(3)
+    check("calibration: resumes hands-off", w2.fl.ctl.calibrating == true)
 end
 
 -- 14. The real ship's control loop runs every ~0.2 s (each Sable call waits

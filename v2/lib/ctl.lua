@@ -35,8 +35,10 @@ end
 
 function Ctl:reset()
     self.vi = 0          -- climb-rate integrator (m/s^2)
-    self.pi_, self.ri = 0, 0
-    self.yi = 0
+    -- trims are LEARNED values: kept across an engine start (they used to be
+    -- zeroed here on every start, so a calibration never survived a flight)
+    self.pi_, self.ri = self.pi_ or 0, self.ri or 0
+    self.yi = self.yi or 0
     -- learned per-rear-level feedforwards (pitch units, yaw duty)
     self.rear_pk = self.rear_pk or 0
     -- which way a correction actually moves the hull: +1 as designed, -1 if
@@ -50,6 +52,21 @@ function Ctl:reset()
     self.prev_out = nil
     self.sat = 0         -- last allocation: +1 lift capped high, -1 low
     self.margin = 15
+end
+
+-- RESET LEARNED VALUES: trims and feedforwards back to zero, calibration
+-- needed again (the measured air is kept: it belongs to the world).
+function Ctl:clearTrims()
+    self.pi_, self.ri, self.yi = 0, 0, 0
+    self.rear_pk, self.rear_yk, self.yaw_brake = 0, 0, nil
+    self.calibrated = 0
+end
+
+-- Trims learn faster while calibrating, and not at all once calibrated
+-- (frozen until the next RESET).
+function Ctl:trimRate()
+    if (self.calibrated or 0) > 0 then return 0 end
+    return self.calibrating and (self.t.calibration and self.t.calibration.boost or 4) or 1
 end
 
 -- Keep learned trims, forget transient state (used on mode changes).
@@ -179,10 +196,10 @@ function Ctl:attitude(s, dt, pitch_sp, roll_sp)
     self.dbg_att = { pP = pP, pD = pD, pI = self.pi_ + self.rear_pk * rl, rP = rP, rD = rD, rI = self.ri, scale = scale }
     -- integrate only while the output is not pinned (anti-windup)
     if math.abs(dp) < a.max_corr then
-        self.pi_ = U.clamp(self.pi_ + a.ki * ep * dt, -a.int_limit, a.int_limit)
+        self.pi_ = U.clamp(self.pi_ + a.ki * self:trimRate() * ep * dt, -a.int_limit, a.int_limit)
     end
     if math.abs(dr) < a.max_corr then
-        self.ri = U.clamp(self.ri + (rk.ki or a.ki) * er * dt, -a.int_limit, a.int_limit)
+        self.ri = U.clamp(self.ri + (rk.ki or a.ki) * self:trimRate() * er * dt, -a.int_limit, a.int_limit)
     end
     dp = U.clamp(dp, -a.max_corr, a.max_corr) * scale
     dr = U.clamp(dr, -a.max_corr, a.max_corr) * scale
@@ -219,7 +236,7 @@ function Ctl:yaw(s, dt, rate_sp)
     -- the integrator learns steady torques, so it only runs near a steady
     -- rate (during a big turn the error is the turn, not a disturbance)
     if math.abs(u) < 1 and math.abs(err) < 4 then
-        self.yi = U.clamp(self.yi + y.rate_int * err * dt, -y.int_limit, y.int_limit)
+        self.yi = U.clamp(self.yi + y.rate_int * self:trimRate() * err * dt, -y.int_limit, y.int_limit)
     end
     u = U.clamp(u, -1, 1)
     self.dbg_yaw = { sp = rate_sp, u = u }

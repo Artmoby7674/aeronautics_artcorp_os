@@ -172,6 +172,19 @@ return {
                              -- getting at least 5 m closer
     },
 
+    -- Calibration after RESET LEARNED VALUES: hover hands-off; the trims
+    -- learn at their normal rate, then freeze once none moved more than
+    -- trim_tol for `window` s (after at least min_time s) with the hull level.
+    -- boost > 1 learns faster but overshoots: in the sim boost 4 took 135 s
+    -- and slid the hull 34 m, boost 1 settled in 40 s with 16 m.
+    calibration = {
+        boost = 1,
+        min_time = 40,       -- s
+        window = 20,         -- s
+        trim_tol = 0.04,     -- prop units (pitch/roll), duty (yaw)
+        level_tol = 1.5,     -- deg mean |pitch| / |roll| over the window
+    },
+
     unflip = {
         detect_time = 0.75,  -- s upside down before acting (lift is cut
                              -- at once: upside down it pushes the ship DOWN)

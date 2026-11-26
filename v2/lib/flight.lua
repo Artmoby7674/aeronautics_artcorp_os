@@ -117,9 +117,48 @@ function Flight:takeoff()
     self.alt_target = self.est.s.alt + (self.t.vertical.takeoff_climb or 20)
     self.ctl:softReset()
     self:notify("TAKEOFF")
-    -- check which way pitch/roll corrections really move the hull, once
-    if not ((self.ctl.roll_known or 0) > 0 and (self.ctl.pitch_known or 0) > 0) then
-        self.calib = { stage = "wait", t = 0, alt0 = self.est.s.alt }
+    -- (the take-off direction check is retired: on this ship it never
+    -- finished -- "moving too much" -- and both directions are confirmed;
+    -- roll_sign / pitch_sign stay in the learned values)
+end
+
+-- Calibration after a RESET: while the pilot hovers hands-off, the trims
+-- learn fast; once none of them has moved more than a little for
+-- `window` s (and the hull sits level), they are frozen until the next
+-- RESET. Progress and state show on the SHIP tab.
+function Flight:calibrationTick(s, dt, handsOff)
+    local c, k = self.ctl, self.t.calibration or {}
+    if (c.calibrated or 0) > 0 then c.calibrating = false self.cal = nil return end
+    if not handsOff then
+        c.calibrating = false
+        self.cal = nil
+        return
+    end
+    c.calibrating = true
+    local cal = self.cal or { t = 0, tick = 0, hist = {} }
+    self.cal = cal
+    cal.t, cal.tick = cal.t + dt, cal.tick + dt
+    if cal.tick >= 1 then
+        cal.tick = 0
+        table.insert(cal.hist, { c.pi_, c.ri, c.yi, math.abs(s.pitch), math.abs(s.roll) })
+        if #cal.hist > (k.window or 20) then table.remove(cal.hist, 1) end
+    end
+    local need = k.min_time or 40
+    cal.progress = math.min(cal.t / need, 0.99)
+    if cal.t < need or #cal.hist < (k.window or 20) then return end
+    local lo, hi, att = { 9, 9, 9 }, { -9, -9, -9 }, 0
+    for _, h in ipairs(cal.hist) do
+        for i = 1, 3 do lo[i], hi[i] = math.min(lo[i], h[i]), math.max(hi[i], h[i]) end
+        att = att + math.max(h[4], h[5])
+    end
+    att = att / #cal.hist
+    local tol = k.trim_tol or 0.04
+    if hi[1] - lo[1] < tol and hi[2] - lo[2] < tol and hi[3] - lo[3] < tol and att < (k.level_tol or 1.5) then
+        c.calibrated, c.calibrating = 1, false
+        self.cal = nil
+        self.save_learned = true -- main writes it to disk
+        U.log("calibrated in %.0f s: pitch trim %.3f, roll trim %.3f, yaw trim %.3f (frozen)", cal.t, c.pi_, c.ri, c.yi)
+        self:notify("CALIBRATED")
     end
 end
 
@@ -404,6 +443,11 @@ function Flight:update(dt, keys)
                 self:notify(ok and ("MODE " .. m) or m)
             end
             cmd = self:pilot(dt)
+            local hands = true
+            for _, key in ipairs({ "W", "S", "A", "D", "Q", "E", "SPACE", "CTRL" }) do
+                if pressed(self, key) then hands = false end
+            end
+            self.hands_off = hands and self.mode == "hover"
             -- manual descent onto the ground ends as a landing
             local thr = pc.landed_threshold or 15
             if self.prox >= thr and self.alt_target < s.alt then
@@ -542,6 +586,8 @@ function Flight:run(cmd, dt)
     -- speed learned so far
     self.atmos.base_hover = ctl.hover
     ctl:learnHover(s, dt, self.out.lift_used, (self.prox or 0) > 0)
+    self:calibrationTick(s, dt, self.phase == "flying" and not self.ap and not cmd.reverse and self.hands_off)
+    self.hands_off = false -- set again by the pilot code each hands-off tick
 
     -- rear thruster: ramps up, drops instantly. Its thrust line is off the
     -- centre of mass, so it pitches the hull; when the stabiliser runs out

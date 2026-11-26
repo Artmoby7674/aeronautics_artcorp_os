@@ -604,9 +604,9 @@ function UI:ship(m, static)
         { "REAR YAW FF", string.format("%+.2f", c.rear_yk or 0), math.abs(c.rear_yk or 0) > 0.3 and C.warn or C.text },
         { "TURN BRAKE", string.format("%.1f ^/S2", c.yaw_brake or fl.t.yaw.brake_accel), C.text },
         { "REAR CAP", string.format("%.0f/15", fl.rear_cap or 15), (fl.rear_cap or 15) < 14 and C.warn or C.text },
-        { "DIRECTIONS", ((c.roll_known or 0) > 0 and (c.pitch_known or 0) > 0)
-            and string.format("R%+d P%+d OK", c.roll_sign or 1, c.pitch_sign or 1) or "CHECK AT TAKE-OFF",
-            ((c.roll_sign or 1) < 0 or (c.pitch_sign or 1) < 0) and C.warn or C.text },
+        { "CALIBRATION", ((c.calibrated or 0) > 0) and "DONE (FROZEN)"
+            or (fl.cal and string.format("RUNNING %d%%", math.floor((fl.cal.progress or 0) * 100)))
+            or "HOVER HANDS-OFF", ((c.calibrated or 0) > 0) and C.good or C.warn },
     }
     local function column(id, x, list)
         for i, r in ipairs(list) do
