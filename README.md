@@ -38,11 +38,11 @@ or `v2/data/` (what the ship has learned, waypoints, logs).
 
 ## First Launch
 
-A computer with no ship set up starts on a **WELCOME ABOARD** screen instead
+A computer with no config loaded starts with a **WELCOME ABOARD** screen instead
 of the cockpit. Two ways in:
 
-- **IMPORT FROM DISK**: put a floppy with a saved ship in any disk drive on
-  the network. The ship loads and the OS restarts on it. Nothing else to do.
+- **IMPORT FROM DISK**: You can put a floppy with a saved ship config in any disk drive on
+  the network. The ship loads and the OS simply reboots on it.
 - **SET UP THIS SHIP**: the OS walks through the wiring one part at a time
   (the four props, the rear thruster, the engine, the gear and ground sensor,
   the two keyboard relays and the monitor). Each step says what that part
@@ -55,20 +55,14 @@ Then a short first-flight guide, and a tour of the screens: the rest of the
 screen dims, one thing is highlighted, and a popup explains it (**NEXT** /
 **SKIP**). The **?** at the top right replays the tour any time on the ground.
 
-Before the first start: **open the steam engine's water input valve**. The OS
-can't do that one for you.
+Before the first start: **open the steam engine's water input valve** because it's not linked to any automatic system (allows you to cut the engines whenever you need too).
+## Features
 
-## What It Does
-
-- **Stays level on its own.** Hands off, the ship holds its altitude, keeps
-  level and cancels fore/aft drift with the rear thrusters. It never tries to
-  hold a position or a heading (it has no sideways thrust to do that with).
-- **Calibrates itself.** After a reset, hover hands-off for a bit: the trims
-  settle, then freeze. SHIP > CALIBRATION says **DONE (FROZEN)** when it's done.
-- **Learns the air.** Every world is different, so the ship measures how much
-  thrust it needs at each height while it flies, and works out its own ceiling.
-  It cruises at Y270 by default, or lower if the air runs out first.
-- **Flies itself to a waypoint.** Pick one on the NAV tab and press FLY: it
+- **Stability** The OS allows keeps the ship leveled.
+- **Auto Calibrattion** The main computer can calibrate values to trim the PIDs and different automatic systems
+  in case you make modifications on the center of mass or parts of the ship.
+- **Adaptation** To allow its usage on different worlds, the OS is capable of calibrating itself to any atmosphere configuration (for example with the Fly Higher addon)
+- **Autopilot** Pick one on the NAV tab and press FLY: it
   climbs straight up, turns to face it, cruises in a straight line (steering by
   banking, like a plane), slows down for the approach, turns to the saved
   heading and lands. The landing gear goes up once it's clear of the ground.
@@ -106,7 +100,7 @@ The full controls (keys, hover vs cruise, every tab) are in `v2/README.md`.
 
 ### Relay Placement (Atlas)
 
-This is how my Atlas is wired. The setup screen asks which relay is which, so
+This is how the Atlas is wired. The setup screen asks which relay is which, so
 yours can be placed differently as long as the faces match.
 
 - **Input relay 1** (W A S D): front = W, back = S, left = A, right = D
@@ -124,8 +118,7 @@ The ground sensor sits under the landing gear and gives an analog signal
 
 ## Updating
 
-Run the same install command again. It pulls the latest release and keeps the
-ship's wiring, waypoints and everything it has learned.
+If you ever see an update or want to check if there has been one, just run the same install command and all your config will remain in the ship (as long as they're on the main computer).
 
 ## More Detail
 
@@ -134,4 +127,4 @@ knobs in `v2/tune.lua`, and the data files.
 
 ## License
 
-MIT
+CC-BY-NC-4.0
