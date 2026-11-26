@@ -563,5 +563,42 @@ do
     check("ap gear: down for touchdown", landed_down == true, tostring(landed_down))
 end
 
+-- 22. Long trips (v2.34 flight): the rear sat at 11-12 holding a 40 m/s
+--     cap, and the autopilot cut itself off 240 s into every long cruise.
+do
+    local w = World.new({ loop_ticks = 3 }):airborne(200, 0)
+    w.fl.ctl.roll_known, w.fl.ctl.pitch_known = 1, 1
+    w.fl.calib = nil
+    w:startAP({ name = "FAR", x = 0, z = -60000, heading = 0 })
+    local cruise_t, full_t, vmax, pre_t = 0, 0, 0, 0
+    w:run(420, function(w)
+        local ap = w.fl.ap
+        if ap and ap.phase == "cruise" then
+            cruise_t = cruise_t + 0.15
+            -- before the planned braking for arrival (speed plan above speed)
+            if (ap.v_sp or 0) > w.fl.est.s.u + 2 then
+                pre_t = pre_t + 0.15
+                if (w.fl.rear or 0) >= 14.99 then full_t = full_t + 0.15 end
+            end
+        end
+        vmax = math.max(vmax, w:truth().speed)
+    end)
+    local ap = w.fl.ap
+    print(string.format("long trip: still flying=%s phase %s, cruise %.0f s, rear at 15 for %.0f s, top speed %.0f m/s",
+        tostring(ap ~= nil), ap and ap.phase or "-", cruise_t, full_t, vmax))
+    check("long trip: no timeout after 240 s of cruise", ap ~= nil and ap.phase == "cruise" and cruise_t > 300, f(cruise_t))
+    check("long trip: rear at full thrust (15) until braking", pre_t > 100 and full_t > pre_t * 0.9,
+        string.format("%.0f of %.0f s", full_t, pre_t))
+    check("long trip: faster than the old 40 m/s cap", vmax > 45, f(vmax))
+
+    -- a cruise that makes no progress still gives up
+    local w2 = World.new({ loop_ticks = 3, tune = { autopilot = { speed_gain = 0, speed_int = 0, nudge_after = 1e9 } } }):airborne(200, 0)
+    w2.fl.ctl.roll_known, w2.fl.ctl.pitch_known = 1, 1
+    w2.fl.calib = nil
+    w2:startAP({ name = "STUCK", x = 0, z = -3000, heading = 0 })
+    local gave_up = w2:run(300, function(w) return w.fl.ap == nil end)
+    check("stalled cruise still times out", gave_up, f(w2.t))
+end
+
 print(string.format("v2_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("v2_test FAILED", 0) end

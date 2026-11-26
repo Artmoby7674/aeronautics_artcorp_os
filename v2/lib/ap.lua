@@ -93,7 +93,18 @@ end
 function AP:update(fl, s, dt)
     local a = self.t.autopilot
     self.pt = self.pt + dt
-    if self.pt > a.phase_timeout and not self.locked then
+    -- Cruise has no time limit while it makes progress: a 12 km trip takes
+    -- well over 240 s (v2.34: "A/P TIMEOUT IN CRUISE" mid-trip, twice). It
+    -- only gives up after stall_timeout s without getting 5 m closer.
+    local timed_out = self.pt > a.phase_timeout and self.phase ~= "cruise"
+    if self.phase == "cruise" and self.dist then
+        if not self.best or self.dist < self.best - 5 then self.best, self.best_t = self.dist, 0 end
+        self.best_t = (self.best_t or 0) + dt
+        if self.best_t > (a.stall_timeout or 90) then timed_out = true end
+    else
+        self.best, self.best_t = nil, 0
+    end
+    if timed_out and not self.locked then
         fl:notify("A/P TIMEOUT IN " .. self.phase:upper())
         self:cancel("TIMEOUT")
         fl.ap = nil

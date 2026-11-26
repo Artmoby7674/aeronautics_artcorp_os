@@ -141,7 +141,10 @@ return {
         lift_margin = 3.5,   -- prop units kept free at cruise altitude
         hop_range = 400,     -- m: closer than this = slow, low hop
         hop_climb = 20,      -- m above start altitude for hops
-        cruise_speed = 40,   -- m/s cap
+        -- No practical cap: far from the point the rear runs at full thrust
+        -- (15) and the speed plan only takes over to brake for arrival. A
+        -- 40 m/s cap held the rear at 11-12 for the whole trip (v2.34).
+        cruise_speed = 200,  -- m/s cap
         hop_speed = 8,       -- m/s cap for hops
         creep_speed = 3,     -- m/s cap when creeping back after a miss
         cruise_brake = 0.6,  -- m/s^2 assumed when planning the stop (rear reverse;
@@ -164,7 +167,9 @@ return {
                              -- autopilot raises the gear
         heading_tol = 4,     -- deg
         shutdown_on_land = true,
-        phase_timeout = 240, -- s per phase
+        phase_timeout = 240, -- s per phase (not cruise: a long trip takes longer)
+        stall_timeout = 90,  -- s: cruise gives up only after this long without
+                             -- getting at least 5 m closer
     },
 
     unflip = {
