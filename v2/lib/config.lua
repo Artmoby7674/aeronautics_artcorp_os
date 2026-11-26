@@ -77,6 +77,108 @@ function Config.load(root, slot)
     return { slot = slot, ship = ship, tune = tune, name = ship.name or slot }
 end
 
+-- ------------------------------------------------------------ slot manager
+-- A slot is config/<slot>.lua plus (once wired) config/assignments_<slot>.lua.
+
+-- The slots with whether the wizard has wired each one (cheap: no loading).
+function Config.slotList()
+    local out = {}
+    for _, s in ipairs(Config.slots()) do
+        out[#out + 1] = { id = s, wired = fs.exists("config/assignments_" .. s .. ".lua") }
+    end
+    return out
+end
+
+-- A typed name -> slot id (lower case, like the original's slots), or nil
+-- and why. Side-file prefixes are refused: such a slot would never be listed.
+function Config.slotId(name)
+    name = tostring(name or "")
+    if name == "" or #name > 16 then return nil, "NAME: 1-16 CHARACTERS" end
+    if not name:match("^[%w_%-]+$") then return nil, "NAME: LETTERS, DIGITS, _ AND - ONLY" end
+    local id = name:lower()
+    if not isSlotFile(id .. ".lua") then return nil, "NAME RESERVED: " .. name:upper() end
+    for _, s in ipairs(Config.slots()) do
+        if s:lower() == id then return nil, "SLOT " .. name:upper() .. " EXISTS" end
+    end
+    return id
+end
+
+-- First free SHIP2, SHIP3, ... for a NEW without a keyboard.
+function Config.freeSlotName()
+    local n = 2
+    while not Config.slotId("SHIP" .. n) do n = n + 1 end
+    return "SHIP" .. n
+end
+
+local function readFile(path)
+    local f = fs.open(path, "r")
+    if not f then return nil end
+    local d = f.readAll()
+    f.close()
+    return d
+end
+
+local function writeFile(path, data)
+    local f = fs.open(path, "w")
+    if not f then return false end
+    f.write(data)
+    f.close()
+    return true
+end
+
+-- Copies slot `from` (wiring + assignments) to a new slot named `name`. The
+-- copy's ship name becomes `name`, or the top bar couldn't tell them apart.
+-- bare = true: the wiring only (a new ship made from the template).
+function Config.copySlot(from, name, bare)
+    local id, why = Config.slotId(name)
+    if not id then return nil, why end
+    local ship = readFile("config/" .. from .. ".lua")
+    if not ship then return nil, "CAN'T READ " .. from:upper() end
+    ship = ship:gsub("(\n%s*name%s*=%s*)\"[^\"\n]*\"", "%1" .. string.format("%q", name), 1)
+    if not writeFile("config/" .. id .. ".lua", ship) then return nil, "DISK FULL?" end
+    local assign = not bare and readFile("config/assignments_" .. from .. ".lua")
+    if assign and not writeFile("config/assignments_" .. id .. ".lua", assign) then
+        fs.delete("config/" .. id .. ".lua") -- no half-made slot
+        return nil, "DISK FULL?"
+    end
+    return id
+end
+
+-- The first setup's slot name: SHIP, else SHIP2, SHIP3, ...
+function Config.firstSlotName()
+    if Config.slotId("SHIP") then return "SHIP" end
+    return Config.freeSlotName()
+end
+
+-- config/assignments_<slot>.lua in the original wizard's format: role ->
+-- real peripheral name, plus the config version it was wired for.
+function Config.writeAssignments(slot, assign, version)
+    local keys = {}
+    for k in pairs(assign) do keys[#keys + 1] = k end
+    table.sort(keys)
+    local out = { "return {\n" }
+    if version then out[#out + 1] = "  config_version = " .. string.format("%q", tostring(version)) .. ",\n" end
+    for _, k in ipairs(keys) do
+        out[#out + 1] = "  [" .. string.format("%q", k) .. "] = " .. string.format("%q", tostring(assign[k])) .. ",\n"
+    end
+    out[#out + 1] = "}\n"
+    return writeFile("config/assignments_" .. slot .. ".lua", table.concat(out))
+end
+
+function Config.deleteSlot(slot)
+    fs.delete("config/" .. slot .. ".lua")
+    if fs.exists("config/assignments_" .. slot .. ".lua") then
+        fs.delete("config/assignments_" .. slot .. ".lua")
+    end
+    return not fs.exists("config/" .. slot .. ".lua")
+end
+
+-- Remembered by pickSlot on the next start.
+function Config.useSlot(root, slot)
+    if not fs.exists(root .. "/data") then fs.makeDir(root .. "/data") end
+    return writeFile(root .. "/data/slot", slot)
+end
+
 -- Derive the ship-specific numbers v2 takes from the ship config.
 function Config.build(ship, tune)
     local lim = ship.limits or {}

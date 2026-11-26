@@ -12,6 +12,7 @@ local UI = require("ui")
 local V = require("version")
 local ShipDisk = require("shipdisk")
 local Remote = require("remote")
+local Onboard = require("onboard")
 
 local Main = {}
 
@@ -163,6 +164,54 @@ local function offRequest()
     say("LANDING, THEN OFF (PRESS AGAIN = OFF NOW)", D.C.warn)
 end
 
+-- ------------------------------------------------------------ tour
+-- The feature walkthrough (ui.lua UI.TOUR): shown once, the first time the
+-- normal screen comes up on the ground, then remembered in TOUR_PATH. The
+-- "?" in the top bar replays it. It covers the controls, so it never opens
+-- in the air and closes itself if the ship lifts off under it (the keys
+-- still fly the ship).
+local TOUR_PATH = ROOT .. "/data/tour_done"
+
+local function inAir() return app.power == "on" and app.fl.phase ~= "parked" end
+
+local function tourDone()
+    app.tour_pending = false
+    if not fs.exists(ROOT .. "/data") then fs.makeDir(ROOT .. "/data") end
+    local f = fs.open(TOUR_PATH, "w")
+    if f then f.write("1") f.close() end
+end
+
+local function tourTick()
+    local ui = app.ui
+    if ui.tour and inAir() then
+        ui:tourEnd()
+        app.tour_pending = not fs.exists(TOUR_PATH) -- not seen to the end: again on the ground
+    end
+    if app.tour_pending and not ui.tour and not inAir() then
+        app.tour_pending = false
+        ui:tourStart()
+        U.log("tour shown")
+    end
+end
+
+local function tourAct(a)
+    local ui = app.ui
+    if a == "tour:start" then
+        if inAir() then return say("LAND FIRST: THE TOUR COVERS THE CONTROLS", D.C.warn) end
+        return ui:tourStart()
+    end
+    if not ui.tour then return end
+    if a == "tour:skip" then
+        ui:tourEnd()
+        tourDone()
+        return say("TOUR CLOSED: TAP ? TO SEE IT AGAIN")
+    end
+    if a == "tour:next" and ui:tourNext() then
+        tourDone()
+        return say("TOUR DONE: HAPPY FLYING", D.C.good)
+    end
+end
+
 -- ------------------------------------------------------------ actions
 
 local ZOOMS = { false, 100, 500, 2500, 10000 }
@@ -192,10 +241,99 @@ end
 local SUMMON_BLOCKED = { ["ap:cancel"] = true, ["ctl:land"] = true, ["ctl:landoff"] = true,
     ["ctl:estop"] = true, ["ctl:power"] = true, ["wp:fly"] = true }
 
+-- ------------------------------------------------------------ save slots
+-- The SLOTS screen (off the SHIP tab): one slot per ship wiring config.
+
+local SLOT_ROWS = 7 -- rows the slot list shows (UI:slots)
+
+-- Re-reads the slot list (only on open and after a change: it lists the
+-- disk) and selects `want`, else keeps the selection in range.
+local function refreshSlots(want)
+    local ui = app.ui
+    app.slots = Config.slotList()
+    for i, s in ipairs(app.slots) do
+        if s.id == want then ui.slot_sel = i end
+    end
+    ui.slot_sel = U.clamp(ui.slot_sel or 1, 1, math.max(#app.slots, 1))
+    -- keep the selected row on screen
+    local top = ui.slot_scroll or 0
+    if ui.slot_sel <= top then top = ui.slot_sel - 1 end
+    if ui.slot_sel > top + SLOT_ROWS then top = ui.slot_sel - SLOT_ROWS end
+    ui.slot_scroll = math.max(0, top)
+end
+
+local function newSlot(name)
+    local id, why = Config.copySlot(app.cfg.slot, name)
+    if not id then return say("NEW SLOT: " .. why, D.C.bad) end
+    U.log("slot %s copied to new slot %s", app.cfg.slot, id)
+    refreshSlots(id)
+    say("NEW SLOT " .. id:upper() .. ": COPY OF " .. app.cfg.slot:upper(), D.C.good)
+end
+
+local function slotAct(a)
+    local ui, fl = app.ui, app.fl
+    if a == "ship:slots" then
+        refreshSlots(app.cfg.slot)
+        return ui:setTab("slots")
+    end
+    if a == "slot:back" then return ui:setTab("ship") end
+    local slots = app.slots or {}
+    local row = a:match("^slot:row:(%d+)")
+    if row then
+        local i = (ui.slot_scroll or 0) + tonumber(row) + 1
+        if slots[i] then ui.slot_sel = i end
+        return
+    end
+    if a == "slot:up" then ui.slot_scroll = math.max(0, (ui.slot_scroll or 0) - 1) return end
+    if a == "slot:down" then
+        ui.slot_scroll = math.min(math.max(#slots - SLOT_ROWS, 0), (ui.slot_scroll or 0) + 1)
+        return
+    end
+    local sel = slots[ui.slot_sel or 0]
+    if a == "slot:use" then
+        if not sel then return end
+        if sel.id == app.cfg.slot then return say(sel.id:upper() .. " IS ALREADY RUNNING") end
+        -- the restart drops whatever is flying the ship
+        if app.power == "on" and fl.phase ~= "parked" then
+            return say("LAND FIRST: SWITCHING RESTARTS THE OS", D.C.bad)
+        end
+        if not confirmed("slot:use:" .. sel.id) then
+            return say("TAP USE AGAIN TO RESTART AS " .. sel.id:upper(), D.C.warn)
+        end
+        if not Config.useSlot(ROOT, sel.id) then return say("CAN'T WRITE " .. ROOT .. "/data/slot", D.C.bad) end
+        saveLearned(fl.ctl)
+        U.log("slot %s chosen on the screen: restarting", sel.id)
+        say("USING " .. sel.id:upper() .. ": RESTARTING", D.C.good)
+        app.reboot_at = os.clock() + 1.5 -- same restart as a disk load
+        return
+    end
+    if a == "slot:new" then
+        if Link.online() then
+            local ok = Link.ask({ { "SLOT NAME", "name" } }, function(v, err)
+                if v then newSlot(v[1]) else say("KEYBOARD: " .. tostring(err), D.C.warn) end
+            end)
+            if ok then return say("TYPE THE NEW SLOT NAME ON THE KEYBOARD") end
+        end
+        return newSlot(Config.freeSlotName())
+    end
+    if a == "slot:del" then
+        if not sel then return end
+        if sel.id == app.cfg.slot then return say("CAN'T DELETE THE RUNNING SLOT", D.C.bad) end
+        if not confirmed("slot:del:" .. sel.id) then
+            return say("TAP DELETE AGAIN TO ERASE " .. sel.id:upper(), D.C.warn)
+        end
+        local ok = Config.deleteSlot(sel.id)
+        U.log("slot %s deleted on the screen (%s)", sel.id, tostring(ok))
+        refreshSlots()
+        return say(ok and ("DELETED SLOT " .. sel.id:upper()) or "DELETE FAILED", ok and D.C.good or D.C.bad)
+    end
+end
+
 local function act(a)
     if not a then return end
     local fl, ui = app.fl, app.ui
     if a == "boot" then return beginBoot() end
+    if a:match("^tour:") then return tourAct(a) end -- engines on or off
     if app.power ~= "on" then return end
     -- ArtCorp lock: a summoned ship can't be cancelled, landed, E-STOPped,
     -- switched off or sent elsewhere by the pilot; a grounded ship's E-STOP
@@ -331,6 +469,7 @@ local function act(a)
         app.reboot_at = os.clock() + 1.5 -- let the screen show it, then restart on it
         return
     end
+    if a == "ship:slots" or a:match("^slot:") then return slotAct(a) end
 end
 
 -- ------------------------------------------------------------ ArtCorp remote
@@ -477,7 +616,7 @@ local function model()
         rec = Rec.on, rec_t = Rec.duration(), rec_n = #Rec.samples,
         loop = app.loop, disk = app.disk, missing = app.missing,
         confirm = app.confirm, clutch = app.power == "on" and HW.feature("clutch"),
-        last_ap = app.last_ap,
+        last_ap = app.last_ap, slots = app.slots, slot = app.cfg.slot,
     }
 end
 
@@ -551,6 +690,7 @@ local function controlTick()
         U.bbFlush(os.clock())
         os.reboot()
     end
+    tourTick()
     -- ArtCorp summon in progress: start the engine and fly to the CEO on our
     -- own, even straight out of a reboot. Nothing the pilot can do stops it.
     if app.pending_summon then
@@ -694,10 +834,18 @@ end
 
 function Main.run(opts)
     opts = opts or {}
+    -- First launch (no wired ship): the setup on the monitor instead of
+    -- stopping with "no ship config". It returns once the new slot is
+    -- written; a disk import restarts the computer instead.
+    if Onboard.needed(ROOT) then
+        local r = Onboard.run(ROOT, opts)
+        if r ~= "ready" then return r end
+    end
     local cfg, err = Config.load(ROOT)
     if not cfg then error(err, 0) end
     app.cfg = cfg
     if not fs.exists(ROOT .. "/data") then fs.makeDir(ROOT .. "/data") end
+    app.tour_pending = not fs.exists(TOUR_PATH)
     local f = fs.open(ROOT .. "/data/slot", "w")
     if f then f.write(cfg.slot) f.close() end
 

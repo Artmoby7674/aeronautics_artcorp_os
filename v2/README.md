@@ -10,6 +10,16 @@ nothing rewired.
 ship boots straight into it: tap **START ENGINES** on the cockpit monitor.
 The keyboard computer works with it unchanged.
 
+On a computer with no wired ship yet (no slot in `config/`, or the chosen
+slot has no assignments file) the monitor shows a first-launch setup:
+**IMPORT FROM DISK** (a ship saved with SAVE DISK; the computer restarts on
+it) or **SET UP THIS SHIP**, which copies `config/atlas.lua` to a new slot
+and asks for each relay/monitor in turn from the ones on the network (TEST
+flips one of its faces for 2 s, DETECT watches for a typewriter key), then
+shows a short first-flight guide. The first time the normal screen comes up
+on the ground a tour explains its main controls; **?** in the top bar
+replays it.
+
 The ship computer is never needed in flight. If the OS stops on an error,
 the launcher shows the error on the monitor and restarts it 2 s later; if
 the ship is in the air at that moment the OS takes control straight away
@@ -23,6 +33,7 @@ v2 keeps its own state in `v2/data/`:
 | `waypoints.lua` | Waypoints. An older `config/wp_<slot>.lua` list is imported on first run; headings are converted to compass degrees. |
 | `learned.lua` | What the controller learned in flight. Saved at power-off. |
 | `slot` | Which ship config was used. |
+| `tour_done` | The tour was seen (or skipped): it is not shown again by itself. |
 | `tune_local.lua` | Optional overrides for anything in `v2/tune.lua`. |
 
 ## Controls

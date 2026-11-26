@@ -3,7 +3,7 @@
 -- higher-contrast cockpit look and puts the stock colours back on exit.
 local Font = require("font")
 
-local D = { W = 0, H = 0, ok = false }
+local D = { W = 0, H = 0, ok = false, n = 0 }
 
 -- palette slot -> name, RGB
 D.C = {
@@ -18,6 +18,17 @@ local PALETTE = {
     [12] = 0x2F6FA8, [13] = 0x7A5430, [14] = 0xB388FF, [15] = 0x000000,
 }
 D.PALETTE = PALETTE
+
+-- The tour (ui.lua) dims everything but the element it explains by drawing
+-- the screen again in darker colours. Mode 2 has 256 palette slots, so where
+-- they can be set, slots 16-31 hold the 16 colours at ~40 % (a true dimmed
+-- copy). Otherwise each colour falls back to a darker one of the 16 (a muted
+-- silhouette), which every monitor can show.
+local DIM_TO = { bg = "bg", panel = "bg", panel2 = "panel", line = "panel2", dim = "line",
+    text = "dim", white = "dim", accent = "accent_dk", accent_dk = "panel2", good = "line",
+    warn = "line", bad = "line", sky = "panel2", ground = "panel", ap = "line", black = "black" }
+local DIM_K = 0.4
+D.dim_map = {}
 
 local mon
 local STOCK
@@ -88,6 +99,8 @@ function D.init(m, use_palette)
     if not D.palette_ok then
         -- the stock 16 colours, mapped to the closest roles
         for k, v in pairs(STOCK) do D.C[k] = v end
+        D.dim_map = {}
+        for role, to in pairs(DIM_TO) do D.dim_map[D.C[role]] = D.C[to] end
     end
     return D.ok
 end
@@ -114,9 +127,35 @@ function D.setPalette()
             local want = rgb3(PALETTE[7])
             if not ok or type(r) ~= "number" or math.abs(r - want) > 0.02 then good = false end
         end
-        if good then return true end
+        if good then
+            D.setDimPalette(idx(0) == 0, rgb3)
+            return true
+        end
     end
     return false
+end
+
+-- Dimmed copies in slots 16-31, only with raw indices (mode 2) and only if
+-- the monitor keeps them (read back when it can be). Otherwise: DIM_TO.
+function D.setDimPalette(raw, rgb3)
+    D.dim_map = {}
+    for role, to in pairs(DIM_TO) do D.dim_map[D.C[role]] = D.C[to] end
+    if not raw then return false end
+    for i = 0, 15 do
+        local r, g, b = rgb3(PALETTE[i])
+        if not pcall(dev.setPaletteColor, 16 + i, r * DIM_K, g * DIM_K, b * DIM_K) then return false end
+    end
+    if type(dev.getPaletteColor) ~= "function" then return false end
+    local ok, r = pcall(dev.getPaletteColor, 16 + 7)
+    if not ok or type(r) ~= "number" or math.abs(r - rgb3(PALETTE[7]) * DIM_K) > 0.02 then return false end
+    for i = 0, 15 do D.dim_map[i] = 16 + i end
+    return true
+end
+
+-- RGB of a dimmed slot (for the screenshot renderer).
+function D.dimRGB(rgb)
+    local r, g, b = math.floor(rgb / 65536) % 256, math.floor(rgb / 256) % 256, rgb % 256
+    return math.floor(r * DIM_K) * 65536 + math.floor(g * DIM_K) * 256 + math.floor(b * DIM_K)
 end
 
 function D.shutdown()
@@ -143,9 +182,31 @@ local function clip(x, y, w, h)
     return x, y, w, h
 end
 
+-- D.dry: draw nothing (the tour lays a screen out first to find where an
+-- element is). D.keep = {x,y,w,h}: dim everything drawn outside it.
+local function fill(x, y, w, h, c)
+    if w < 1 or h < 1 then return end
+    D.n = D.n + 1
+    dev.drawPixels(x, y, c, w, h)
+end
+
 function D.rect(x, y, w, h, c)
+    if D.dry then return end
     local cx, cy, cw, ch = clip(x, y, w, h)
-    if cx then dev.drawPixels(cx, cy, c, cw, ch) end
+    if not cx then return end
+    local k = D.keep
+    if not k then return fill(cx, cy, cw, ch, c) end
+    local dc = D.dim_map[c] or c
+    -- bands above / below the kept rect, then left / inside / right of it
+    local y1, y2 = math.max(cy, k.y), math.min(cy + ch, k.y + k.h)
+    if y2 <= y1 then return fill(cx, cy, cw, ch, dc) end
+    fill(cx, cy, cw, y1 - cy, dc)
+    fill(cx, y2, cw, cy + ch - y2, dc)
+    local x1, x2 = math.max(cx, k.x), math.min(cx + cw, k.x + k.w)
+    if x2 <= x1 then return fill(cx, y1, cw, y2 - y1, dc) end
+    fill(cx, y1, x1 - cx, y2 - y1, dc)
+    fill(x1, y1, x2 - x1, y2 - y1, c)
+    fill(x2, y1, cx + cw - x2, y2 - y1, dc)
 end
 
 function D.frame(x, y, w, h, c)
@@ -157,6 +218,7 @@ end
 
 -- rows = { {c,...}, ... } at x,y (clipped on the right/bottom only)
 function D.blit(x, y, rows)
+    if D.dry then return end
     if x < 0 or y < 0 or x >= D.W or y >= D.H or #rows == 0 then return end
     local maxw, maxh = D.W - x, D.H - y
     if #rows > maxh or #rows[1] > maxw then
@@ -168,7 +230,24 @@ function D.blit(x, y, rows)
         end
         rows = cut
     end
-    dev.drawPixels(math.floor(x), math.floor(y), rows)
+    x, y = math.floor(x), math.floor(y)
+    local k = D.keep
+    if k then
+        -- a dimmed copy (glyph rows may be shared: never change them)
+        local map, out = D.dim_map, {}
+        for r = 1, #rows do
+            local src, line, py = rows[r], {}, y + r - 1
+            local inY = py >= k.y and py < k.y + k.h
+            for c = 1, #src do
+                local px, v = x + c - 1, src[c]
+                if inY and px >= k.x and px < k.x + k.w then line[c] = v else line[c] = map[v] or v end
+            end
+            out[r] = line
+        end
+        rows = out
+    end
+    D.n = D.n + 1
+    dev.drawPixels(x, y, rows)
 end
 
 function D.textW(str, scale) return Font.width(tostring(str), scale) end

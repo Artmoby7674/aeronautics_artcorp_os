@@ -1,4 +1,4 @@
--- Mock CC:Graphics monitor: a 348x216 indexed framebuffer that also records
+-- Mock CC:Graphics monitor (mode 2, 256 colours): a 348x216 indexed framebuffer that also records
 -- out-of-bounds and malformed drawPixels calls (they are errors on the real
 -- peripheral or silently lost pixels).
 local M = {}
@@ -12,7 +12,7 @@ function M.new(W, H)
             mon.errors[#mon.errors + 1] = string.format("pixel out of bounds %d,%d", x, y)
             return
         end
-        if type(c) ~= "number" or c < -1 or c > 15 or c ~= math.floor(c) then
+        if type(c) ~= "number" or c < -1 or c > 255 or c ~= math.floor(c) then
             mon.errors[#mon.errors + 1] = "bad colour " .. tostring(c)
             return
         end
@@ -21,7 +21,13 @@ function M.new(W, H)
     function mon.setTextScale() end
     function mon.setGraphicsMode() return true end
     function mon.setFrozen() end
+    -- mode 2 has 256 palette slots (the tour's dimmed colours live in 16-31)
     function mon.setPaletteColor(i, r, g, b) mon.palette[i] = { r, g, b } end
+    function mon.getPaletteColor(i)
+        local p = mon.palette[i]
+        if p then return p[1], p[2], p[3] end
+        return 0, 0, 0
+    end
     function mon.getSize(mode)
         if mode then return W, H end
         return math.floor(W / 6), math.floor(H / 9)

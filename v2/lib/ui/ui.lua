@@ -4,8 +4,14 @@
 --   NAV    map + waypoint list (fly / delete / save here / new via keyboard)
 --   AUTO   the autopilot run: phase stepper, distance, ETA, cancel
 --   SHIP   hardware state and everything the controller has learned
+--          (SLOTS > opens the slot screen: switch / copy / delete ship configs)
 --   ALERT  active warnings only
 --   CTRL   big buttons: land, gear, mode, e-stop, hold, record, print, power
+--   ?      (top bar, right) replays the tour
+--
+-- Also drawn here: the first-launch setup screens (onboard.lua runs them)
+-- and the tour, which explains one real element of the live screen at a
+-- time with the rest dimmed.
 --
 -- Rendering is retained: each part is redrawn only when its signature (the
 -- text/values it shows) changes, so a quiet screen costs almost nothing.
@@ -41,9 +47,14 @@ function UI:setTab(id)
     if id ~= self.tab then self.tab = id self.full = true end
 end
 
+-- The bar tab a screen belongs to (SLOTS is a sub-screen of SHIP).
+local PARENT = { slots = "ship" }
+function UI:barTab() return PARENT[self.tab] or self.tab end
+
 function UI:cycleTab(dir)
+    local cur = self:barTab()
     for i, t in ipairs(TABS) do
-        if t.id == self.tab then
+        if t.id == cur then
             self:setTab(TABS[(i - 1 + dir) % #TABS + 1].id)
             return
         end
@@ -166,6 +177,8 @@ function UI:chrome(m)
         local w = (i == #TABS) and (W - x) or tw
         self:hit(x, ty, w, TAB_H, "tab:" .. t.id)
     end
+    -- "?" in the top bar's right corner replays the tour (topBar draws it)
+    self:hit(W - 20, 0, 20, TOP, "tour:start")
     self.sig = {}
 end
 
@@ -191,6 +204,7 @@ function UI:topBar(m)
             chip(rx, 3, text, fg, bg)
             rx = rx - 3
         end
+        rchip("?", C.text, C.panel2) -- the tour (hit area: chrome)
         rchip("KBD", m.kbd and C.black or C.dim, m.kbd and C.good or C.panel2)
         if m.rec then rchip("REC", C.white, C.bad) end
         if msg ~= "" then
@@ -207,11 +221,12 @@ function UI:tabBar(m)
     local W, H = D.W, D.H
     local ty = H - TAB_H
     local tw = math.floor(W / #TABS)
-    self:part("tabs", self.tab .. (m.alerts_bad and "!" or "") .. (#(m.alerts or {}) > 0 and "a" or ""), function()
+    local cur = self:barTab()
+    self:part("tabs", cur .. (m.alerts_bad and "!" or "") .. (#(m.alerts or {}) > 0 and "a" or ""), function()
         for i, t in ipairs(TABS) do
             local x = (i - 1) * tw
             local w = (i == #TABS) and (W - x) or tw
-            local on = t.id == self.tab
+            local on = t.id == cur
             local bg = on and C.accent or C.panel
             local fg = on and C.black or C.dim
             if t.id == "alert" and #(m.alerts or {}) > 0 and not on then fg = m.alerts_bad and C.bad or C.warn end
@@ -575,7 +590,9 @@ function UI:ship(m, static)
     if static then
         D.text(lx, y0, "HARDWARE", C.accent, C.bg)
         D.text(rx, y0, "LEARNED IN FLIGHT", C.accent, C.bg)
-        self:button(rx, y0 + 140, colw, 18, "RESET LEARNED VALUES", "ship:reset", "normal")
+        -- RESET shares its row with the slot manager (other ship configs)
+        self:button(rx, y0 + 140, colw - 64, 18, "RESET LEARNED", "ship:reset", "normal")
+        self:button(rx + colw - 60, y0 + 140, 60, 18, "SLOTS >", "ship:slots", "normal")
         -- ship backup on a floppy (any disk drive on the network)
         local bw = math.floor((colw - 4) / 2)
         self:button(lx, y0 + 140, bw, 18, "SAVE DISK", "ship:disksave", "normal")
@@ -620,6 +637,78 @@ function UI:ship(m, static)
     end
     column("l", lx, left)
     column("r", rx, right)
+end
+
+-- -------------------------------------------------------------- SLOTS
+-- Sub-screen of SHIP: the ship wiring configs on this computer. The list
+-- and selection work like the NAV waypoint list.
+
+local SLOT_ROW, SLOT_ROWS = 16, 7 -- main.lua's SLOT_ROWS must match
+
+function UI:slots(m, static)
+    local W = D.W
+    local list = m.slots or {}
+    local lx, lw = 6, W - 12
+    local y0 = TOP + 6
+    local rows_y = y0 + 14
+    local by = rows_y + SLOT_ROWS * SLOT_ROW + 14
+    local bw = math.floor((lw - 12) / 4)
+    local sel = self.slot_sel or 1
+    local scroll = self.slot_scroll or 0
+    if static then
+        D.text(lx, y0 + 2, "SHIP SLOTS", C.accent, C.bg)
+        self:button(lx + lw - 30, y0, 14, 11, "{", "slot:up")
+        self:button(lx + lw - 14, y0, 14, 11, "}", "slot:down")
+        for i = 0, SLOT_ROWS - 1 do self:hit(lx, rows_y + i * SLOT_ROW, lw, SLOT_ROW, "slot:row:" .. i) end
+        self:hit(lx, by, bw, 22, "slot:back")
+        self:hit(lx + (bw + 4), by, bw, 22, "slot:use")
+        self:hit(lx + (bw + 4) * 2, by, bw, 22, "slot:new")
+        self:hit(lx + (bw + 4) * 3, by, lw - (bw + 4) * 3, 22, "slot:del")
+    end
+
+    local lsig = { sel, scroll, #list, tostring(m.slot) }
+    for i = 1, SLOT_ROWS do
+        local s = list[scroll + i]
+        if s then lsig[#lsig + 1] = s.id .. (s.wired and "+" or "-") end
+    end
+    self:part("slotlist", table.concat(lsig, ","), function()
+        D.rect(lx, rows_y, lw, SLOT_ROWS * SLOT_ROW, C.bg)
+        if #list == 0 then D.text(lx + 2, rows_y + 4, "NO SLOTS IN CONFIG/", C.dim, C.bg) end
+        for i = 1, SLOT_ROWS do
+            local idx = scroll + i
+            local s = list[idx]
+            if s then
+                local y = rows_y + (i - 1) * SLOT_ROW
+                local on = idx == sel
+                local bg = on and C.panel2 or C.bg
+                D.rect(lx, y, lw, SLOT_ROW - 2, bg)
+                if on then D.rect(lx, y, 2, SLOT_ROW - 2, C.warn) end
+                D.text(lx + 6, y + 4, s.id:upper(), on and C.white or C.text, bg)
+                local wired = s.wired and "WIRED" or "NOT WIRED"
+                local rx = lx + lw - 4
+                D.text(rx, y + 4, wired, s.wired and C.dim or C.warn, bg, 1, "r")
+                if s.id == m.slot then
+                    -- the one running now: switching away from it needs a restart
+                    local cw = D.textW("ACTIVE") + 8
+                    chip(rx - D.textW(wired) - 8 - cw, y + 1, "ACTIVE", C.black, C.good)
+                end
+            end
+        end
+    end)
+
+    local cur = list[sel]
+    local active = cur and cur.id == m.slot
+    local use_label = (cur and m.confirm == "slot:use:" .. cur.id) and "SURE?" or "USE"
+    local del_label = (cur and m.confirm == "slot:del:" .. cur.id) and "SURE?" or "DELETE"
+    local info = active and "RUNNING NOW. NEW COPIES IT TO A NEW SLOT"
+        or (cur and "USE RESTARTS THE OS ON " .. cur.id:upper()) or ""
+    self:part("slotbtn", table.concat({ info, use_label, del_label, tostring(m.kbd_prompt), tostring(m.kbd) }, "|"), function()
+        D.slot(lx, by - 12, lw, info, C.dim, C.bg)
+        self:button(lx, by, bw, 22, "< BACK", nil, "normal")
+        self:button(lx + (bw + 4), by, bw, 22, use_label, nil, (cur and not active) and "primary" or "off")
+        self:button(lx + (bw + 4) * 2, by, bw, 22, m.kbd_prompt and "TYPING..." or (m.kbd and "NEW (KBD)" or "NEW"), nil, "normal")
+        self:button(lx + (bw + 4) * 3, by, lw - (bw + 4) * 3, 22, del_label, nil, (cur and not active) and "danger" or "off")
+    end)
 end
 
 -- -------------------------------------------------------------- ALERT
@@ -713,11 +802,331 @@ function UI:splash(m)
     end)
 end
 
+-- -------------------------------------------------------------- text wrap
+
+-- Word-wraps text into lines of at most `maxc` characters (6 px each).
+local function wrap(text, maxc)
+    local lines, cur = {}, ""
+    for w in tostring(text):gmatch("%S+") do
+        local word = w
+        while #word > maxc do -- a word longer than a line: cut it
+            if cur ~= "" then lines[#lines + 1] = cur cur = "" end
+            lines[#lines + 1] = word:sub(1, maxc)
+            word = word:sub(maxc + 1)
+        end
+        if cur == "" then cur = word
+        elseif #cur + 1 + #word <= maxc then cur = cur .. " " .. word
+        else lines[#lines + 1] = cur cur = word end
+    end
+    if cur ~= "" then lines[#lines + 1] = cur end
+    return lines
+end
+UI.wrap = wrap
+
+local function maxChars(w) return math.floor((w + 1) / 6) end
+
+-- -------------------------------------------------------------- tour
+-- One real element at a time: the screen it lives on is drawn dimmed except
+-- that element, which gets an accent frame and a popup saying what it does.
+-- Elements are found by their touch actions (`find`: patterns, the union of
+-- every matching hit area), so the frame follows the real layout; the few
+-- that are not buttons give a `rect`. While the tour is up only its own
+-- NEXT / SKIP buttons take taps (UI:touch).
+
+-- SHIP tab geometry (UI:ship): row i of the right-hand column.
+local function shipRow(i)
+    local colw = math.floor((D.W - 18) / 2)
+    local y = TOP + 6 + 4 + i * 14
+    return { x = 12 + colw - 2, y = y - 1, w = colw + 4, h = 14 }
+end
+
+local TOUR = {
+    { screen = "splash", find = { "^boot$" }, title = "START ENGINES",
+        text = "FIRST OPEN THE STEAM ENGINE'S WATER INPUT VALVE BY HAND: THE OS CAN'T DO THAT. THEN TAP START ENGINES (OR PRESS SPACE)." },
+    { screen = "fly", find = { "^tab:" }, title = "TABS",
+        text = "FLY: ATTITUDE + NUMBERS. NAV: MAP + WAYPOINTS. AUTO: AUTOPILOT. SHIP: HARDWARE + LEARNING. ALERT: WARNINGS. CTRL: BIG BUTTONS." },
+    { screen = "ctrl", find = { "^ctl:land$" }, title = "TAKE OFF",
+        text = "LIFTS THE SHIP OFF THE GROUND. IN THE AIR THE SAME BUTTON LANDS RIGHT WHERE YOU ARE." },
+    { screen = "ctrl", find = { "^ctl:estop$" }, title = "E-STOP",
+        text = "CUTS ALL LIFT AT ONCE: THE SHIP FALLS. EMERGENCIES ONLY. TAP AGAIN (OR SPACE) TO RESET." },
+    { screen = "nav", find = { "^wp:row:", "^wp:up$", "^wp:down$" }, title = "WAYPOINTS",
+        text = "YOUR SAVED PLACES: TAP ONE TO PICK IT. SAVE HERE STORES WHERE THE SHIP IS, NEW TAKES COORDINATES FROM THE KEYBOARD COMPUTER." },
+    { screen = "nav", find = { "^wp:fly$" }, title = "FLY",
+        text = "FLIES TO THE PICKED WAYPOINT ON AUTOPILOT: CLIMB, CRUISE, STOP AND LAND." },
+    { screen = "auto", find = { "^tab:auto$" }, title = "AUTO",
+        text = "THE AUTO TAB FOLLOWS AN AUTOPILOT RUN: STAGE, DISTANCE, ETA. CANCEL A/P HANDS THE SHIP BACK TO YOU, HOVERING." },
+    { screen = "ship", title = "CALIBRATION", rect = function() return shipRow(9) end,
+        text = "AFTER TAKE-OFF, HOVER HANDS-OFF UNTIL THIS SAYS DONE (FROZEN). THE SHIP LEARNS ITS TRIMS, THEN KEEPS THEM." },
+    { screen = "ship", find = { "^ship:disk" }, title = "SAVE / LOAD DISK",
+        text = "BACKS UP THIS SHIP (WIRING, LEARNING, WAYPOINTS) TO A FLOPPY IN ANY DISK DRIVE, OR LOADS ONE BACK." },
+    { screen = "ship", find = { "^ship:slots$" }, title = "SLOTS",
+        text = "THE OTHER SHIP CONFIGS ON THIS COMPUTER: SWITCH, COPY OR DELETE THEM." },
+    { screen = "fly", find = { "^tour:start$" }, title = "THIS TOUR",
+        text = "TAP ? ANY TIME ON THE GROUND TO SEE THIS TOUR AGAIN. HAPPY FLYING!" },
+}
+UI.TOUR = TOUR
+
+function UI:tourStart()
+    self.tour = { i = 1, prev = self.tab, hits = {} }
+    self.full = true
+end
+
+-- Next step; true when that was the last one (the tour is over).
+function UI:tourNext()
+    local t = self.tour
+    if not t then return true end
+    t.i = t.i + 1
+    if t.i > #TOUR then self:tourEnd() return true end
+    return false
+end
+
+function UI:tourEnd()
+    local t = self.tour
+    if not t then return end
+    self.tour = nil
+    self.tab = t.prev or "fly"
+    self.screen, self.full, self.hits, self.sig = nil, true, {}, {}
+end
+
+-- Draws screen `scr` ("splash" or a tab) for the tour. The splash is shown
+-- as on the ground (its START button is the element being explained).
+function UI:tourScreen(m, scr, full)
+    if scr == "splash" then
+        if full then self.screen = nil end
+        local m2 = {}
+        for k, v in pairs(m) do m2[k] = v end
+        m2.power = "off"
+        return self:splash(m2)
+    end
+    self.tab = scr
+    if full then
+        self.hits = {}
+        self:chrome(m)
+        self.screen = scr
+    end
+    self:topBar(m)
+    self:tabBar(m)
+    self[scr](self, m, full)
+end
+
+function UI:tourTarget(st)
+    if st.rect then return st.rect() end
+    local x0, y0, x1, y1
+    for _, h in ipairs(self.hits) do
+        for _, pat in ipairs(st.find) do
+            if h.action:match(pat) then
+                x0, y0 = math.min(x0 or h.x, h.x), math.min(y0 or h.y, h.y)
+                x1, y1 = math.max(x1 or 0, h.x + h.w), math.max(y1 or 0, h.y + h.h)
+                break
+            end
+        end
+    end
+    if not x0 then return { x = 0, y = TOP + 1, w = D.W, h = D.H - TOP - TAB_H - 2 } end
+    return { x = x0, y = y0, w = x1 - x0, h = y1 - y0 }
+end
+
+-- The accent frame round the element and the popup next to it.
+function UI:tourPopup(t, st)
+    local W, H = D.W, D.H
+    local r = t.rect
+    -- (kept on screen: an element at the edge still gets all four sides)
+    for k = 2, 3 do
+        local x0, y0 = math.max(r.x - k, 0), math.max(r.y - k, 0)
+        local x1, y1 = math.min(r.x + r.w + k, W), math.min(r.y + r.h + k, H)
+        D.frame(x0, y0, x1 - x0, y1 - y0, C.accent)
+    end
+    local pw = math.min(W - 8, 232)
+    local lines = wrap(st.text, maxChars(pw - 12))
+    local ph = 19 + #lines * 10 + 30
+    local px = U.clamp(math.floor(r.x + r.w / 2 - pw / 2), 4, W - pw - 4)
+    local py
+    if r.y + r.h + 6 + ph <= H - 2 then py = r.y + r.h + 6          -- below
+    elseif r.y - 6 - ph >= 2 then py = r.y - 6 - ph                 -- above
+    else
+        py = U.clamp(r.y, 2, H - ph - 2)
+        if r.x + r.w + 6 + pw <= W - 2 then px = r.x + r.w + 6      -- right
+        elseif r.x - 6 - pw >= 2 then px = r.x - 6 - pw             -- left
+        -- no room anywhere: the bigger gap, over the (dimmed) bars
+        elseif H - (r.y + r.h) >= r.y then py = H - ph - 2
+        else py = 2 end
+    end
+    D.rect(px, py, pw, ph, C.panel)
+    D.frame(px, py, pw, ph, C.accent)
+    D.text(px + 6, py + 6, st.title, C.accent, C.panel)
+    D.text(px + pw - 6, py + 6, t.i .. "/" .. #TOUR, C.dim, C.panel, 1, "r")
+    for i, l in ipairs(lines) do D.text(px + 6, py + 19 + (i - 1) * 10, l, C.text, C.panel) end
+    local saved = self.hits
+    self.hits = {}
+    local by = py + ph - 24
+    self:button(px + 6, by, 64, 18, "SKIP", "tour:skip", "normal")
+    self:button(px + pw - 70, by, 64, 18, t.i == #TOUR and "DONE" or "NEXT >", "tour:next", "primary")
+    t.hits, self.hits = self.hits, saved
+end
+
+function UI:tourFrame(m)
+    local t = self.tour
+    local st = TOUR[t.i]
+    if t.drawn ~= t.i or self.full then
+        self.full = false
+        -- lay the screen out unseen to find the element, then draw it dimmed
+        -- around that element
+        D.dry = true
+        self:tourScreen(m, st.screen, true)
+        D.dry = false
+        t.rect = self:tourTarget(st)
+        D.keep = t.rect
+        self:tourScreen(m, st.screen, true)
+        D.keep = nil
+        t.drawn = t.i
+        self:tourPopup(t, st)
+        return
+    end
+    -- live values keep updating (dimmed); the popup goes back on top of
+    -- anything they drew
+    local n0 = D.n
+    D.keep = t.rect
+    self:tourScreen(m, st.screen, false)
+    D.keep = nil
+    if D.n ~= n0 then self:tourPopup(t, st) end
+end
+
+-- -------------------------------------------------------------- setup screens
+-- First launch with no wired ship (onboard.lua owns the flow; m.ob is its
+-- state). Full screens of their own: no tab bar, so a tap can only reach
+-- the setup's buttons.
+
+local function obHeader(left, right, frac)
+    local W = D.W
+    D.rect(0, 0, W, TOP, C.panel)
+    D.text(6, 5, left, C.white, C.panel)
+    if right then D.text(W - 6, 5, right, C.dim, C.panel, 1, "r") end
+    D.rect(0, TOP, W, 2, C.line)
+    if frac then D.rect(0, TOP, math.floor(W * U.clamp(frac, 0, 1)), 2, C.accent) end
+end
+
+function UI:obWelcome(ob)
+    local W, H = D.W, D.H
+    D.rect(0, 0, W, 3, C.accent)
+    D.text(W / 2, 22, "WELCOME ABOARD", C.white, C.bg, 2, "c")
+    D.text(W / 2, 42, "ARTCORP FLIGHT OS  V" .. V.number, C.dim, C.bg, 1, "c")
+    D.text(W / 2, 62, "THIS COMPUTER HAS NO SHIP SET UP YET.", C.text, C.bg, 1, "c")
+    D.text(W / 2, 74, "HOW DO YOU WANT TO START?", C.text, C.bg, 1, "c")
+    local bw = math.floor((W - 18) / 2)
+    self:button(6, 94, bw, 50, "IMPORT FROM DISK", "ob:import", "normal", "A SHIP SAVED ON A FLOPPY")
+    self:button(12 + bw, 94, bw, 50, "SET UP THIS SHIP", "ob:setup", "primary", "PICK EACH RELAY")
+    D.text(6 + bw / 2, 150, "SKIPS THE SETUP", C.dim, C.bg, 1, "c")
+    D.text(12 + bw + bw / 2, 150, "THEN A FIRST-FLIGHT GUIDE", C.dim, C.bg, 1, "c")
+    if ob.msg then D.slot(6, H - 30, W - 12, ob.msg, ob.msg_color or C.accent, C.bg, 1, "c") end
+end
+
+local OB_ROW, OB_ROWS = 14, 6
+
+function UI:obRole(ob)
+    local W, H = D.W, D.H
+    local role = ob.role
+    obHeader("SHIP SETUP: WIRING", string.format("%d/%d", ob.idx, ob.total), ob.idx / ob.total)
+    D.text(6, TOP + 6, role.label, C.white, C.bg, 2)
+    for i, l in ipairs(wrap(role.desc, maxChars(W - 12))) do
+        if i > 2 then break end
+        D.text(6, TOP + 24 + (i - 1) * 10, l, C.text, C.bg)
+    end
+    local ly = TOP + 48
+    local lw = W - 12
+    D.text(6, ly + 2, "TAP THE ONE IT IS:", C.dim, C.bg)
+    D.text(6 + lw - 34, ly + 2, role.type:upper(), C.dim, C.bg, 1, "r")
+    self:button(6 + lw - 30, ly, 14, 11, "{", "ob:up")
+    self:button(6 + lw - 14, ly, 14, 11, "}", "ob:down")
+    local rows_y = ly + 14
+    local cands = ob.cands or {}
+    if #cands == 0 then
+        D.text(8, rows_y + 4, "NONE FOUND ON THE NETWORK.", C.warn, C.bg)
+        D.text(8, rows_y + 16, "CONNECT IT WITH A WIRED MODEM AND RIGHT-CLICK", C.dim, C.bg)
+        D.text(8, rows_y + 26, "THE MODEM (IT TURNS RED). THE LIST UPDATES.", C.dim, C.bg)
+    end
+    for i = 1, OB_ROWS do
+        local idx = (ob.scroll or 0) + i
+        local c = cands[idx]
+        local y = rows_y + (i - 1) * OB_ROW
+        self:hit(6, y, lw, OB_ROW, "ob:row:" .. (i - 1))
+        if c then
+            local on = idx == ob.sel
+            local bg = on and C.panel2 or C.bg
+            D.rect(6, y, lw, OB_ROW - 2, bg)
+            if on then D.rect(6, y, 2, OB_ROW - 2, C.warn) end
+            D.text(12, y + 3, c.name:upper(), c.used and C.dim or (on and C.white or C.text), bg)
+            if c.tag then D.text(6 + lw - 4, y + 3, c.tag, c.tag_color or C.dim, bg, 1, "r") end
+        end
+    end
+    if ob.msg then D.slot(6, rows_y + OB_ROWS * OB_ROW + 4, lw, ob.msg, ob.msg_color or C.accent, C.bg) end
+    local by = H - 28
+    local bw = math.floor((lw - 12) / 4)
+    local picked = ob.sel and cands[ob.sel]
+    self:button(6, by, bw, 22, "< BACK", "ob:back", "normal")
+    -- with nothing found the TEST slot looks again (RESCAN)
+    self:button(6 + (bw + 4), by, bw, 22, #cands == 0 and "RESCAN" or (role.test_label or "TEST"), "ob:test",
+        (#cands == 0 or (role.test_label and (picked or role.test_any))) and "normal" or "off")
+    self:button(6 + (bw + 4) * 2, by, bw, 22, "SKIP", role.optional and "ob:skip" or nil, role.optional and "normal" or "off",
+        role.optional and "NOT FITTED" or nil)
+    self:button(6 + (bw + 4) * 3, by, lw - (bw + 4) * 3, 22, ob.idx == ob.total and "FINISH" or "NEXT >", "ob:next",
+        picked and "primary" or "off")
+end
+
+function UI:obGuide(ob)
+    local W, H = D.W, D.H
+    local card = ob.card
+    obHeader("FIRST FLIGHT", string.format("%d/%d", ob.gi, ob.gn), ob.gi / ob.gn)
+    D.rect(6, TOP + 8, W - 12, H - TOP - 46, C.panel)
+    D.rect(6, TOP + 8, 3, H - TOP - 46, C.accent)
+    D.text(18, TOP + 16, ob.gi .. ".", C.accent, C.panel, 2)
+    D.text(18 + D.textW(ob.gi .. ".", 2) + 8, TOP + 16, card.title, C.white, C.panel, 2)
+    for i, l in ipairs(wrap(card.text, maxChars(W - 36))) do
+        D.text(18, TOP + 40 + (i - 1) * 11, l, C.text, C.panel)
+    end
+    local by = H - 28
+    local bw = math.floor((W - 12 - 8) / 3)
+    self:button(6, by, bw, 22, "SKIP GUIDE", "ob:gskip", "normal")
+    self:button(6 + bw + 4, by, bw, 22, "< BACK", ob.gi > 1 and "ob:gback" or nil, ob.gi > 1 and "normal" or "off")
+    self:button(6 + (bw + 4) * 2, by, W - 12 - (bw + 4) * 2, 22, ob.gi == ob.gn and "LET'S FLY" or "NEXT >", "ob:gnext", "primary")
+end
+
+function UI:obBusy(ob)
+    local W, H = D.W, D.H
+    D.rect(0, 0, W, 3, C.accent)
+    D.text(W / 2, H / 2 - 10, ob.title or "PLEASE WAIT", C.white, C.bg, 2, "c")
+    if ob.msg then D.text(W / 2, H / 2 + 12, ob.msg, ob.msg_color or C.dim, C.bg, 1, "c") end
+end
+
+-- m = { ob = state } from onboard.lua; redrawn whenever ob.rev changes.
+function UI:onboard(m)
+    local ob = m.ob
+    if self.screen ~= "onboard" then self.screen = "onboard" self.sig = {} end
+    self:part("ob", tostring(ob.rev), function()
+        self.hits = {}
+        D.rect(0, 0, D.W, D.H, C.bg)
+        if ob.screen == "welcome" then self:obWelcome(ob)
+        elseif ob.screen == "role" then self:obRole(ob)
+        elseif ob.screen == "guide" then self:obGuide(ob)
+        else self:obBusy(ob) end
+    end)
+end
+
 -- -------------------------------------------------------------- frame
 
 function UI:render(m)
     if not D.ok then return end
     D.begin()
+    if m.ob then
+        self:onboard(m)
+        D.finish()
+        return
+    end
+    if self.tour then
+        local ok, err = pcall(self.tourFrame, self, m)
+        D.dry, D.keep = false, nil -- an error must not leave the screen dimmed
+        D.finish()
+        if not ok then self.full = true error(err, 0) end
+        return
+    end
     if m.power ~= "on" then
         self:splash(m)
         D.finish()
@@ -738,9 +1147,11 @@ function UI:render(m)
 end
 
 -- touch in PIXELS -> action string (or nil)
+-- While the tour is up only its own buttons answer (nothing underneath).
 function UI:touch(px, py)
-    for i = #self.hits, 1, -1 do
-        local h = self.hits[i]
+    local hits = self.tour and (self.tour.hits or {}) or self.hits
+    for i = #hits, 1, -1 do
+        local h = hits[i]
         if px >= h.x and px < h.x + h.w and py >= h.y and py < h.y + h.h then return h.action end
     end
 end
