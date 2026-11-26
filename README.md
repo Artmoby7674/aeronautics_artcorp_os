@@ -1,26 +1,26 @@
 # ArtCorpOS
 
-A ComputerCraft flight stabilization and control system for Create:Aeronautics ships.
+A ComputerCraft flight stabilization and control OS for my Create:Aeronautics ships.
 
-## Requirements
+## Minecraft Requirements
 
-- Minecraft with the Create:Aeronautics mod
+- Create:Aeronautics
 - CC:Tweaked
-- CC:Sable addon
-- CC:Graphics (pixel HUD)
+- CC:Sable
+- CC:Graphics
 
 ## Quick Install
 
-On the **ship computer** (ComputerCraft terminal):
+On the main computer located inside the ship's brain:
 
 ```
 wget run https://raw.githubusercontent.com/Artmoby7674/aeronautics_artcorp_os/master/install.lua
 reboot
 ```
 
-The ship boots straight into the flight OS: the cockpit monitor shows the
+The ship will then boot straight into the flight OS: the cockpit monitor shows the
 **START ENGINES** button. Everything after that is done from the touchscreen,
-the pilot's relay keys, and the small keyboard computer (text input). The
+the typewritter, and the basic computer that serves as a text input. The
 ship computer itself is never needed in flight: if the OS ever stops on an
 error it shows the error on the monitor and restarts on its own, and an
 airborne restart takes control immediately.
@@ -40,7 +40,7 @@ left by earlier releases, and never touches `config/` (ship wiring, saves).
 The OS flies with the wiring in `config/<ship>.lua` plus the real
 peripheral names in `config/assignments_<ship>.lua`. A ship that was set up
 before keeps working as it is. For a new ship, put the network names of its
-relays and monitor in the `peripherals` table of `config/atlas.lua`.
+relays and monitor in the `peripherals` table of `config/atlas.lua`. This is done because modems get their names from placement order.
 
 See `v2/README.md` for the controls, the screens and the tuning knobs.
 
