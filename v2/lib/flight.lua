@@ -598,10 +598,16 @@ function Flight:run(cmd, dt)
     -- the rear thrust tips the hull: ease off while the stabiliser is out of
     -- room, or once the hull is clearly tipped (the stabiliser is gentle on
     -- purpose and needs the thrust to come off to catch up)
-    if self.rear > 0 and ((ctl.sat ~= 0 and pitch_err > 2) or pitch_err > 6) then
+    -- Only a really tipped hull: at cruise speed the nose sits several
+    -- degrees up by itself, and easing off there throttled every A/P cruise
+    -- back to a crawl (v2.39 flight: 6.5 deg at 35 m/s cut the rear to 1).
+    -- Speed is only for the waypoint to decide; this is a last-resort guard
+    -- against a hull actually tipping over, nothing more.
+    local pg = t.cruise.pitch_guard or 20
+    if self.rear > 0 and pitch_err > pg then
         self.rear_cap = math.max(1, (self.rear_cap or 15) - 4 * dt)
     else
-        self.rear_cap = math.min(15, (self.rear_cap or 15) + 0.5 * dt)
+        self.rear_cap = math.min(15, (self.rear_cap or 15) + 2 * dt)
     end
     local want, rev = 0, false
     if cmd.damp_u ~= nil then

@@ -219,7 +219,9 @@ function AP:update(fl, s, dt)
         local cap = (self.retries > 0) and a.creep_speed or (self.hop and a.hop_speed or a.cruise_speed)
         local room = math.max(df, 0) - a.stop_margin
         local v_sp = math.min(cap, U.brakeSpeed(room, a.cruise_brake))
-        if math.abs(herr) > 15 and dist > a.face_r then v_sp = math.min(v_sp, 10) end
+        -- (no other speed limit: the speed only drops for the approach. A
+        -- "15 deg off course = 10 m/s" cap used to live here; at 10 m/s the
+        -- bank steering is too weak to fix the heading, so it never lifted.)
         self.v_sp = v_sp
         local cmd = { alt = self.goal_alt }
         if dist > a.face_r then

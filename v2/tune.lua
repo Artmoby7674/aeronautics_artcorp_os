@@ -121,6 +121,8 @@ return {
         bank_sign = 1,       -- flip if banking turns the ship the wrong way
         bank_v0 = 6,         -- m/s: no banking below this (it only slides)
         bank_v1 = 15,        -- m/s: full banking from this speed
+        pitch_guard = 20,    -- deg: only a hull pitched this far eases off the
+                             -- rear (last resort; speed is the waypoint's call)
         manual_turn = 12,    -- deg/s of heading change while Q/E held
     },
 

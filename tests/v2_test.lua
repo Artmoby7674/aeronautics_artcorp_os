@@ -601,5 +601,46 @@ do
     check("stalled cruise still times out", gave_up, f(w2.t))
 end
 
+-- 22. Cruise speed only changes for the approach (v2.39 flight: the A/P
+--     cruised at ~10 m/s: a heading-off-15-deg cap and a 6-deg pitch guard
+--     kept cutting the rear thrust on a hull that drifts and pitches up).
+--     Whenever the speed plan (which only depends on the distance left)
+--     wants more speed than the ship has, the rear must be at full thrust.
+do
+    local w = World.new({ loop_ticks = 3, sim = { rear_dz = 1.6, rear_dy = -2.5, hull_pitch = 0.6 } })
+        :airborne(200, 0)
+    w.fl.ctl.roll_known, w.fl.ctl.pitch_known = 1, 1
+    w.fl.calib = nil
+    w:startAP({ name = "LONG", x = 0, z = -6000, heading = 0 })
+    local under, low_rear, reversed, max_herr, max_p, prev_rear = 0, 0, 0, 0, 0, 0
+    w:run(400, function(w)
+        local ap = w.fl.ap
+        if not ap then return true end
+        local s = w.fl.est.s
+        if ap.phase == "cruise" and ap.dist > 200 then
+            max_herr = math.max(max_herr, math.abs(ap.herr or 0))
+            max_p = math.max(max_p, math.abs(s.pitch))
+            -- the plan (distance only) wants far more speed than the ship
+            -- has: not tracking the approach slow-down, so it must be flat out
+            local rear = w.fl.rear or 0
+            -- (skip the first 5 s of cruise: the rear switching from the
+            -- hover drift-brake's reverse to forward restarts it from 0)
+            if (ap.v_sp or 0) > (s.u or 0) + 20 and (ap.pt or 0) > 5 then
+                under = under + 1
+                -- (the rear ramps up a few levels a second: rising is fine)
+                if rear < 14 and rear <= (prev_rear or 0) and (prev_rear or 0) > 0 then low_rear = low_rear + 1 end
+                if w.fl.rear_rev then reversed = reversed + 1 end
+            end
+            prev_rear = rear
+        end
+        return ap.phase == "stop"
+    end)
+    print(string.format("cruise thrust: %d ticks wanting more speed, %d of them below full rear, %d reversing (max heading err %.0f, max pitch %.1f)",
+        under, low_rear, reversed, max_herr, max_p))
+    check("cruise: the plan asked for speed", under > 20, under)
+    check("cruise: full rear whenever it wants more speed", low_rear == 0, low_rear)
+    check("cruise: never reverses while it wants more speed", reversed == 0, reversed)
+end
+
 print(string.format("v2_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("v2_test FAILED", 0) end
