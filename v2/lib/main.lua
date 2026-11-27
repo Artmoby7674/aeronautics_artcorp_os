@@ -113,6 +113,7 @@ end
 
 local function powerOff(why)
     local fl = app.fl
+    app.pending_goto = nil -- switched off before a dispatch got going: drop it
     if fl.ap then fl.ap:cancel("POWER OFF") fl.ap = nil end
     -- a summon survives a power cut: the engines start again and it carries on
     if app.lock and app.lock.mode == "summon" then app.pending_summon = { x = app.lock.x, z = app.lock.z } end
@@ -433,7 +434,16 @@ local function doRemote(cmd)
         local w = Nav.list[tonumber(cmd.idx) or 0]
         if not w then return false, "NO SUCH WAYPOINT" end
         if app.lock then return false, "SHIP IS LOCKED" end
-        if app.power ~= "on" then return false, "ENGINES OFF" end
+        if app.power ~= "on" then
+            -- engines off: start them (the same sequence as the START
+            -- button), then fly once they run (controlTick, pending_goto)
+            app.pending_goto = w
+            if app.power == "off" then beginBoot() end
+            say("ARTCORP DISPATCH: STARTING ENGINES FOR " .. tostring(w.name), D.C.ap)
+            U.log("artcorp: dispatched to %s by remote %s (starting engines)", tostring(w.name), tostring(cmd.by))
+            app.ui:invalidate()
+            return app.cfg.name
+        end
         if fl.phase == "estop" or fl.phase == "unflip" then return false, "SHIP IN " .. fl.phase:upper() end
         if fl.phase == "landing" then fl:cancelLanding("") end
         fl.ap = AP.new(fl, w)
@@ -612,6 +622,19 @@ local function controlTick()
         elseif app.power == "on" and app.fl.phase ~= "unflip" and not (app.fl.ap and app.fl.ap.locked) then
             app.fl:remoteSummon(app.pending_summon.x, app.pending_summon.z)
             app.pending_summon = nil
+        end
+    end
+    -- a dispatch that arrived with the engines off: fly once they run
+    if app.pending_goto and app.power == "on" then
+        local w, fl = app.pending_goto, app.fl
+        app.pending_goto = nil
+        if app.lock then
+            say("DISPATCH CANCELLED: SHIP IS LOCKED", D.C.bad)
+        elseif fl.phase == "estop" or fl.phase == "unflip" then
+            say("DISPATCH CANCELLED: " .. fl.phase:upper(), D.C.bad)
+        else
+            fl.ap = AP.new(fl, w)
+            say("ARTCORP DISPATCH: A/P TO " .. tostring(w.name), D.C.ap)
         end
     end
     local tick_t0 = HW.now_ms()

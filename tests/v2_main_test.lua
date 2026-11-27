@@ -394,6 +394,61 @@ check("tour: never opened in the air", UI3._last and UI3._last.tour == nil and f
 check("summon lock: still flying to the CEO", (states.d60 or 1e9) < (states.d0 or 0) - 100,
     string.format("%.0f -> %.0f", states.d0 or -1, states.d60 or -1))
 
+-- ---------------------------------------------------------------- dispatch, engines off
+-- A DISPATCH from the remote while the ship is parked with its engines off:
+-- the OS starts the engines itself, then takes off and flies to the point.
+for _, m in ipairs({ "main", "config", "nav", "link", "rec", "draw", "ui", "font", "flight", "ctl", "est", "atmos", "ap", "shipdisk", "remote" }) do
+    package.loaded[m] = nil
+end
+do -- park the simulated ship on the ground, level, everything stopped
+    sim.pos.y = sim.p.ground
+    sim.vel.x, sim.vel.y, sim.vel.z = 0, 0, 0
+    sim.w.x, sim.w.y, sim.w.z = 0, 0, 0
+    sim.q = require("sim").quatFromHeading(0)
+    for _, p in ipairs({ "FL", "FR", "RL", "RR" }) do sim.prop[p] = 0 end
+    sim.history = {}
+    for _ = 1, 3 do sim:snapshot() end
+    sim:setProx(15)
+end
+files["v2/data/state"] = "return { where = \"ground\", gear = true }"
+files["v2/data/artcorp_lock.lua"] = nil
+files["v2/data/tour_done"] = "done" -- the tour would block the screen on the ground
+mon.errors = {}
+timers, script, si = {}, {}, 1
+t0 = sim.t
+local ground0 = sim.pos.y
+local sent4 = {}
+local rednet_saved4 = _G.rednet
+_G.rednet = { open = function() end, broadcast = function() end,
+    send = function(to, m) sent4[#sent4 + 1] = m return true end }
+local function rn4(m) m.proto = "artcorp" return { "rednet_message", 11, m, "artcorp" } end
+at(t0 + 2, function() states.power_before = "off?" return rn4({ op = "cmd", cmd = "goto", idx = 1 }) end)
+at(t0 + 4, function() states.starter_dispatch = sim:relay(cfg.peripherals[cfg.engine.relay_key]).out[cfg.engine.start_side] end)
+at(t0 + 45, function()
+    states.d_alt = sim.pos.y - ground0
+    return { "terminate" }
+end)
+printed = {}
+_G.print = function(...) printed[#printed + 1] = table.concat({ ... }, " ") end
+local ok4, err4 = pcall(require("main").run, { runs = 4 })
+_G.print = real_print
+_G.rednet = rednet_saved4
+local ack4
+for _, m in ipairs(sent4) do if m.op == "ack" and m.cmd == "goto" then ack4 = m end end
+local starting, routed = false, false
+for _, l in ipairs(printed) do
+    if l:find("STARTING ENGINES FOR") then starting = true end
+    if l:find("ARTCORP DISPATCH: A/P TO") then routed = true end
+end
+print(string.format("dispatch from engines off: ack=%s starter=%s climbed %.1f m, starting=%s routed=%s",
+    tostring(ack4 and ack4.ok), tostring(states.starter_dispatch), states.d_alt or -1, tostring(starting), tostring(routed)))
+check("dispatch off: ran", ok4, err4)
+check("dispatch off: accepted (not ENGINES OFF)", ack4 and ack4.ok == true, ack4 and tostring(ack4.why))
+check("dispatch off: starter engaged by itself", states.starter_dispatch == 15, states.starter_dispatch)
+check("dispatch off: says it is starting the engines", starting)
+check("dispatch off: autopilot engaged once running", routed)
+check("dispatch off: took off on its own", (states.d_alt or 0) > 10, states.d_alt)
+
 -- ---------------------------------------------------------------- first launch
 -- No peripheral assignments: the original OS's setup wizard runs on the
 -- computer's terminal (all modems unplugged, then one device at a time),
