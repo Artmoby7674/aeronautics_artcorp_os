@@ -38,20 +38,28 @@ or `v2/data/` (what the ship has learned, waypoints, logs).
 
 ## First Launch
 
-A computer with no config loaded starts with a **WELCOME ABOARD** screen instead
-of the cockpit. Two ways in:
+The relay faces (which side does what) come with the repo in
+`config/atlas.lua`. What the OS still needs is the **names** your world gave
+each relay and the monitor (like `redstone_relay_8`: they depend on the order
+things were connected). So on the first start, the **ship computer's own
+terminal** runs the setup wizard, the same one the original OS had:
 
-- **IMPORT FROM DISK**: You can put a floppy with a saved ship config in any disk drive on
-  the network. The ship loads and the OS simply reboots on it.
-- **SET UP THIS SHIP**: the OS walks through the wiring one part at a time
-  (the four props, the rear thruster, the engine, the gear and ground sensor,
-  the two keyboard relays and the monitor). Each step says what that part
-  does and lists the relays it found on the network; tap the right one.
-  **TEST** flips a face for 2 seconds so you can see which relay it is,
-  **DETECT** finds a keyboard relay when you press one of its keys. Nothing
-  is saved until **FINISH**.
+1. **Disconnect ALL modems from the computer first**, so the scan starts
+   clean, then press any key.
+2. The wizard asks for one device at a time, always in this order: input
+   relay 1 (W A S D), input relay 2 (Q / E / Space / Ctrl), aux relay, engine
+   relay, the FL / FR / RL / RR prop relays, the rear thruster relay, then
+   the cockpit monitor. For each one: **plug in that device's modem, then
+   right-click it**. The wizard picks it up on its own and moves on.
+3. Optionally the printer for flight reports (**S** skips it).
 
-Then a short first-flight guide, and a tour of the screens: the rest of the
+The names are saved in `config/assignments_atlas.lua` and the OS starts right
+after. Anything already connected before step 2 is ignored. Plugged in the
+wrong one? Hold **Ctrl+T** on the ship computer to stop the OS, then type
+`v2/wizard` to do it again (deleting `config/assignments_atlas.lua` and
+rebooting does the same).
+
+Then a tour of the screens: the rest of the
 screen dims, one thing is highlighted, and a popup explains it (**NEXT** /
 **SKIP**). The **?** at the top right replays the tour any time on the ground.
 
@@ -66,8 +74,8 @@ Before the first start: **open the steam engine's water input valve** because it
   climbs straight up, turns to face it, cruises in a straight line (steering by
   banking, like a plane), slows down for the approach, turns to the saved
   heading and lands. The landing gear goes up once it's clear of the ground.
-- **Saves and swaps ships.** SAVE DISK / LOAD DISK copy the whole ship to a
-  floppy; SHIP > SLOTS keeps several ship configs on one computer.
+- **Takes the world with it.** SAVE DISK / LOAD DISK copy the waypoints, the
+  measured air and the learned trims to a floppy (never the wiring).
 - **Keeps a black box.** Every control tick is logged to `v2/data/bb.txt`, and
   events to `v2/data/log.txt`, so any weird flight can be looked at later.
 
@@ -78,7 +86,7 @@ Before the first start: **open the steam engine's water input valve** because it
 | FLY | Altitude, climb, speed, heading, target altitude, and what every prop is doing |
 | NAV | Map and waypoints: save the current spot, add one, FLY to one |
 | AUTO | The autopilot's progress on its current trip |
-| SHIP | Hardware status, what it learned in flight, disk and slots |
+| SHIP | Hardware status, what it learned in flight, disk backup |
 | ALERT | Anything that needs attention |
 | CTRL | Take off / land, gear, hover/cruise, E-STOP, recorder, power |
 
@@ -100,8 +108,8 @@ The full controls (keys, hover vs cruise, every tab) are in `v2/README.md`.
 
 ### Relay Placement (Atlas)
 
-This is how the Atlas is wired. The setup screen asks which relay is which, so
-yours can be placed differently as long as the faces match.
+This is how the Atlas is wired (`config/atlas.lua`). The setup wizard only
+asks which relay is which, so they can sit anywhere as long as the faces match.
 
 - **Input relay 1** (W A S D): front = W, back = S, left = A, right = D
 - **Input relay 2**: left = Q, right = E, front = Space, back = Ctrl

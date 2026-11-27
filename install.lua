@@ -18,6 +18,7 @@ local files = {
     { "boot.lua", "startup" },
     { "config/atlas.lua", "config/atlas.lua" },
     { "v2/start.lua", "v2/start.lua" },
+    { "v2/wizard.lua", "v2/wizard.lua" },
     { "v2/tune.lua", "v2/tune.lua" },
     { "v2/lib/ap.lua", "v2/lib/ap.lua" },
     { "v2/lib/config.lua", "v2/lib/config.lua" },
@@ -25,7 +26,7 @@ local files = {
     { "v2/lib/est.lua", "v2/lib/est.lua" },
     { "v2/lib/atmos.lua", "v2/lib/atmos.lua" },
     { "v2/lib/shipdisk.lua", "v2/lib/shipdisk.lua" },
-    { "v2/lib/onboard.lua", "v2/lib/onboard.lua" },
+    { "v2/lib/wizard.lua", "v2/lib/wizard.lua" },
     { "v2/lib/remote.lua", "v2/lib/remote.lua" },
     { "v2/lib/flight.lua", "v2/lib/flight.lua" },
     { "v2/lib/hw.lua", "v2/lib/hw.lua" },
@@ -46,7 +47,7 @@ local leftovers = {
     "startup_v1", "boot", "ship.lua", "mkconfig.lua", "gfxcheck", "stab_log.txt",
     "lib/pid.lua", "lib/hardware.lua", "lib/flight.lua", "lib/os_main.lua", "lib/hud.lua",
     "lib/gfx.lua", "lib/font.lua", "lib/record.lua", "lib/report.lua", "lib/kbd.lua",
-    "lib/waypoints.lua",
+    "lib/waypoints.lua", "v2/lib/onboard.lua",
 }
 
 -- The KEYBOARD computer (on top of the cockpit screen) only needs kbd.lua:
@@ -57,9 +58,10 @@ if kbd_only then
     leftovers = {}
 end
 
--- config/atlas.lua is the TEMPLATE new save slots are copied from. If a save
--- slot is itself called "atlas" (it has wizard assignments), that file is a
--- live ship config with its own edits: never overwrite it.
+-- config/atlas.lua is the ship config (relay roles and faces) from the repo.
+-- Once the setup wizard has named this computer's peripherals for it
+-- (config/assignments_atlas.lua exists) it is the live config, maybe with
+-- its own edits: never overwrite it.
 local function isLiveConfig(path)
     return path == "config/atlas.lua" and fs.exists("config/assignments_atlas.lua")
 end

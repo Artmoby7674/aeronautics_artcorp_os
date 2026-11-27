@@ -86,7 +86,7 @@ echo "computer 5 (main):"
 deploy_file "$REPO/boot.lua" "$MAIN/startup" "startup"
 deploy_file "$REPO/install.lua" "$MAIN/install.lua" "install.lua"
 # v2/data/ is the ship's own state (waypoints, learned values): never touched.
-for f in "$REPO"/v2/start.lua "$REPO"/v2/tune.lua "$REPO"/v2/lib/*.lua "$REPO"/v2/lib/ui/*.lua; do
+for f in "$REPO"/v2/start.lua "$REPO"/v2/tune.lua "$REPO"/v2/wizard.lua "$REPO"/v2/lib/*.lua "$REPO"/v2/lib/ui/*.lua; do
   rel="${f#"$REPO"/}"
   deploy_file "$f" "$MAIN/$rel" "$rel"
 done

@@ -5,6 +5,7 @@
 -- start-up, in the log and on the error screen; the cockpit screen (start
 -- screen, SHIP tab) shows the number only. Newest first.
 local history = {
+    { "2.39", "PLUG IN", "no in-game setup: v1-style plug-in wizard for peripheral names; disk = world data only; ATLAS splash" },
     { "2.38", "SHOW ME", "setup fires each relay face and asks what moved: learns relays AND faces, any wiring" },
     { "2.37", "WELCOME", "first-launch setup (wiring, first-flight guide, tour) and a save-slot manager" },
     { "2.36", "CALIBRATE", "trims kept across engine starts; after RESET: hover hands-off, calibrate, freeze" },
@@ -43,6 +44,6 @@ return {
     note = latest[3],
     date = "2026-11-26",
     history = history,
-    -- "v2.38 SHOW ME"
+    -- "v2.39 PLUG IN"
     label = "v" .. latest[1] .. " " .. latest[2],
 }

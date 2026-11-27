@@ -601,25 +601,5 @@ do
     check("stalled cruise still times out", gave_up, f(w2.t))
 end
 
--- Config.patch: the setup writes observed faces into the template text
-do
-    local Cp = require("config")
-    local f = io.open("config/atlas.lua", "r")
-    local src = f:read("a")
-    f:close()
-    local out, err = Cp.patch(src, {
-        { { "output_map", "FL" }, "speed", "top" }, { { "output_map", "REAR" }, "rev", nil },
-        { { "engine" }, "clutch_side", "front" }, { { "input_map", "engine_relay" }, "OFF", "back" },
-        { { "proximity" }, "side", "left" }, { { "gear_output" }, "side", "back" } })
-    local t = out and load(out)()
-    check("patch: faces written", t and t.output_map.FL.speed == "top" and t.output_map.FL.tilt_fwd == "front"
-        and t.output_map.REAR.rev == nil and t.output_map.REAR.fw == "front" and t.engine.clutch_side == "front"
-        and t.engine.start_side == "left" and t.input_map.engine_relay.OFF == "back" and t.input_map.engine_relay.UP == "front"
-        and t.proximity.side == "left" and t.gear_output.side == "back" and t.peripherals.aux_relay == "relay_aux", err)
-    check("patch: other sides untouched", t and t.input_map.aux_relay.SHIFT == "left" and t.output_map.FR.speed == "right")
-    check("patch: comments kept", out and out:find("Slow-down link", 1, true) ~= nil)
-    check("patch: a missing block is refused", Cp.patch(src, { { { "nowhere" }, "side", "top" } }) == nil)
-end
-
 print(string.format("v2_test: %d passed, %d failed", passed, failed))
 if failed > 0 then error("v2_test FAILED", 0) end

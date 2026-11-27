@@ -12,7 +12,7 @@ local UI = require("ui")
 local V = require("version")
 local ShipDisk = require("shipdisk")
 local Remote = require("remote")
-local Onboard = require("onboard")
+local Wizard = require("wizard")
 
 local Main = {}
 
@@ -241,94 +241,6 @@ end
 local SUMMON_BLOCKED = { ["ap:cancel"] = true, ["ctl:land"] = true, ["ctl:landoff"] = true,
     ["ctl:estop"] = true, ["ctl:power"] = true, ["wp:fly"] = true }
 
--- ------------------------------------------------------------ save slots
--- The SLOTS screen (off the SHIP tab): one slot per ship wiring config.
-
-local SLOT_ROWS = 7 -- rows the slot list shows (UI:slots)
-
--- Re-reads the slot list (only on open and after a change: it lists the
--- disk) and selects `want`, else keeps the selection in range.
-local function refreshSlots(want)
-    local ui = app.ui
-    app.slots = Config.slotList()
-    for i, s in ipairs(app.slots) do
-        if s.id == want then ui.slot_sel = i end
-    end
-    ui.slot_sel = U.clamp(ui.slot_sel or 1, 1, math.max(#app.slots, 1))
-    -- keep the selected row on screen
-    local top = ui.slot_scroll or 0
-    if ui.slot_sel <= top then top = ui.slot_sel - 1 end
-    if ui.slot_sel > top + SLOT_ROWS then top = ui.slot_sel - SLOT_ROWS end
-    ui.slot_scroll = math.max(0, top)
-end
-
-local function newSlot(name)
-    local id, why = Config.copySlot(app.cfg.slot, name)
-    if not id then return say("NEW SLOT: " .. why, D.C.bad) end
-    U.log("slot %s copied to new slot %s", app.cfg.slot, id)
-    refreshSlots(id)
-    say("NEW SLOT " .. id:upper() .. ": COPY OF " .. app.cfg.slot:upper(), D.C.good)
-end
-
-local function slotAct(a)
-    local ui, fl = app.ui, app.fl
-    if a == "ship:slots" then
-        refreshSlots(app.cfg.slot)
-        return ui:setTab("slots")
-    end
-    if a == "slot:back" then return ui:setTab("ship") end
-    local slots = app.slots or {}
-    local row = a:match("^slot:row:(%d+)")
-    if row then
-        local i = (ui.slot_scroll or 0) + tonumber(row) + 1
-        if slots[i] then ui.slot_sel = i end
-        return
-    end
-    if a == "slot:up" then ui.slot_scroll = math.max(0, (ui.slot_scroll or 0) - 1) return end
-    if a == "slot:down" then
-        ui.slot_scroll = math.min(math.max(#slots - SLOT_ROWS, 0), (ui.slot_scroll or 0) + 1)
-        return
-    end
-    local sel = slots[ui.slot_sel or 0]
-    if a == "slot:use" then
-        if not sel then return end
-        if sel.id == app.cfg.slot then return say(sel.id:upper() .. " IS ALREADY RUNNING") end
-        -- the restart drops whatever is flying the ship
-        if app.power == "on" and fl.phase ~= "parked" then
-            return say("LAND FIRST: SWITCHING RESTARTS THE OS", D.C.bad)
-        end
-        if not confirmed("slot:use:" .. sel.id) then
-            return say("TAP USE AGAIN TO RESTART AS " .. sel.id:upper(), D.C.warn)
-        end
-        if not Config.useSlot(ROOT, sel.id) then return say("CAN'T WRITE " .. ROOT .. "/data/slot", D.C.bad) end
-        saveLearned(fl.ctl)
-        U.log("slot %s chosen on the screen: restarting", sel.id)
-        say("USING " .. sel.id:upper() .. ": RESTARTING", D.C.good)
-        app.reboot_at = os.clock() + 1.5 -- same restart as a disk load
-        return
-    end
-    if a == "slot:new" then
-        if Link.online() then
-            local ok = Link.ask({ { "SLOT NAME", "name" } }, function(v, err)
-                if v then newSlot(v[1]) else say("KEYBOARD: " .. tostring(err), D.C.warn) end
-            end)
-            if ok then return say("TYPE THE NEW SLOT NAME ON THE KEYBOARD") end
-        end
-        return newSlot(Config.freeSlotName())
-    end
-    if a == "slot:del" then
-        if not sel then return end
-        if sel.id == app.cfg.slot then return say("CAN'T DELETE THE RUNNING SLOT", D.C.bad) end
-        if not confirmed("slot:del:" .. sel.id) then
-            return say("TAP DELETE AGAIN TO ERASE " .. sel.id:upper(), D.C.warn)
-        end
-        local ok = Config.deleteSlot(sel.id)
-        U.log("slot %s deleted on the screen (%s)", sel.id, tostring(ok))
-        refreshSlots()
-        return say(ok and ("DELETED SLOT " .. sel.id:upper()) or "DELETE FAILED", ok and D.C.good or D.C.bad)
-    end
-end
-
 local function act(a)
     if not a then return end
     local fl, ui = app.fl, app.ui
@@ -447,12 +359,14 @@ local function act(a)
         saveLearned(c)
         return say("RESET: HOVER HANDS-OFF TO CALIBRATE")
     end
-    -- ship backup on a floppy in any disk drive on the network
+    -- world backup on a floppy in any disk drive on the network: waypoints,
+    -- measured air, learned trims + hover (never the wiring: that is the
+    -- repo's config and this computer's own peripheral names)
     if a == "ship:disksave" then
         saveLearned(fl.ctl) -- what was learned this flight goes on the disk too
-        local n, why = ShipDisk.save(app.cfg.slot, { ship = app.cfg.name, os = V.label })
+        local n, why = ShipDisk.save({ ship = app.cfg.name, os = V.label })
         if not n then return say(why, D.C.bad) end
-        return say(string.format("SAVED %s TO DISK (%d FILES)", tostring(app.cfg.name):upper(), n), D.C.good)
+        return say(string.format("SAVED WORLD DATA TO DISK (%d FILES)", n), D.C.good)
     end
     if a == "ship:diskload" then
         if app.power == "on" and fl.phase ~= "parked" and fl.phase ~= "estop" then
@@ -461,15 +375,14 @@ local function act(a)
         local m, why = ShipDisk.peek()
         if not m then return say(why, D.C.bad) end
         if not confirmed("ship:diskload") then
-            return say("TAP AGAIN TO LOAD " .. tostring(m.ship or m.slot):upper() .. " FROM DISK", D.C.warn)
+            return say("TAP AGAIN TO LOAD WORLD DATA FROM DISK", D.C.warn)
         end
         local ok, why2 = ShipDisk.load()
         if not ok then return say(why2, D.C.bad) end
-        say("LOADED " .. tostring(ok.ship or ok.slot):upper() .. ": RESTARTING", D.C.good)
+        say(string.format("LOADED WORLD DATA (%d FILES): RESTARTING", #ok.files), D.C.good)
         app.reboot_at = os.clock() + 1.5 -- let the screen show it, then restart on it
         return
     end
-    if a == "ship:slots" or a:match("^slot:") then return slotAct(a) end
 end
 
 -- ------------------------------------------------------------ ArtCorp remote
@@ -616,7 +529,7 @@ local function model()
         rec = Rec.on, rec_t = Rec.duration(), rec_n = #Rec.samples,
         loop = app.loop, disk = app.disk, missing = app.missing,
         confirm = app.confirm, clutch = app.power == "on" and HW.feature("clutch"),
-        last_ap = app.last_ap, slots = app.slots, slot = app.cfg.slot,
+        last_ap = app.last_ap,
     }
 end
 
@@ -684,9 +597,9 @@ end
 
 local function controlTick()
     if app.reboot_at and os.clock() >= app.reboot_at then
-        -- a ship was loaded from disk: start again on it (learned values are
+        -- world data was loaded from disk: start again on it (learned values are
         -- NOT saved first, that would overwrite what was just loaded)
-        U.log("restarting on the ship loaded from disk")
+        U.log("restarting on the world data loaded from disk")
         U.bbFlush(os.clock())
         os.reboot()
     end
@@ -834,11 +747,12 @@ end
 
 function Main.run(opts)
     opts = opts or {}
-    -- First launch (no wired ship): the setup on the monitor instead of
-    -- stopping with "no ship config". It returns once the new slot is
-    -- written; a disk import restarts the computer instead.
-    if Onboard.needed(ROOT) then
-        local r = Onboard.run(ROOT, opts)
+    -- No (or outdated / incomplete) peripheral assignments: the original
+    -- OS's setup wizard on this computer's terminal names every relay and
+    -- the monitor, then the OS starts on them. "stop" = Ctrl+T in it.
+    local need, why = Wizard.needed(ROOT)
+    if need then
+        local r = Wizard.run(ROOT, { why = why })
         if r ~= "ready" then return r end
     end
     local cfg, err = Config.load(ROOT)

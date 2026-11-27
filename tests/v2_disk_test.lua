@@ -1,5 +1,6 @@
--- v2 ship backup on a floppy (v2/lib/shipdisk.lua): save on one computer,
--- load on another, with a fake filesystem, disk drive and floppy.
+-- v2 world backup on a floppy (v2/lib/shipdisk.lua): save on one computer,
+-- load on another, with a fake filesystem, disk drive and floppy. Only the
+-- world data (waypoints, air, learned values) travels.
 package.path = "./v2/lib/?.lua;" .. package.path
 package.loaded["shipdisk"], package.loaded["util"] = nil, nil
 
@@ -105,60 +106,92 @@ _G.disk = {
 
 local SD = require("shipdisk")
 
--- ---------------------------------------------------------------- ship A
-files["config/ArtAtlas.lua"] = "return { name = 'ArtAtlas' }"
-files["config/assignments_ArtAtlas.lua"] = "return { aux_relay = 'redstone_relay_8' }"
+-- ---------------------------------------------------------------- computer A
+-- Only WORLD data goes on the disk: waypoints, measured air, learned
+-- values. Never the ship config, the peripheral assignments (this
+-- computer's own names), the slot or local tuning.
+files["config/atlas.lua"] = "return { name = 'Atlas' }"
+files["config/assignments_atlas.lua"] = "return { aux_relay = 'redstone_relay_8' }"
 files["v2/data/learned.lua"] = "return { hover = 6.9 }"
 files["v2/data/atmos.lua"] = "return { band = 10, bands = {} }"
 files["v2/data/waypoints.lua"] = "return { { name = 'REACTOR', x = 1, z = 2 } }"
-files["v2/data/slot"] = "ArtAtlas"
-files["v2/data/log.txt"] = "not part of a ship backup"
+files["v2/data/slot"] = "atlas"
+files["v2/data/tune_local.lua"] = "return { ui = { fps = 2 } }"
+files["v2/data/log.txt"] = "not part of a backup"
 
 -- no drive / no floppy / blank floppy
 have_drive = false
-local n, why = SD.save("ArtAtlas", { ship = "ArtAtlas" })
+local n, why = SD.save({ ship = "Atlas" })
 check("no drive: says so", not n and why == "NO DISK DRIVE FOUND", why)
 have_drive = true
 drive.present = false
-n, why = SD.save("ArtAtlas", { ship = "ArtAtlas" })
+n, why = SD.save({ ship = "Atlas" })
 check("no floppy: says so", not n and why == "PUT A FLOPPY IN THE DRIVE", why)
 drive.present = true
 local m
 m, why = SD.peek()
-check("blank floppy: nothing to load", not m and why == "NO SHIP SAVED ON THIS DISK", why)
+check("blank floppy: nothing to load", not m and why == "NO WORLD DATA ON THIS DISK", why)
 
 -- save
-n, why = SD.save("ArtAtlas", { ship = "ArtAtlas", os = "v2.28" })
-check("save: 6 ship files", n == 6, tostring(n) .. " " .. tostring(why))
-check("save: config on disk", files["disk/artcorp_ship/config/ArtAtlas.lua"] ~= nil)
-check("save: learned on disk", files["disk/artcorp_ship/v2/data/learned.lua"] == "return { hover = 6.9 }")
-check("save: logs left out", files["disk/artcorp_ship/v2/data/log.txt"] == nil)
+n, why = SD.save({ ship = "Atlas", os = "v2.39" })
+check("save: the 3 world files", n == 3, tostring(n) .. " " .. tostring(why))
+check("save: waypoints on disk", files["disk/artcorp_world/v2/data/waypoints.lua"] ~= nil)
+check("save: air on disk", files["disk/artcorp_world/v2/data/atmos.lua"] ~= nil)
+check("save: learned on disk", files["disk/artcorp_world/v2/data/learned.lua"] == "return { hover = 6.9 }")
+local leaked = {}
+for k in pairs(files) do
+    if k:sub(1, 5) == "disk/" and not k:match("^disk/artcorp_world/v2/data/[a-z]+%.lua$")
+        and k ~= "disk/artcorp_world/manifest.lua" then leaked[#leaked + 1] = k end
+end
+check("save: nothing else (no config, assignments, slot, tune_local, logs)", #leaked == 0, table.concat(leaked, " "))
 m = SD.peek()
-check("save: manifest names the ship", m and m.ship == "ArtAtlas" and m.slot == "ArtAtlas" and m.os == "v2.28")
+check("save: manifest says world data", m and m.kind == "world" and m.os == "v2.39" and #m.files == 3 and m.slot == nil)
 -- saving again replaces the old backup
 files["v2/data/learned.lua"] = "return { hover = 7.1 }"
-n = SD.save("ArtAtlas", { ship = "ArtAtlas" })
-check("save again: replaced", n == 6 and files["disk/artcorp_ship/v2/data/learned.lua"] == "return { hover = 7.1 }")
+n = SD.save({ ship = "Atlas" })
+check("save again: replaced", n == 3 and files["disk/artcorp_world/v2/data/learned.lua"] == "return { hover = 7.1 }")
 
--- ---------------------------------------------------------------- ship B
--- a different computer: other files, the floppy carried over
+-- ---------------------------------------------------------------- computer B
+-- another world's computer: its own wiring stays exactly as it is
 for k in pairs(files) do if k:sub(1, 5) ~= "disk/" then files[k] = nil end end
-files["config/Other.lua"] = "return { name = 'Other' }"
+files["config/atlas.lua"] = "return { name = 'Atlas', mine = true }"
+files["config/assignments_atlas.lua"] = "return { aux_relay = 'redstone_relay_2' }"
 files["v2/data/learned.lua"] = "return { hover = 5.0 }"
-files["v2/data/slot"] = "Other"
+files["v2/data/slot"] = "atlas"
+files["v2/data/tune_local.lua"] = "return { mine = true }"
 m, why = SD.load()
-check("load: ok", m and m.ship == "ArtAtlas", why)
-check("load: config copied", files["config/ArtAtlas.lua"] == "return { name = 'ArtAtlas' }")
-check("load: assignments copied", files["config/assignments_ArtAtlas.lua"] ~= nil)
+check("load: ok", m and #m.files == 3, why)
+check("load: waypoints copied", files["v2/data/waypoints.lua"] == "return { { name = 'REACTOR', x = 1, z = 2 } }")
+check("load: air copied", files["v2/data/atmos.lua"] == "return { band = 10, bands = {} }")
 check("load: learned copied", files["v2/data/learned.lua"] == "return { hover = 7.1 }")
-check("load: slot now the loaded ship", files["v2/data/slot"] == "ArtAtlas")
-check("load: replaced files kept", files["v2/data/before_disk/v2/data/learned.lua"] == "return { hover = 5.0 }"
-    and files["v2/data/before_disk/v2/data/slot"] == "Other")
+check("load: config untouched", files["config/atlas.lua"] == "return { name = 'Atlas', mine = true }")
+check("load: assignments untouched", files["config/assignments_atlas.lua"] == "return { aux_relay = 'redstone_relay_2' }")
+check("load: slot and own tuning untouched", files["v2/data/slot"] == "atlas" and files["v2/data/tune_local.lua"] == "return { mine = true }")
+check("load: replaced files kept", files["v2/data/before_disk/v2/data/learned.lua"] == "return { hover = 5.0 }")
+
+-- a floppy saved by an older OS (whole ship): only its world files load
+for k in pairs(files) do if k:sub(1, 5) == "disk/" then files[k] = nil end end
+files["disk/artcorp_ship/config/old.lua"] = "return { name = 'Old' }"
+files["disk/artcorp_ship/config/assignments_old.lua"] = "return { aux_relay = 'redstone_relay_99' }"
+files["disk/artcorp_ship/v2/data/slot"] = "old"
+files["disk/artcorp_ship/v2/data/waypoints.lua"] = "return { { name = 'OLDWP', x = 5, z = 6 } }"
+files["disk/artcorp_ship/manifest.lua"] = "return { slot = 'old', ship = 'Old', files = { 'config/old.lua', "
+    .. "'config/assignments_old.lua', 'v2/data/waypoints.lua', 'v2/data/slot' } }"
+m, why = SD.load()
+check("old floppy: loads", m and #m.files == 1 and m.files[1] == "v2/data/waypoints.lua", why)
+check("old floppy: waypoints taken", files["v2/data/waypoints.lua"] == "return { { name = 'OLDWP', x = 5, z = 6 } }")
+check("old floppy: wiring and slot left on the disk", files["config/old.lua"] == nil and files["config/assignments_old.lua"] == nil
+    and files["v2/data/slot"] == "atlas")
+
+-- nothing learned yet: nothing to save
+for k in pairs(files) do files[k] = nil end
+n, why = SD.save({})
+check("nothing yet: says so", not n and why == "NOTHING TO SAVE YET", why)
 
 -- full floppy
 cap = 300
-for k in pairs(files) do if k:sub(1, 5) == "disk/" then files[k] = nil end end
-n, why = SD.save("ArtAtlas", { ship = "ArtAtlas" })
+files["v2/data/learned.lua"] = string.rep("x", 200)
+n, why = SD.save({ ship = "Atlas" })
 check("full floppy: refused", not n and tostring(why):find("DISK FULL") ~= nil, why)
 
 _G.fs, _G.peripheral, _G.disk, _G.textutils = saved.fs, saved.peripheral, saved.disk, saved.textutils

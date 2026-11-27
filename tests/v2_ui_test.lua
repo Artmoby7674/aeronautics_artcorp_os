@@ -71,48 +71,51 @@ for _, a in ipairs({ "ctl:land", "ctl:gear", "ctl:mode", "ctl:estop", "ctl:hold"
     check("ctrl reachable by cell touch: " .. a, seen[a])
 end
 
--- SHIP tab opens the SLOTS sub-screen; it lists the slots and keeps SHIP lit
+-- SHIP tab bottom row: SAVE DISK, LOAD DISK, RESET LEARNED VALUES (no slots)
 frame(worlds.parked, "ship")
-local slotsBtn
-for _, h in ipairs(SC.ui.hits) do if h.action == "ship:slots" then slotsBtn = h end end
-check("ship: SLOTS button", slotsBtn ~= nil)
-check("ship: RESET still there", (function()
-    for _, h in ipairs(SC.ui.hits) do if h.action == "ship:reset" then return true end end
-end)())
 do
-    local SLOTS = { { id = "atlas", wired = true }, { id = "ship2", wired = false } }
-    for i = 3, 9 do SLOTS[i] = { id = "spare" .. i, wired = true } end
-    SC.ui.slot_sel, SC.ui.slot_scroll = 2, 0
-    SC.mon.errors = {}
-    local ok, err = pcall(frame, worlds.parked, "slots", { slots = SLOTS, slot = "atlas", confirm = "slot:del:ship2" })
-    check("slots: renders", ok, err)
-    check("slots: no draw errors", #SC.mon.errors == 0, SC.mon.errors[1])
     local acts = {}
-    for _, h in ipairs(SC.ui.hits) do
-        acts[h.action] = h
-        if not h.action:match("^tab:") then
-            check("slots: hit clear of the tab bar " .. h.action, h.x >= 0 and h.x + h.w <= W and h.y + h.h <= TAB_Y,
-                string.format("%d,%d %dx%d", h.x, h.y, h.w, h.h))
+    for _, h in ipairs(SC.ui.hits) do acts[h.action] = h end
+    check("ship: no SLOTS button", acts["ship:slots"] == nil)
+    local sv, ld, rs = acts["ship:disksave"], acts["ship:diskload"], acts["ship:reset"]
+    check("ship: SAVE DISK, LOAD DISK, RESET there", sv and ld and rs)
+    if sv and ld and rs then
+        check("ship: one row, left to right", sv.y == ld.y and ld.y == rs.y and sv.x < ld.x and ld.x < rs.x)
+        check("ship: no overlap", sv.x + sv.w <= ld.x and ld.x + ld.w <= rs.x)
+        check("ship: row clear of the tab bar", rs.y + rs.h <= TAB_Y and rs.x + rs.w <= W)
+        for _, h in ipairs({ sv, ld, rs }) do
+            check("ship: touch " .. h.action, SC.ui:touch(h.x + h.w / 2, h.y + h.h / 2) == h.action)
         end
     end
-    for _, a in ipairs({ "slot:back", "slot:use", "slot:new", "slot:del", "slot:up", "slot:down", "slot:row:0", "slot:row:6" }) do
-        local h = acts[a]
-        check("slots: touch " .. a, h and SC.ui:touch(h.x + h.w / 2, h.y + h.h / 2) == a)
-    end
-    check("slots: SHIP stays lit in the tab bar", SC.ui:barTab() == "ship")
-    check("slots: not in the bottom tab bar", (function()
-        for _, t in ipairs(UI.TABS) do if t.id == "slots" then return false end end
-        return true
-    end)())
-    local before = SC.mon.calls
-    SC.ui:render(SC.base(worlds.parked, { slots = SLOTS, slot = "atlas", confirm = "slot:del:ship2" }))
-    check("slots: retained redraw", SC.mon.calls - before <= 3, SC.mon.calls - before)
-    -- no list (main never opened it): still draws
-    SC.mon.errors = {}
-    local ok2 = pcall(frame, worlds.parked, "slots", {})
-    check("slots: renders without a list", ok2 and #SC.mon.errors == 0, SC.mon.errors[1])
-    SC.ui.slot_sel, SC.ui.slot_scroll = nil, nil
 end
+
+-- the start screen is titled with the ship's name, ATLAS, whatever the config says
+do
+    local ui = SC.ui
+    ui.screen = nil
+    local texts = {}
+    local realText = SC.D.text
+    SC.D.text = function(x, y, t, ...) texts[#texts + 1] = tostring(t) return realText(x, y, t, ...) end
+    local ok, err = pcall(ui.render, ui, SC.base(worlds.parked, { power = "off", name = "Some Other Name" }))
+    SC.D.text = realText
+    check("splash: renders", ok, err)
+    local atlas, other = false, false
+    for _, t in ipairs(texts) do
+        if t == "ATLAS" then atlas = true end
+        if t:upper():find("SOME OTHER NAME", 1, true) then other = true end
+    end
+    check("splash: titled ATLAS", atlas and not other, table.concat(texts, " | "))
+    check("splash: START still there", ui:touch(W / 2, 128) == "boot")
+    ui.screen = nil
+end
+
+-- the tour's first step says to open the steam engine's water valve
+check("tour: step 1 is START with the water valve", UI.TOUR[1].screen == "splash"
+    and UI.TOUR[1].text:find("WATER INPUT VALVE", 1, true) ~= nil)
+check("tour: no SLOTS step", (function()
+    for _, st in ipairs(UI.TOUR) do if st.title == "SLOTS" then return false end end
+    return true
+end)())
 
 -- the "?" in the top bar replays the tour
 frame(worlds.parked, "fly")
@@ -193,78 +196,10 @@ do
     end)())
 end
 
--- first-launch setup screens
-do
-    local ui = SC.ui
-    local roleOb = { screen = "role", rev = 1, idx = 3, total = 10, scroll = 0, sel = 2, msg = "TESTING RELAY_AUX",
-        role = { key = "aux_relay", label = "AUX RELAY", type = "redstone_relay", optional = true, test_label = "TEST",
-            desc = "MOVES THE LANDING GEAR, READS THE GROUND SENSOR AND THE SHIFT KEY." },
-        cands = { { name = "relay_1", used = true, tag = "USED: KEYS W A S D" }, { name = "relay_aux" }, { name = "relay_eng" } } }
-    local screens = {
-        welcome = { screen = "welcome", rev = 1, msg = "NO DISK DRIVE FOUND" },
-        role = roleOb,
-        empty = { screen = "role", rev = 1, idx = 10, total = 10, scroll = 0, cands = {},
-            role = { key = "main_monitor", label = "COCKPIT SCREEN", type = "monitor", test_label = "SHOW", desc = "X" } },
-        guide = { screen = "guide", rev = 1, gi = 4, gn = 4, card = { title = "HOVER HANDS-OFF", text = string.rep("WORDS ", 40) } },
-        busy = { screen = "busy", rev = 1, title = "SHIP LOADED", msg = "RESTARTING ON CARGO..." },
-        engines = { screen = "engines", rev = 1, msg = "NO OTHER RELAYS ON THE NETWORK" },
-        fire = { screen = "fire", rev = 1, phase = 1, firing = true, known_n = 5, known_total = 17,
-            cur = { relay = "redstone_relay_12", face = "bottom" }, hint = "WATCH THE SHIP: A 0.5 S FLIP.",
-            msg = string.rep("LONG MESSAGE ", 10), pv = {
-                { id = "FL", label = "FRONT-LEFT", sub = "PROP 2/3" }, { id = "FR", label = "FRONT-RIGHT", sub = "PROP 0/3" },
-                { id = "RL", label = "REAR-LEFT", sub = "DONE", done = true }, { id = "RR", label = "REAR-RIGHT", sub = "PROP 0/3" },
-                { id = "REAR", label = "REAR", sub = "THRUSTER 0/3" }, { id = "GEAR", label = "LANDING", sub = "GEAR" },
-                { id = "ENGINE", label = "ENGINE /", sub = "PROPS SPIN" }, { id = "NOTHING", label = "NOTHING", sub = "NO CHANGE" } } },
-        what = { screen = "fire", rev = 1, phase = 2, part = "FL", cur = { relay = "relay_3", face = "left" },
-            pv = { { id = "FL", label = "FRONT-LEFT", sub = "PROP 2/3" } },
-            choices = { { label = "TILTED", sub = "FORWARD", slot = "tilt_fwd" }, { label = "TILTED", sub = "BACK", slot = "tilt_bwd" },
-                { label = "CHANGED", sub = "SPEED", slot = "speed" } } },
-        review = { screen = "review", rev = 1, known_n = 16, known_total = 17, can_next = true, msg = "MISSING: X", rows = {
-            { label = "FRONT-LEFT", relay = "redstone_relay_12", faces = { { lbl = "F", face = "bottom", seen = false },
-                { lbl = "B", face = "bottom", seen = false }, { lbl = "S", face = "bottom", seen = false } } },
-            { label = "REAR THRUST", relay = "relay_7", faces = { { lbl = "FW", face = "front", seen = true },
-                { lbl = "BW", face = "back", seen = true }, { lbl = "REV", face = "top", seen = true } } },
-            { label = "GEAR", faces = { { lbl = "", face = "front", seen = false } } } } },
-        press = { screen = "press", rev = 1, pi = 2, pn = 5, press = { found = "left",
-            item = { label = "SCREEN DOWN BUTTON", desc = string.rep("PRESS IT ", 30), relay = "redstone_relay_12", tpl = "back" },
-            faces = { { face = "top", level = 0 }, { face = "bottom", level = 0 }, { face = "left", level = 15 },
-                { face = "right", level = 0 }, { face = "front", level = 7 }, { face = "back", level = 0 } } } },
-    }
-    local want = {
-        welcome = { "ob:import", "ob:setup" },
-        role = { "ob:back", "ob:test", "ob:skip", "ob:next", "ob:up", "ob:down", "ob:row:0", "ob:row:5" },
-        empty = { "ob:back", "ob:test" },
-        guide = { "ob:gskip", "ob:gback", "ob:gnext" },
-        busy = {},
-        engines = { "ob:engines", "ob:back" },
-        fire = { "ob:part:FL", "ob:part:NOTHING", "ob:part:ENGINE", "ob:again", "ob:back", "ob:review" },
-        what = { "ob:what:tilt_fwd", "ob:what:tilt_bwd", "ob:what:speed", "ob:parts", "ob:again" },
-        review = { "ob:back", "ob:more", "ob:next" },
-        press = { "ob:back", "ob:skip", "ob:next" },
-    }
-    for name, ob in pairs(screens) do
-        SC.mon.errors = {}
-        ui.screen = nil
-        local ok, err = pcall(ui.render, ui, { ob = ob })
-        check("setup " .. name .. ": renders", ok, err)
-        check("setup " .. name .. ": no draw errors", #SC.mon.errors == 0, SC.mon.errors[1])
-        local acts = {}
-        for _, h in ipairs(ui.hits) do
-            acts[h.action] = true
-            check("setup " .. name .. ": on screen " .. h.action, h.x >= 0 and h.y >= 0 and h.x + h.w <= W and h.y + h.h <= H)
-            check("setup " .. name .. ": no tab under it " .. h.action, not h.action:match("^tab:"))
-        end
-        for _, a in ipairs(want[name]) do check("setup " .. name .. ": has " .. a, acts[a]) end
-        local before = SC.mon.calls
-        ui:render({ ob = ob })
-        check("setup " .. name .. ": quiet frame free", SC.mon.calls == before)
-    end
-    check("wrap: lines fit", (function()
-        for _, l in ipairs(UI.wrap(string.rep("ABCDEFG ", 30), 20)) do if #l > 20 then return false end end
-        return #UI.wrap("A VERYVERYVERYLONGWORDINDEED", 10) == 4
-    end)())
-    ui.screen = nil
-end
+check("wrap: lines fit", (function()
+    for _, l in ipairs(UI.wrap(string.rep("ABCDEFG ", 30), 20)) do if #l > 20 then return false end end
+    return #UI.wrap("A VERYVERYVERYLONGWORDINDEED", 10) == 4
+end)())
 
 -- the palette is set on init
 check("palette applied", SC.mon.palette[0] ~= nil and SC.mon.palette[15] ~= nil)

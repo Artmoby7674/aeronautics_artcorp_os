@@ -1,33 +1,35 @@
--- v2 ship backup on a floppy: SAVE DISK / LOAD DISK on the SHIP tab.
+-- v2 world backup on a floppy: SAVE DISK / LOAD DISK on the SHIP tab.
 --
 -- Any ComputerCraft disk drive on the ship's network (or touching the
--- computer) is used. Everything that makes this ship THIS ship is copied
--- into <disk>/artcorp_ship/ with the same paths as on the computer:
---   config/<slot>.lua, config/assignments_<slot>.lua   wiring
---   v2/data/learned.lua, v2/data/atmos.lua             learned in flight
---   v2/data/waypoints.lua, v2/data/tune_local.lua      waypoints, own tuning
---   v2/data/slot                                       which ship it is
--- plus manifest.lua (ship, slot, OS version, file list).
--- LOAD copies them back; the files it replaces are kept first in
--- v2/data/before_disk/ so a wrong disk can be undone by hand.
+-- computer) is used. Only WORLD data is carried: what the ship learned in
+-- this world/server, copied into <disk>/artcorp_world/ with the same paths
+-- as on the computer:
+--   v2/data/waypoints.lua    saved places
+--   v2/data/atmos.lua        the air measured in flight
+--   v2/data/learned.lua      learned trims and hover thrust
+-- plus manifest.lua (OS version, file list). The wiring never goes on the
+-- disk: config/<slot>.lua comes from the repo and config/assignments_*.lua
+-- holds THIS computer's peripheral names (the setup wizard writes them).
+-- LOAD copies the world files back; the files it replaces are kept first in
+-- v2/data/before_disk/ so a wrong disk can be undone by hand. A floppy saved
+-- by an older OS (artcorp_ship/, with the wiring on it) still loads: only its
+-- world files are taken.
 local U = require("util")
 
 local SD = {}
 
-local DIR = "artcorp_ship"
+local DIR = "artcorp_world"
+local OLD_DIR = "artcorp_ship" -- v2.28 - v2.38 saves
 local KEEP = "v2/data/before_disk"
 
-local function files(slot)
-    return {
-        "config/" .. slot .. ".lua",
-        "config/assignments_" .. slot .. ".lua",
-        "v2/data/learned.lua",
-        "v2/data/atmos.lua",
-        "v2/data/waypoints.lua",
-        "v2/data/tune_local.lua",
-        "v2/data/slot",
-    }
-end
+local WORLD = {
+    "v2/data/waypoints.lua",
+    "v2/data/atmos.lua",
+    "v2/data/learned.lua",
+}
+SD.WORLD = WORLD
+local IS_WORLD = {}
+for _, f in ipairs(WORLD) do IS_WORLD[f] = true end
 
 local function isDrive(name)
     if peripheral.hasType then
@@ -63,18 +65,19 @@ local function copy(src, dst)
     fs.copy(src, dst)
 end
 
--- Save this ship onto the floppy. Returns number of files, or nil + reason.
-function SD.save(slot, info)
+-- Save the world data onto the floppy. Returns number of files, or nil + reason.
+function SD.save(info)
     local mnt, why = SD.mount()
     if not mnt then return nil, why end
     local base = fs.combine(mnt, DIR)
     local list, size = {}, 0
-    for _, f in ipairs(files(slot)) do
+    for _, f in ipairs(WORLD) do
         if fs.exists(f) and not fs.isDir(f) then
             list[#list + 1] = f
             size = size + fs.getSize(f)
         end
     end
+    if #list == 0 then return nil, "NOTHING TO SAVE YET" end
     -- room on the floppy (what is already ours there gets replaced)
     local mine = 0
     if fs.exists(base) then
@@ -92,36 +95,44 @@ function SD.save(slot, info)
         fs.makeDir(base)
         for _, f in ipairs(list) do copy(f, fs.combine(base, f)) end
         U.saveTable(fs.combine(base, "manifest.lua"), {
-            slot = slot, ship = info and info.ship, os = info and info.os,
+            kind = "world", ship = info and info.ship, os = info and info.os,
             day = os.day and os.day() or 0, files = list,
         })
     end)
     if not ok then return nil, "SAVE FAILED: " .. tostring(err):upper():sub(1, 40) end
-    U.log("disk: saved %d files of ship %s (slot %s) to %s", #list, tostring(info and info.ship), slot, base)
+    U.log("disk: saved %d world files to %s", #list, base)
     return #list
 end
 
--- What is on the floppy (manifest table), or nil + reason.
+-- What is on the floppy: the manifest (its files cut down to the world
+-- files), its folder on the disk; or nil + reason.
 function SD.peek()
     local mnt, why = SD.mount()
     if not mnt then return nil, why end
-    local m = U.loadTable(fs.combine(mnt, DIR .. "/manifest.lua"))
-    if type(m) ~= "table" or type(m.files) ~= "table" or not m.slot then
-        return nil, "NO SHIP SAVED ON THIS DISK"
+    for _, dir in ipairs({ DIR, OLD_DIR }) do
+        local base = fs.combine(mnt, dir)
+        local m = U.loadTable(fs.combine(base, "manifest.lua"))
+        if type(m) == "table" and type(m.files) == "table" then
+            local list = {}
+            for _, f in ipairs(m.files) do
+                if IS_WORLD[f] then list[#list + 1] = f end
+            end
+            if #list > 0 then
+                m.files = list
+                return m, base
+            end
+        end
     end
-    return m, mnt
+    return nil, "NO WORLD DATA ON THIS DISK"
 end
 
--- Load the ship from the floppy over this computer's files. Returns the
--- manifest, or nil + reason. The caller restarts the OS afterwards.
+-- Load the world data from the floppy over this computer's files. Returns
+-- the manifest, or nil + reason. The caller restarts the OS afterwards.
 function SD.load()
-    local m, mnt = SD.peek()
-    if not m then return nil, mnt end
-    local base = fs.combine(mnt, DIR)
+    local m, base = SD.peek()
+    if not m then return nil, base end
     for _, f in ipairs(m.files) do
-        if type(f) ~= "string" or f:find("%.%.") or not fs.exists(fs.combine(base, f)) then
-            return nil, "DISK SAVE IS INCOMPLETE"
-        end
+        if not fs.exists(fs.combine(base, f)) then return nil, "DISK SAVE IS INCOMPLETE" end
     end
     local ok, err = pcall(function()
         if fs.exists(KEEP) then fs.delete(KEEP) end
@@ -131,8 +142,7 @@ function SD.load()
         end
     end)
     if not ok then return nil, "LOAD FAILED: " .. tostring(err):upper():sub(1, 40) end
-    U.log("disk: loaded %d files of ship %s (slot %s); replaced files kept in %s",
-        #m.files, tostring(m.ship), tostring(m.slot), KEEP)
+    U.log("disk: loaded %d world files from %s; replaced files kept in %s", #m.files, base, KEEP)
     return m
 end
 

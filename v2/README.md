@@ -1,8 +1,9 @@
 # ArtCorp Flight OS v2
 
-The ship's flight OS. It reads the ship's wiring from `config/<slot>.lua` +
-`config/assignments_<slot>.lua`, so a ship that was already set up needs
-nothing rewired.
+The Atlas's flight OS. It reads the ship's wiring from `config/atlas.lua`
+(relay roles and faces, from the repo) + `config/assignments_atlas.lua` (the
+network name each relay and the monitor got in this world), so a ship that
+was already set up needs nothing rewired.
 
 ## Running it
 
@@ -10,15 +11,21 @@ nothing rewired.
 ship boots straight into it: tap **START ENGINES** on the cockpit monitor.
 The keyboard computer works with it unchanged.
 
-On a computer with no wired ship yet (no slot in `config/`, or the chosen
-slot has no assignments file) the monitor shows a first-launch setup:
-**IMPORT FROM DISK** (a ship saved with SAVE DISK; the computer restarts on
-it) or **SET UP THIS SHIP**, which copies `config/atlas.lua` to a new slot
-and asks for each relay/monitor in turn from the ones on the network (TEST
-flips one of its faces for 2 s, DETECT watches for a typewriter key), then
-shows a short first-flight guide. The first time the normal screen comes up
-on the ground a tour explains its main controls; **?** in the top bar
-replays it.
+With no assignments file (or one made for another `version` of the config,
+or missing a role) the original OS's setup wizard (`v2/lib/wizard.lua`) runs
+on the ship computer's terminal before the OS starts: disconnect ALL modems
+from the computer, press a key, then plug in and right-click one device's
+modem at a time in a fixed order (input_1, input_2, aux_relay, engine_relay,
+output_FL, output_FR, output_RL, output_RR, output_REAR, main_monitor, then
+any optional ones the config lists, then an optional printer: S skips). Each
+new peripheral that attaches is that role; devices already connected, and
+modems on the computer itself, are ignored. It writes
+`config/assignments_atlas.lua` in the original format and the OS starts
+straight after. To run it again: hold Ctrl+T on the ship computer, then type
+`v2/wizard` (or delete the assignments file and reboot).
+
+The first time the normal screen comes up on the ground a tour explains its
+main controls; **?** in the top bar replays it.
 
 The ship computer is never needed in flight. If the OS stops on an error,
 the launcher shows the error on the monitor and restarts it 2 s later; if
@@ -31,7 +38,8 @@ v2 keeps its own state in `v2/data/`:
 | File | Contents |
 | --- | --- |
 | `waypoints.lua` | Waypoints. An older `config/wp_<slot>.lua` list is imported on first run; headings are converted to compass degrees. |
-| `learned.lua` | What the controller learned in flight. Saved at power-off. |
+| `learned.lua` | What the controller learned in flight (trims, hover thrust). Saved at power-off. |
+| `atmos.lua` | The air measured in flight (it belongs to this world/server). |
 | `slot` | Which ship config was used. |
 | `tour_done` | The tour was seen (or skipped): it is not shown again by itself. |
 | `tune_local.lua` | Optional overrides for anything in `v2/tune.lua`. |
@@ -65,7 +73,10 @@ Any stick or altitude input during an autopilot run cancels the run
 - **AUTO**: route progress (DEPART → CRUISE → STOP + ALIGN → LAND), distance,
   ETA, speed against target, altitude against goal, course error, cancel.
 - **SHIP**: hardware state, loop timing, disk, and everything learned in
-  flight, with a reset button.
+  flight. **SAVE DISK** / **LOAD DISK** copy the world data (waypoints,
+  `atmos.lua`, `learned.lua`) to / from a floppy in any disk drive; loading
+  restarts the OS on it. The wiring (config and assignments) never goes on
+  the disk. **RESET LEARNED VALUES** clears the trims.
 - **ALERT**: only what is active right now.
 - **CTRL**: TAKE OFF / AUTO-LAND, GEAR, MODE, E-STOP, AUTO BRAKE, RECORD, PRINT LOG,
   LAND + OFF, POWER OFF. In the air, POWER OFF needs a second tap.

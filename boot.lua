@@ -1,7 +1,9 @@
 -- ArtCorp Flight OS launcher. Installed as the ship computer's `startup`.
 --
 -- The ship computer sits in a server room the pilot cannot reach in
--- flight, so this never waits for terminal input. It starts the OS, and if
+-- flight, so this never waits for terminal input (only the one-time
+-- peripheral setup wizard does, on the ground, before the first start: see
+-- v2/lib/wizard.lua). It starts the OS, and if
 -- the OS ever stops on an error it shows the error on the cockpit monitor
 -- and starts it again 2 s later. If the ship is in the air at that point the
 -- OS takes control straight away (no splash, engines kept running). Ctrl+T on the ship computer
@@ -44,7 +46,7 @@ local last_err = nil
 while true do
     runs = runs + 1
     -- reload the OS fresh on every start (only its own modules)
-    for _, m in ipairs({ "main", "util", "config", "hw", "est", "atmos", "ctl", "flight", "ap", "shipdisk", "remote", "onboard",
+    for _, m in ipairs({ "main", "util", "config", "hw", "est", "atmos", "ctl", "flight", "ap", "shipdisk", "remote", "wizard",
         "nav", "link", "rec", "draw", "font", "ui", "version" }) do
         package.loaded[m] = nil
     end
