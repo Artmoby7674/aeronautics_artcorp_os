@@ -207,6 +207,28 @@ do
             role = { key = "main_monitor", label = "COCKPIT SCREEN", type = "monitor", test_label = "SHOW", desc = "X" } },
         guide = { screen = "guide", rev = 1, gi = 4, gn = 4, card = { title = "HOVER HANDS-OFF", text = string.rep("WORDS ", 40) } },
         busy = { screen = "busy", rev = 1, title = "SHIP LOADED", msg = "RESTARTING ON CARGO..." },
+        engines = { screen = "engines", rev = 1, msg = "NO OTHER RELAYS ON THE NETWORK" },
+        fire = { screen = "fire", rev = 1, phase = 1, firing = true, known_n = 5, known_total = 17,
+            cur = { relay = "redstone_relay_12", face = "bottom" }, hint = "WATCH THE SHIP: A 0.5 S FLIP.",
+            msg = string.rep("LONG MESSAGE ", 10), pv = {
+                { id = "FL", label = "FRONT-LEFT", sub = "PROP 2/3" }, { id = "FR", label = "FRONT-RIGHT", sub = "PROP 0/3" },
+                { id = "RL", label = "REAR-LEFT", sub = "DONE", done = true }, { id = "RR", label = "REAR-RIGHT", sub = "PROP 0/3" },
+                { id = "REAR", label = "REAR", sub = "THRUSTER 0/3" }, { id = "GEAR", label = "LANDING", sub = "GEAR" },
+                { id = "ENGINE", label = "ENGINE /", sub = "PROPS SPIN" }, { id = "NOTHING", label = "NOTHING", sub = "NO CHANGE" } } },
+        what = { screen = "fire", rev = 1, phase = 2, part = "FL", cur = { relay = "relay_3", face = "left" },
+            pv = { { id = "FL", label = "FRONT-LEFT", sub = "PROP 2/3" } },
+            choices = { { label = "TILTED", sub = "FORWARD", slot = "tilt_fwd" }, { label = "TILTED", sub = "BACK", slot = "tilt_bwd" },
+                { label = "CHANGED", sub = "SPEED", slot = "speed" } } },
+        review = { screen = "review", rev = 1, known_n = 16, known_total = 17, can_next = true, msg = "MISSING: X", rows = {
+            { label = "FRONT-LEFT", relay = "redstone_relay_12", faces = { { lbl = "F", face = "bottom", seen = false },
+                { lbl = "B", face = "bottom", seen = false }, { lbl = "S", face = "bottom", seen = false } } },
+            { label = "REAR THRUST", relay = "relay_7", faces = { { lbl = "FW", face = "front", seen = true },
+                { lbl = "BW", face = "back", seen = true }, { lbl = "REV", face = "top", seen = true } } },
+            { label = "GEAR", faces = { { lbl = "", face = "front", seen = false } } } } },
+        press = { screen = "press", rev = 1, pi = 2, pn = 5, press = { found = "left",
+            item = { label = "SCREEN DOWN BUTTON", desc = string.rep("PRESS IT ", 30), relay = "redstone_relay_12", tpl = "back" },
+            faces = { { face = "top", level = 0 }, { face = "bottom", level = 0 }, { face = "left", level = 15 },
+                { face = "right", level = 0 }, { face = "front", level = 7 }, { face = "back", level = 0 } } } },
     }
     local want = {
         welcome = { "ob:import", "ob:setup" },
@@ -214,6 +236,11 @@ do
         empty = { "ob:back", "ob:test" },
         guide = { "ob:gskip", "ob:gback", "ob:gnext" },
         busy = {},
+        engines = { "ob:engines", "ob:back" },
+        fire = { "ob:part:FL", "ob:part:NOTHING", "ob:part:ENGINE", "ob:again", "ob:back", "ob:review" },
+        what = { "ob:what:tilt_fwd", "ob:what:tilt_bwd", "ob:what:speed", "ob:parts", "ob:again" },
+        review = { "ob:back", "ob:more", "ob:next" },
+        press = { "ob:back", "ob:skip", "ob:next" },
     }
     for name, ob in pairs(screens) do
         SC.mon.errors = {}

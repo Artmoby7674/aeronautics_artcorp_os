@@ -165,6 +165,92 @@ function Config.writeAssignments(slot, assign, version)
     return writeFile("config/assignments_" .. slot .. ".lua", table.concat(out))
 end
 
+-- ------------------------------------------------------------ text patching
+-- The setup learns faces by watching the ship (onboard.lua) and writes them
+-- into the slot's copy of the template text, so the file keeps its layout
+-- and comments. An edit is { path, key, value }: path names nested table
+-- fields ({ "output_map", "FL" }), key is set to the string value (or nil).
+
+-- The index of the "}" closing the "{" at i (skips strings and comments).
+local function closeBrace(src, i)
+    local depth, n = 0, #src
+    while i <= n do
+        local c = src:sub(i, i)
+        if c == "-" and src:sub(i + 1, i + 1) == "-" then
+            i = (src:find("\n", i, true) or n)
+        elseif c == "\"" or c == "'" then
+            local j = i + 1
+            while j <= n and src:sub(j, j) ~= c do
+                if src:sub(j, j) == "\\" then j = j + 1 end
+                j = j + 1
+            end
+            i = j
+        elseif c == "{" then depth = depth + 1
+        elseif c == "}" then
+            depth = depth - 1
+            if depth == 0 then return i end
+        end
+        i = i + 1
+    end
+end
+
+-- The first "name = {" in src[s..e] -> the positions of its braces.
+local function findBlock(src, s, e, name)
+    local i = s
+    while true do
+        local a, b = src:find("[^%w_]" .. name .. "%s*=%s*{", i)
+        if not a or b > e then return nil end
+        local close = closeBrace(src, b)
+        if close and close <= e then return b, close end
+        i = b + 1
+    end
+end
+
+function Config.patch(src, edits)
+    for _, ed in ipairs(edits) do
+        local s, e = 1, #src
+        for _, name in ipairs(ed[1]) do
+            s, e = findBlock(src, s, e, name)
+            if not s then return nil, "NO " .. table.concat(ed[1], "."):upper() .. " IN THE TEMPLATE" end
+        end
+        local val = ed[3] == nil and "nil" or string.format("%q", ed[3])
+        local body = src:sub(s + 1, e - 1)
+        local a, b = body:find("[^%w_]" .. ed[2] .. "%s*=%s*[\"'][^\"'\n]*[\"']")
+        if not a then a, b = body:find("[^%w_]" .. ed[2] .. "%s*=%s*nil") end
+        if a then
+            local lhs = body:sub(a, b):match("^(.-=%s*)")
+            body = body:sub(1, a - 1) .. lhs .. val .. body:sub(b + 1)
+        elseif ed[3] ~= nil then
+            body = " " .. ed[2] .. " = " .. val .. "," .. body
+        end
+        src = src:sub(1, s) .. body .. src:sub(e)
+    end
+    -- the result must load and say what was asked
+    local fn, err = load(src, "=patch", "t", {})
+    if not fn then return nil, tostring(err) end
+    local ok, t = pcall(fn)
+    if not ok or type(t) ~= "table" then return nil, "PATCHED CONFIG DOES NOT LOAD" end
+    for _, ed in ipairs(edits) do
+        local node = t
+        for _, name in ipairs(ed[1]) do node = type(node) == "table" and node[name] or nil end
+        if type(node) ~= "table" or node[ed[2]] ~= ed[3] then
+            return nil, "PATCH MISSED " .. table.concat(ed[1], "."):upper() .. "." .. ed[2]:upper()
+        end
+    end
+    return src
+end
+
+-- Applies edits to config/<slot>.lua in place.
+function Config.patchSlot(slot, edits)
+    local path = "config/" .. slot .. ".lua"
+    local src = readFile(path)
+    if not src then return nil, "CAN'T READ " .. slot:upper() end
+    local out, err = Config.patch(src, edits)
+    if not out then return nil, err end
+    if not writeFile(path, out) then return nil, "DISK FULL?" end
+    return true
+end
+
 function Config.deleteSlot(slot)
     fs.delete("config/" .. slot .. ".lua")
     if fs.exists("config/assignments_" .. slot .. ".lua") then

@@ -89,39 +89,60 @@ snap("12_slots")
 lua.execute("""
 OB = require("onboard")
 function OBF(ob) SC.ui.screen = nil SC.ui:render({ ob = ob }) end
-RELAYS = { { name = "relay_1", used = true, tag = "USED: KEYS W A S D", tag_color = SC.D.C.dim },
-    { name = "relay_2", used = true, tag = "USED: KEYS Q E SPACE CTRL", tag_color = SC.D.C.dim },
-    { name = "relay_3" }, { name = "relay_4" }, { name = "relay_5" }, { name = "relay_6" },
-    { name = "relay_7" }, { name = "relay_aux" }, { name = "relay_eng" } }
 """)
 lua.execute('OBF({ screen = "welcome", rev = 1 })')
 snap("13_setup_welcome")
-lua.execute("""OBF({ screen = "role", rev = 1, idx = 3, total = 10, scroll = 3, sel = 8,
-    msg = "TESTING RELAY_AUX: WATCH THE LANDING GEAR", msg_color = SC.D.C.accent, cands = RELAYS,
-    role = { key = "aux_relay", label = "AUX RELAY", type = "redstone_relay", optional = true, test_label = "TEST",
-        desc = "MOVES THE LANDING GEAR, READS THE GROUND SENSOR AND THE SHIFT KEY." } })""")
-snap("14_setup_role")
-lua.execute("""OBF({ screen = "role", rev = 1, idx = 1, total = 10, scroll = 0, sel = 1,
-    msg = "FOUND IT: RELAY_1", msg_color = SC.D.C.good,
+lua.execute('OBF({ screen = "engines", rev = 1 })')
+snap("14_setup_engines")
+lua.execute("""OBF({ screen = "role", rev = 1, idx = 1, total = 2, scroll = 0, sel = 1, head = "SHIP SETUP: KEYS",
+    next_label = "NEXT >", msg = "FOUND IT: RELAY_1", msg_color = SC.D.C.good,
     cands = { { name = "relay_1", tag = "SIGNAL", tag_color = SC.D.C.good }, { name = "relay_2" }, { name = "relay_3" } },
     role = { key = "input_1", label = "KEYS W A S D", type = "redstone_relay", test_label = "DETECT", test_any = true,
         desc = "READS THE TYPEWRITER'S W, A, S AND D KEYS: FORWARD, BACK AND TURNING." } })""")
-snap("15_setup_role_detect")
-lua.execute("""OBF({ screen = "role", rev = 1, idx = 10, total = 10, scroll = 0, cands = {},
-    role = { key = "main_monitor", label = "COCKPIT SCREEN", type = "monitor", test_label = "SHOW",
-        desc = "THE TOUCHSCREEN THE PILOT USES: USUALLY THE ONE YOU ARE TAPPING NOW." } })""")
-snap("16_setup_role_none")
+snap("15_setup_keys_detect")
+lua.execute("""PV = {
+    { id = "FL", label = "FRONT-LEFT", sub = "PROP 2/3" }, { id = "FR", label = "FRONT-RIGHT", sub = "PROP 0/3" },
+    { id = "RL", label = "REAR-LEFT", sub = "DONE", done = true }, { id = "RR", label = "REAR-RIGHT", sub = "PROP 1/3" },
+    { id = "REAR", label = "REAR", sub = "THRUSTER 0/3" }, { id = "GEAR", label = "LANDING", sub = "DONE", done = true },
+    { id = "ENGINE", label = "ENGINE /", sub = "PROPS SPIN" }, { id = "NOTHING", label = "NOTHING", sub = "NO CHANGE" } }
+OBF({ screen = "fire", rev = 1, phase = 1, firing = false, known_n = 6, known_total = 17, pv = PV,
+    cur = { relay = "relay_5", face = "left" }, hint = "WATCH THE SHIP: A 0.5 S FLIP. PROPS TURNING = ENGINE.",
+    msg = "RELAY_3 FRONT = FRONT-LEFT PROP TILT FORWARD", msg_color = SC.D.C.good })""")
+snap("16_setup_fire")
+lua.execute("""OBF({ screen = "fire", rev = 1, phase = 2, firing = true, known_n = 11, known_total = 17, pv = PV, part = "FL",
+    cur = { relay = "relay_3", face = "left" }, hint = "SPIN TEST: CLUTCH IN, THIS FACE AT LOW SPEED FOR 2 S.",
+    choices = { { label = "TILTED", sub = "FORWARD", slot = "tilt_fwd" }, { label = "TILTED", sub = "BACK", slot = "tilt_bwd" },
+        { label = "CHANGED", sub = "SPEED", slot = "speed" } } })""")
+snap("17_setup_fire_what")
+lua.execute("""local function F(a, b, c, s) return { { lbl = "F", face = a, seen = true }, { lbl = "B", face = b, seen = true },
+    { lbl = "S", face = c, seen = s ~= false } } end
+OBF({ screen = "review", rev = 1, known_n = 16, known_total = 17, can_next = true, rows = {
+    { label = "FRONT-LEFT", relay = "relay_3", faces = F("front", "back", "left") },
+    { label = "FRONT-RIGHT", relay = "relay_4", faces = F("front", "back", "right") },
+    { label = "REAR-LEFT", relay = "relay_5", faces = F("front", "back", "left") },
+    { label = "REAR-RIGHT", relay = "relay_6", faces = F("front", "back", "right") },
+    { label = "REAR THRUST", relay = "relay_7", faces = { { lbl = "FW", face = "front", seen = true },
+        { lbl = "BW", face = "back", seen = true }, { lbl = "REV", face = "top", seen = false } } },
+    { label = "GEAR", relay = "relay_aux", faces = { { lbl = "", face = "front", seen = true } } },
+    { label = "CLUTCH", relay = "relay_eng", faces = { { lbl = "", face = "right", seen = true } } } } })""")
+snap("18_setup_found")
+lua.execute("""OBF({ screen = "press", rev = 1, pi = 1, pn = 5, msg = "FOUND IT: THE LEFT FACE", msg_color = SC.D.C.good,
+    press = { found = "left", item = { label = "ENGINE OFF BUTTON", relay = "relay_eng", tpl = "left",
+        desc = "PRESS THE ENGINE OFF BUTTON. THE STARTER IS WIRED TO THE SAME FACE, SO THIS FINDS IT TOO." },
+    faces = { { face = "top", level = 0 }, { face = "bottom", level = 0 }, { face = "left", level = 15 },
+        { face = "right", level = 0 }, { face = "front", level = 0 }, { face = "back", level = 0 } } } })""")
+snap("19_setup_buttons")
 lua.execute('OBF({ screen = "guide", rev = 1, gi = 1, gn = #OB.GUIDE, card = OB.GUIDE[1] })')
-snap("17_setup_guide_1")
+snap("20_setup_guide_1")
 lua.execute('OBF({ screen = "guide", rev = 1, gi = 4, gn = #OB.GUIDE, card = OB.GUIDE[4] })')
-snap("18_setup_guide_4")
+snap("21_setup_guide_4")
 lua.execute('OBF({ screen = "busy", rev = 1, title = "SHIP LOADED", msg = "RESTARTING ON CARGO...", msg_color = SC.D.C.good })')
-snap("19_setup_import")
+snap("22_setup_import")
 
 # the tour, every step, over the engines-off ship
 lua.execute('SC.ui.screen = nil SC.ui:setTab("fly") SC.ui:tourStart() TOUR_M = SC.base(W_PARK, { power = "off" })')
 n = int(lua.eval("#SC.ui.TOUR or #require('ui').TOUR"))
 for i in range(1, n + 1):
     lua.execute("SC.ui:render(TOUR_M)")
-    snap(f"{19 + i}_tour_{i:02d}")
+    snap(f"{22 + i}_tour_{i:02d}")
     lua.execute("SC.ui:tourNext()")

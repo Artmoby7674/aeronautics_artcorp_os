@@ -545,22 +545,257 @@ do
 end
 files["config/atlas.lua"] = atlas_src
 
--- 2. SET UP THIS SHIP: every role picked from the network (DETECT, TEST,
--- BACK and a used relay on the way), the guide, then the OS with the tour
+-- 2. SET UP THIS SHIP: engines, the keyboard relays (DETECT, a used relay,
+-- BACK, scrolling), then the computer fires every relay face and a "player"
+-- who only looks at the ship answers what moved; the buttons; the guide;
+-- then the OS with the tour.
+--
+-- The player: a fake ship computes what can be SEEN from the relay outputs
+-- and its true wiring (truth: a config table) on every write: prop tilts,
+-- props / rear turning (only with the clutch in; slow-down links, 0 = full),
+-- rear reverse while it turns, gear. It also keeps the safety numbers.
+local PROPS4 = { "FL", "FR", "RL", "RR" }
+local function shipModel(truth, R)
+    local function out(role, face)
+        if not face then return 0 end
+        local r = R(truth.peripherals[role])
+        return r and (r.out[face] or 0) or 0
+    end
+    return function()
+        local S = { tilt = {}, spin = {}, lift = 0 }
+        local e = truth.engine
+        S.clutch = out(e.relay_key, e.clutch_side) > 0
+        for _, p in ipairs(PROPS4) do
+            local m = truth.output_map[p]
+            local f, b = out(m.relay, m.tilt_fwd) > 0, out(m.relay, m.tilt_bwd) > 0
+            S.tilt[p] = f and 1 or (b and -1 or 0)
+            S.spin[p] = S.clutch and (15 - out(m.relay, m.speed)) or 0
+            S.lift = S.lift + S.spin[p]
+        end
+        local m = truth.output_map.REAR
+        S.rear = S.clutch and math.max(15 - out(m.relay, m.fw), 15 - out(m.relay, m.bw)) or 0
+        S.rev = out(m.relay, m.rev) > 0
+        S.gear = out(truth.gear_output.relay, truth.gear_output.side) > 0
+        return S
+    end
+end
+
+local function observer(Ob, stateFn)
+    local obs = { seen = {}, max_full = 0, max_lift_known = 0, max_lift = 0, writes = 0 }
+    function obs.update()
+        obs.writes = obs.writes + 1
+        local st = Ob._st
+        local S = stateFn()
+        local t = os.clock()
+        if st and st.fire_id ~= obs.id then obs.id, obs.S0, obs.seen = st.fire_id, obs.last or S, {} end
+        local S0, sn = obs.S0 or S, obs.seen
+        for p, v in pairs(S.tilt) do if v ~= S0.tilt[p] and v ~= 0 then sn.tilt = sn.tilt or {} sn.tilt[p] = v end end
+        for p, v in pairs(S.spin) do if v ~= S0.spin[p] then sn.spin = sn.spin or {} sn.spin[p] = true end end
+        if S.gear ~= S0.gear then sn.gear = true end
+        if S.rear ~= S0.rear then
+            sn.rear = true
+            if S.rear > 0 then sn.rear_dir = S.rev and "bw" or "fw" end
+        end
+        if obs.last and S.rear > 0 and obs.last.rear > 0 and S.rev ~= obs.last.rev then sn.rev = true end
+        if S.clutch and not S0.clutch then sn.clutch_in = true end
+        obs.max_lift = math.max(obs.max_lift, S.lift)
+        local k = Ob._know and Ob._know()
+        obs.clutch_known = k ~= nil and k.face.ENGINE ~= nil -- (an undone clutch answer is unknown again)
+        if obs.clutch_known then obs.max_lift_known = math.max(obs.max_lift_known, S.lift) end
+        if S.lift >= 24 then obs.full_t = obs.full_t or t
+        elseif obs.full_t then obs.max_full = math.max(obs.max_full, t - obs.full_t) obs.full_t = nil end
+        obs.last = S
+    end
+    -- what a player watching the ship would tap
+    function obs.answer(stage)
+        if obs.id ~= Ob._st.fire_id then return "NOTHING" end
+        local sn = obs.seen
+        if stage <= 1 then
+            if sn.clutch_in and (sn.spin or sn.rear) then return "ENGINE" end
+            for _, p in ipairs(PROPS4) do
+                local v = sn.tilt and sn.tilt[p]
+                if v then return p, v > 0 and "tilt_fwd" or "tilt_bwd" end
+            end
+            if sn.gear then return "GEAR" end
+        elseif stage == 2 then
+            for _, p in ipairs(PROPS4) do if sn.spin and sn.spin[p] then return p, "speed" end end
+            if sn.rear then return "REAR", sn.rear_dir or "fw" end
+        elseif sn.rev then
+            return "REAR", "rev"
+        end
+        return "NOTHING"
+    end
+    function obs.watch(r)
+        if r._watched then return end
+        local f = r.setAnalogOutput
+        r.setAnalogOutput = function(side, v) f(side, v) obs.update() end
+        r._watched = true
+        obs.last = stateFn() -- what the ship looks like before the first write
+    end
+    return obs
+end
+
+-- one step per driver tick: each returns done (move on), event
+local function Seq(list)
+    local i = 1
+    return function()
+        local f = list[i]
+        if not f then return nil end
+        local done, ev = f()
+        if done then i = i + 1 end
+        return ev
+    end
+end
+local function once(fn) return function() return true, fn() end end
+local function sleepFor(s)
+    local t
+    return function()
+        t = t or sim.t
+        if sim.t - t >= s - 1e-6 then t = nil return true end
+        return false
+    end
+end
+
+local function players(Ob, truth, R, tapUI, obs, o)
+    local P = {}
+    function P.screen(name) return function() return Ob._st.screen == name end end
+    -- keyboard relays: press one of the role's keys, DETECT, NEXT
+    function P.keys()
+        local held
+        return function()
+            local st = Ob._st
+            if st.screen ~= "role" then
+                if held then held.r.inp[held.f] = 0 held = nil end
+                return true
+            end
+            local want = truth.peripherals[st.role.key]
+            local c = st.sel and st.cands[st.sel]
+            if c and c.name == want then
+                if held then held.r.inp[held.f] = 0 held = nil end
+                return false, tapUI("ob:next")
+            end
+            if not st.detect then
+                if held then held.r.inp[held.f] = 0 held = nil end
+                return false, tapUI("ob:test")
+            end
+            if not held then -- a press after DETECT starts listening
+                local r = R(want)
+                held = { r = r, f = st.role.faces[1] }
+                r.inp[held.f] = 15
+            end
+            return false
+        end
+    end
+    -- the firing: watch, then tap the part (and what it did)
+    function P.fire()
+        local pending
+        return function()
+            local st = Ob._st
+            if st.screen ~= "fire" then return true end
+            if pending then
+                local s = pending
+                pending = nil
+                return false, tapUI("ob:what:" .. s)
+            end
+            if o.undo_done and o.undo_ok == nil then
+                o.undo_ok = #st.answers == 2 and st.cur.relay == o.undo_last.relay and st.cur.face == o.undo_last.face
+            end
+            if st.firing then return false end
+            local pid, slot = obs.answer(st.phase)
+            if o.again and not o.again_key and pid ~= "NOTHING" then
+                o.again_key = st.cur.relay .. ":" .. st.cur.face
+                o.again_before = st.fires[o.again_key]
+                return false, tapUI("ob:again")
+            end
+            if o.again_key and o.again_after == nil then o.again_after = st.fires[o.again_key] end
+            if o.undo and not o.undo_done and #st.answers == 3 then
+                o.undo_done, o.undo_last = true, st.answers[3]
+                return false, tapUI("ob:back")
+            end
+            o.answers = (o.answers or 0) + 1
+            if pid == "NOTHING" then o.nothing = (o.nothing or 0) + 1 end
+            pending = slot
+            return false, tapUI("ob:part:" .. pid)
+        end
+    end
+    -- buttons: press the true face; the ground sensor reads by itself
+    function P.press()
+        local held
+        local function release() if held then held.r.inp[held.f] = 0 held = nil end end
+        return function()
+            local st = Ob._st
+            if st.screen ~= "press" then release() return true end
+            local it = st.pitems[st.pi]
+            if held and held.id ~= it.id then release() return false end
+            if st.press.found then
+                o.pressed = (o.pressed or "") .. it.key .. "=" .. st.press.found .. " "
+                release()
+                return false, tapUI("ob:next")
+            end
+            if not it.auto and not held then
+                local r = R(truth.peripherals[it.role])
+                held = { r = r, f = truth.input_map[it.role][it.key], id = it.id }
+                r.inp[held.f] = 15
+            end
+            return false
+        end
+    end
+    return P
+end
+
+-- the faces a written slot ended up with, against the truth
+local function sameWiring(ship, truth)
+    local bad = {}
+    for _, p in ipairs(PROPS4) do
+        for _, k in ipairs({ "tilt_fwd", "tilt_bwd", "speed" }) do
+            if ship.output_map[p][k] ~= truth.output_map[p][k] then bad[#bad + 1] = p .. "." .. k end
+        end
+    end
+    local a, b = ship.output_map.REAR, truth.output_map.REAR
+    local set = { [a.fw or "?"] = true, [a.bw or "?"] = true }
+    if not (set[b.fw] and set[b.bw]) then bad[#bad + 1] = "REAR.fw/bw" end -- both speed links: either way round
+    if a.rev ~= b.rev then bad[#bad + 1] = "REAR.rev" end
+    if ship.gear_output.side ~= truth.gear_output.side then bad[#bad + 1] = "gear" end
+    if ship.engine.clutch_side ~= truth.engine.clutch_side then bad[#bad + 1] = "clutch" end
+    if ship.engine.start_side ~= truth.engine.start_side then bad[#bad + 1] = "starter" end
+    if ship.proximity.side ~= truth.proximity.side then bad[#bad + 1] = "proximity" end
+    for _, role in ipairs({ "engine_relay", "aux_relay" }) do
+        for k, f in pairs(truth.input_map[role]) do
+            if ship.input_map[role][k] ~= f then bad[#bad + 1] = role .. "." .. k end
+        end
+    end
+    return #bad == 0, table.concat(bad, " ")
+end
+
+local function deepCopy(t)
+    if type(t) ~= "table" then return t end
+    local o = {}
+    for k, v in pairs(t) do o[k] = deepCopy(v) end
+    return o
+end
+
+local function tapper(UIo, monName)
+    return function(action)
+        local u = UIo._last or {}
+        for _, h in ipairs(u.tour and u.tour.hits or u.hits or {}) do -- the tour's own buttons while it is up
+            if h.action == action then
+                local ev = touchCell(h.x + 5, h.y + 5)
+                ev[2] = monName or ev[2]
+                return ev
+            end
+        end
+        states.ob_missing = (states.ob_missing or "") .. action .. " "
+    end
+end
+
 fresh()
 do
     local UIo = hooked()
     local Ob = require("onboard")
-    local function tapUI(action)
-        local u = UIo._last or {}
-        for _, h in ipairs(u.tour and u.tour.hits or u.hits or {}) do -- the tour's own buttons while it is up
-            if h.action == action then return touchCell(h.x + 5, h.y + 5) end
-        end
-        states.ob_missing = (states.ob_missing or "") .. action .. " "
-    end
-    local function tap(action) return function() return tapUI(action) end end
+    local tapUI = tapper(UIo)
+    local function tap(action) return once(function() return tapUI(action) end) end
     local function pick(name)
-        return function()
+        return once(function()
             local st = Ob._st
             for i, c in ipairs(st.cands or {}) do
                 if c.name == name then
@@ -569,97 +804,145 @@ do
                 end
             end
             states.ob_missing = (states.ob_missing or "") .. name .. " "
-        end
+        end)
     end
     local function selName()
         local st = Ob._st
         local c = st.sel and st.cands[st.sel]
         return c and c.name
     end
+    -- the simulator's relays ARE the ship: the clutch couples the props
+    local R = function(n) return sim:relay(n) end
+    local obs = observer(Ob, shipModel(cfg, R))
+    for _, n in ipairs(NET) do if n ~= cfg.peripherals.main_monitor then obs.watch(sim:relay(n)) end end
+    local ec = cfg.engine
+    local rawOut = sim.readOutputs
+    sim.readOutputs = function(s)
+        local o = rawOut(s)
+        if (sim:relay(cfg.peripherals[ec.relay_key]).out[ec.clutch_side] or 0) <= 0 then
+            for _, p in ipairs(PROPS4) do o[p] = 0 end
+            o.rear = 0
+        end
+        return o
+    end
+    local o = { again = true }
+    local P = players(Ob, cfg, R, tapUI, obs, o)
     local saved_reboot = os.reboot
     os.reboot = function() states.ob_rebooted = true end
     mon.errors = {}
     timers, script, si = {}, {}, 1
     t0 = sim.t
-    local t = t0 + 0.5
-    local function nxt(dt) t = t + (dt or 0.5) return t end
-    at(t, tap("ob:setup"))
-    at(nxt(), function()
-        states.role1 = Ob._st.role and Ob._st.role.key
-        sim:press("W", true)
-        return tapUI("ob:test") -- DETECT
-    end)
-    at(nxt(0.8), function() sim:press("W", false) states.detected = selName() end)
-    at(nxt(), tap("ob:next"))
-    at(nxt(), pick(cfg.peripherals.input_1)) -- already input_1's
-    at(nxt(), function() states.used_sel = selName() end)
-    at(nxt(), tap("ob:back"))
-    at(nxt(), function() states.back_role, states.back_sel = Ob._st.role.key, selName() end)
-    at(nxt(), tap("ob:next"))
-    local order = { "input_2", "aux_relay", "engine_relay", "output_FL", "output_FR", "output_RL", "output_RR", "output_REAR" }
-    for _, key in ipairs(order) do
-        at(nxt(), function() states.roles = (states.roles or "") .. Ob._st.role.key .. " " end)
-        if key == "output_REAR" then
-            at(nxt(), tap("ob:down"))
-            at(nxt(0.3), function() states.scrolled = Ob._st.scroll end)
-        end
-        at(nxt(), pick(cfg.peripherals[key]))
-        if key == "output_FL" then
-            local face = cfg.output_map.FL.tilt_fwd
-            at(nxt(), tap("ob:test"))
-            at(nxt(0.5), function() states.test_on = sim:relay(cfg.peripherals.output_FL).out[face] end)
-            at(nxt(2.5), function() states.test_off = sim:relay(cfg.peripherals.output_FL).out[face] end)
-        end
-        at(nxt(), tap("ob:next"))
+    local y0 = sim.pos.y
+    local drive = Seq({
+        tap("ob:setup"),
+        P.screen("engines"),
+        once(function() states.ob_engines = Ob._st.screen return tapUI("ob:engines") end),
+        P.screen("role"),
+        once(function()
+            states.role1 = Ob._st.role and Ob._st.role.key
+            return tapUI("ob:test") -- DETECT
+        end),
+        sleepFor(0.3),
+        once(function() sim:press("W", true) end),
+        sleepFor(0.8),
+        once(function() sim:press("W", false) states.detected = selName() end),
+        tap("ob:next"),
+        pick(cfg.peripherals.input_1), -- already input_1's
+        once(function() states.used_sel = selName() end),
+        tap("ob:back"),
+        once(function() states.back_role, states.back_sel = Ob._st.role.key, selName() end),
+        tap("ob:next"),
+        tap("ob:down"),
+        sleepFor(0.3),
+        once(function() states.scrolled = Ob._st.scroll end),
+        pick(cfg.peripherals.input_2),
+        tap("ob:next"),
+        P.screen("fire"),
+        once(function() states.fire_first = Ob._st.cur and Ob._st.cur.relay end),
+        P.fire(),
+        once(function()
+            local st = Ob._st
+            states.review, states.can_next = st.screen, st.can_next
+            states.known_n, states.known_total = st.known_n, st.known_total
+            states.unseen = ""
+            for _, r in ipairs(st.rows or {}) do
+                for _, f in ipairs(r.faces) do if not f.seen then states.unseen = states.unseen .. r.label .. "." .. f.lbl .. " " end end
+            end
+            states.before_finish = files["config/assignments_ship.lua"]
+            states.relays_rest = sim:relay(cfg.peripherals[ec.relay_key]).out[ec.clutch_side]
+            return tapUI("ob:next")
+        end),
+        P.press(),
+        P.screen("guide"),
+        once(function() states.guide = Ob._st.screen return tapUI("ob:gnext") end),
+        tap("ob:gnext"), tap("ob:gnext"),
+        once(function() states.guide_last = Ob._st.gi return tapUI("ob:gnext") end), -- LET'S FLY
+        -- the OS proper: engines off, so the tour comes up at once
+        sleepFor(1.5),
+        once(function()
+            local u = UIo._last
+            states.tour_i = u.tour and u.tour.i
+            states.tour_hits = u.tour and #u.tour.hits
+            return touchCell(Dref.W / 2, 128) -- START, under the tour
+        end),
+        sleepFor(1.5),
+        once(function()
+            states.tour_start_blocked = (sim:relay(cfg.peripherals[ec.relay_key]).out[ec.start_side] or 0) == 0
+            return tapUI("tour:next")
+        end),
+        sleepFor(0.5),
+        once(function() states.tour_i2 = UIo._last.tour and UIo._last.tour.i return tapUI("tour:next") end),
+        sleepFor(0.5),
+        once(function() states.tour_i3 = UIo._last.tour and UIo._last.tour.i return tapUI("tour:skip") end),
+        sleepFor(0.5),
+        once(function()
+            states.tour_after_skip = UIo._last.tour
+            states.tour_flag = files["v2/data/tour_done"]
+            return touchCell(Dref.W / 2, 128) -- START, now for real
+        end),
+        sleepFor(1.5),
+        once(function()
+            states.started_after_tour = sim:relay(cfg.peripherals[ec.relay_key]).out[ec.start_side]
+            return { "terminate" }
+        end),
+    })
+    local hmax = 0
+    for k = 1, 4000 do
+        at(t0 + k * 0.25, function()
+            if Ob._st and Ob._st.screen ~= "guide" and states.guide == nil then hmax = math.max(hmax, sim.pos.y - y0) end
+            return drive()
+        end)
     end
-    at(nxt(), function()
-        states.last_role, states.mon_sel = Ob._st.role.key, selName()
-        states.before_finish = files["config/assignments_ship.lua"]
-        return tapUI("ob:next") -- FINISH
-    end)
-    at(nxt(), function() states.guide = Ob._st.screen end)
-    for _ = 1, 3 do at(nxt(), tap("ob:gnext")) end
-    at(nxt(), function() states.guide_last = Ob._st.gi return tapUI("ob:gnext") end) -- LET'S FLY
-    -- the OS proper: engines off, so the tour comes up at once
-    at(nxt(1.5), function()
-        local u = UIo._last
-        states.tour_i = u.tour and u.tour.i
-        states.tour_hits = u.tour and #u.tour.hits
-        return touchCell(Dref.W / 2, 128) -- START, under the tour
-    end)
-    at(nxt(1.5), function()
-        local e = cfg.engine
-        states.tour_start_blocked = (sim:relay(cfg.peripherals[e.relay_key]).out[e.start_side] or 0) == 0
-        return tapUI("tour:next")
-    end)
-    at(nxt(), function() states.tour_i2 = UIo._last.tour and UIo._last.tour.i return tapUI("tour:next") end)
-    at(nxt(), function() states.tour_i3 = UIo._last.tour and UIo._last.tour.i return tapUI("tour:skip") end)
-    at(nxt(), function()
-        states.tour_after_skip = UIo._last.tour
-        states.tour_flag = files["v2/data/tour_done"]
-        return touchCell(Dref.W / 2, 128) -- START, now for real
-    end)
-    at(nxt(1.5), function()
-        local e = cfg.engine
-        states.started_after_tour = sim:relay(cfg.peripherals[e.relay_key]).out[e.start_side]
-        return { "terminate" }
-    end)
+    at(t0 + 1000.5, function() states.ob_timeout = true return { "terminate" } end)
     local okS, resS = runMain()
     os.reboot = saved_reboot
+    sim.readOutputs = rawOut
+    print(string.format("setup firing: %d answers (%d NOTHING), longest full lift %.2f s, max lift once clutch known %d, rose %.2f m",
+        o.answers or 0, o.nothing or 0, obs.max_full, obs.max_lift_known, hmax))
     check("setup: ran", okS, resS)
     check("setup: every button found", states.ob_missing == nil, states.ob_missing)
-    check("setup: first role from the template", states.role1 == "input_1", states.role1)
+    check("setup: engines first", states.ob_engines == "engines", states.ob_engines)
+    check("setup: then the first keyboard relay", states.role1 == "input_1", states.role1)
     check("setup: DETECT picks the relay that sees the key", states.detected == cfg.peripherals.input_1, states.detected)
     check("setup: a relay can't take two roles", states.used_sel == nil and saidIt("IS ALREADY"), states.used_sel)
     check("setup: BACK keeps the earlier pick", states.back_role == "input_1" and states.back_sel == cfg.peripherals.input_1,
         tostring(states.back_role) .. "/" .. tostring(states.back_sel))
-    check("setup: roles in wiring order", states.roles == table.concat(order, " ") .. " ", states.roles)
     check("setup: list scrolls", states.scrolled == 1, states.scrolled)
-    check("setup: TEST flips the face", states.test_on == 15, states.test_on)
-    check("setup: TEST puts it back", (states.test_off or 0) == 0, states.test_off)
-    check("setup: cockpit monitor preselected", states.last_role == "main_monitor" and states.mon_sel == cfg.peripherals.main_monitor,
-        tostring(states.last_role) .. "/" .. tostring(states.mon_sel))
-    check("setup: nothing written before FINISH", states.before_finish == nil and states.ob_rebooted == nil)
+    check("setup: firing never touches the keyboard relays",
+        next(sim:relay(cfg.peripherals.input_1).out) == nil and next(sim:relay(cfg.peripherals.input_2).out) == nil)
+    check("fire: every part and face found", states.review == "review" and states.can_next
+        and states.known_n == states.known_total and states.known_total == 17,
+        tostring(states.known_n) .. "/" .. tostring(states.known_total) .. " unseen " .. tostring(states.unseen))
+    check("fire: FIRE AGAIN fires the same face again", o.again_before == 1 and o.again_after == 2,
+        tostring(o.again_before) .. "->" .. tostring(o.again_after))
+    check("fire: NOTHING answered for faces that move nothing", (o.nothing or 0) > 0, o.nothing)
+    check("fire: clutch left out after the firing", (states.relays_rest or 0) == 0, states.relays_rest)
+    check("safety: full lift only in blind pulses", obs.max_full <= Ob.PULSE_BLIND + 0.06, obs.max_full)
+    check("safety: once the clutch is known, at most one slow prop", obs.max_lift_known <= 15 - Ob.SPIN, obs.max_lift_known)
+    check("safety: the ship stayed on the ground", hmax < 1.5, string.format("rose %.2f", hmax))
+    check("buttons: each found on its face", o.pressed and o.pressed:find("OFF=left", 1, true) and o.pressed:find("PROX=right", 1, true),
+        o.pressed)
+    check("setup: nothing written before the end", states.before_finish == nil and states.ob_rebooted == nil)
     local A = files["config/assignments_ship.lua"] and load(files["config/assignments_ship.lua"])()
     local okA = A ~= nil
     for key, name in pairs(cfg.peripherals) do
@@ -668,10 +951,14 @@ do
     check("setup: assignments file has every role", okA, files["config/assignments_ship.lua"])
     check("setup: assignments tagged with the config version", A and A.config_version == "1.2", A and A.config_version)
     check("setup: new slot from the template", (files["config/ship.lua"] or ""):find("name = \"SHIP\"", 1, true) ~= nil)
+    check("setup: comments kept", (files["config/ship.lua"] or ""):find("Slow-down link", 1, true) ~= nil)
     check("setup: slot remembered", files["v2/data/slot"] == "ship", files["v2/data/slot"])
     local Cf = require("config")
     local lc, lerr = Cf.load("v2")
     check("setup: Config.load accepts it", lc and lc.slot == "ship" and lc.ship.peripherals.output_FL == cfg.peripherals.output_FL, lerr)
+    local same, diff = false, "no config"
+    if lc then same, diff = sameWiring(lc.ship, cfg) end
+    check("setup: faces seen = the template's (template-wired ship)", same, diff)
     check("setup: guide follows", states.guide == "guide" and states.guide_last == #Ob.GUIDE, tostring(states.guide))
     check("tour: comes up after setup", states.tour_i == 1, states.tour_i)
     check("tour: only NEXT and SKIP take taps", states.tour_hits == 2, states.tour_hits)
@@ -683,6 +970,120 @@ do
     check("tour: the screen works again after it", states.started_after_tour == 15, states.started_after_tour)
     check("setup: no draw errors", #mon.errors == 0, mon.errors[1])
     check("setup: no screen errors (setup, tour)", not saidIt("[UI]") and not saidIt("[ERROR]") and not saidIt("[ACTION]"))
+end
+
+-- 2b. A ship wired NOTHING like the template: other relay names, every
+-- prop / rear / gear / clutch / button on other faces, the gear already
+-- down, a spare relay. The setup must learn all of it from the answers
+-- (with an undo on the way) and write a config that loads and matches.
+fresh()
+for p in pairs(files) do
+    if p:match("^config/") and p ~= "config/atlas.lua" and p ~= "config/wp_atlas.lua" then files[p] = nil end
+end
+files["v2/data/slot"], files["v2/data/tour_done"] = nil, nil
+do
+    local truth = deepCopy(cfg)
+    truth.peripherals = { input_1 = "redstone_relay_4", input_2 = "redstone_relay_9", aux_relay = "redstone_relay_1",
+        engine_relay = "redstone_relay_7", output_FL = "redstone_relay_2", output_FR = "redstone_relay_8",
+        output_RL = "redstone_relay_0", output_RR = "redstone_relay_5", output_REAR = "redstone_relay_3",
+        main_monitor = "monitor_3" }
+    local om = truth.output_map
+    om.FL.tilt_fwd, om.FL.tilt_bwd, om.FL.speed = "left", "right", "top"
+    om.FR.tilt_fwd, om.FR.tilt_bwd, om.FR.speed = "back", "front", "bottom"
+    om.RL.tilt_fwd, om.RL.tilt_bwd, om.RL.speed = "top", "bottom", "front"
+    om.RR.tilt_fwd, om.RR.tilt_bwd, om.RR.speed = "right", "left", "back"
+    om.REAR.fw, om.REAR.bw, om.REAR.rev = "left", "right", "bottom"
+    truth.gear_output.side = "back"
+    truth.engine.clutch_side, truth.engine.start_side = "front", "back"
+    truth.input_map.engine_relay = { UP = "top", DOWN = "bottom", OFF = "back" }
+    truth.input_map.aux_relay = { SHIFT = "top", PROX = "left" }
+    truth.proximity.side = "left"
+    local relays = {}
+    local function R(n)
+        if not relays[n] then
+            local r = { out = {}, inp = {} }
+            function r.setAnalogOutput(side, v) r.out[side] = v end
+            function r.getAnalogOutput(side) return r.out[side] or 0 end
+            function r.getAnalogInput(side) return r.inp[side] or 0 end
+            relays[n] = r
+        end
+        return relays[n]
+    end
+    local net = { "redstone_relay_6", "monitor_3" }
+    for k, n in pairs(truth.peripherals) do if k ~= "main_monitor" then net[#net + 1] = n end end
+    peripheral.getNames = function() return net end
+    peripheral.getType = function(n) return n == "monitor_3" and "monitor" or "redstone_relay" end
+    peripheral.wrap = function(n) if n == "monitor_3" then return mon end return R(n) end
+    R(truth.peripherals.aux_relay).out.back = 15 -- the gear is down already
+    R(truth.peripherals.aux_relay).inp.left = 15 -- landed: the ground sensor reads 15
+
+    local UIo = hooked()
+    local Ob = require("onboard")
+    local tapUI = tapper(UIo, "monitor_3")
+    local obs = observer(Ob, shipModel(truth, R))
+    for _, n in ipairs(net) do if n ~= "monitor_3" then obs.watch(R(n)) end end
+    local o = { undo = true }
+    local P = players(Ob, truth, R, tapUI, obs, o)
+    states.ob_missing = nil
+    mon.errors = {}
+    timers, script, si = {}, {}, 1
+    t0 = sim.t
+    local drive = Seq({
+        once(function() return tapUI("ob:setup") end),
+        P.screen("engines"),
+        once(function() return tapUI("ob:engines") end),
+        P.screen("role"),
+        P.keys(),
+        P.screen("fire"),
+        P.fire(),
+        once(function()
+            local st = Ob._st
+            states.w_review, states.w_can = st.screen, st.can_next
+            states.w_known = (st.known_n or 0) .. "/" .. (st.known_total or 0)
+            return tapUI("ob:next")
+        end),
+        P.press(),
+        P.screen("guide"),
+        once(function() states.w_guide = true return { "terminate" } end),
+    })
+    for k = 1, 4000 do at(t0 + k * 0.25, drive) end
+    at(t0 + 1000.5, function() states.w_timeout = true return { "terminate" } end)
+    local okW, resW = runMain()
+    print(string.format("rewired firing: %d answers (%d NOTHING), longest full lift %.2f s, max lift once clutch known %d",
+        o.answers or 0, o.nothing or 0, obs.max_full, obs.max_lift_known))
+    check("rewired: ran", okW, resW)
+    check("rewired: every button found", states.ob_missing == nil, states.ob_missing)
+    check("rewired: every part and face found", states.w_review == "review" and states.w_can and states.w_known == "17/17",
+        tostring(states.w_known))
+    check("rewired: BACK undoes the last answer and fires that face again", o.undo_ok == true, tostring(o.undo_ok))
+    check("rewired: NOTHING answered for the spare relay and unused faces", (o.nothing or 0) >= 6, o.nothing)
+    check("rewired: safety, full lift only in blind pulses", obs.max_full <= Ob.PULSE_BLIND + 0.06, obs.max_full)
+    check("rewired: safety, once the clutch is known at most one slow prop", obs.max_lift_known <= 15 - Ob.SPIN,
+        obs.max_lift_known)
+    check("rewired: reached the guide", states.w_guide == true)
+    local A = files["config/assignments_ship.lua"] and load(files["config/assignments_ship.lua"])()
+    local okA = A ~= nil
+    for key, name in pairs(truth.peripherals) do if not A or A[key] ~= name then okA = false end end
+    check("rewired: assignments name the true relays", okA, files["config/assignments_ship.lua"])
+    local Cf = require("config")
+    local lc, lerr = Cf.load("v2")
+    check("rewired: written config loads", lc ~= nil and lc.slot == "ship", lerr)
+    local same, diff = false, "no config"
+    if lc then same, diff = sameWiring(lc.ship, truth) end
+    check("rewired: config has the faces the ship showed", same, diff)
+    check("rewired: everything put back (clutch out, gear as it was)",
+        (R(truth.peripherals.engine_relay).out.front or 0) == 0 and R(truth.peripherals.aux_relay).out.back == 15)
+    check("rewired: no draw errors", #mon.errors == 0, mon.errors[1])
+    check("rewired: no screen errors", not saidIt("[UI]") and not saidIt("ERROR"))
+end
+peripheral.wrap = function(name)
+    if name == cfg.peripherals.main_monitor then return mon end
+    return sim:relay(name)
+end
+peripheral.getNames = function() return NET end
+peripheral.getType = function(n)
+    if n == cfg.peripherals.main_monitor then return "monitor" end
+    return "redstone_relay"
 end
 
 -- 3. IMPORT FROM DISK: two taps, ShipDisk.load, restart; no setup, no guide

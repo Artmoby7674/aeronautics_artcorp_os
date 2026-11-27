@@ -1013,7 +1013,7 @@ function UI:obWelcome(ob)
     D.text(W / 2, 74, "HOW DO YOU WANT TO START?", C.text, C.bg, 1, "c")
     local bw = math.floor((W - 18) / 2)
     self:button(6, 94, bw, 50, "IMPORT FROM DISK", "ob:import", "normal", "A SHIP SAVED ON A FLOPPY")
-    self:button(12 + bw, 94, bw, 50, "SET UP THIS SHIP", "ob:setup", "primary", "PICK EACH RELAY")
+    self:button(12 + bw, 94, bw, 50, "SET UP THIS SHIP", "ob:setup", "primary", "THE SHIP SHOWS ITS WIRING")
     D.text(6 + bw / 2, 150, "SKIPS THE SETUP", C.dim, C.bg, 1, "c")
     D.text(12 + bw + bw / 2, 150, "THEN A FIRST-FLIGHT GUIDE", C.dim, C.bg, 1, "c")
     if ob.msg then D.slot(6, H - 30, W - 12, ob.msg, ob.msg_color or C.accent, C.bg, 1, "c") end
@@ -1024,7 +1024,7 @@ local OB_ROW, OB_ROWS = 14, 6
 function UI:obRole(ob)
     local W, H = D.W, D.H
     local role = ob.role
-    obHeader("SHIP SETUP: WIRING", string.format("%d/%d", ob.idx, ob.total), ob.idx / ob.total)
+    obHeader(ob.head or "SHIP SETUP: WIRING", string.format("%d/%d", ob.idx, ob.total), ob.idx / ob.total)
     D.text(6, TOP + 6, role.label, C.white, C.bg, 2)
     for i, l in ipairs(wrap(role.desc, maxChars(W - 12))) do
         if i > 2 then break end
@@ -1067,8 +1067,134 @@ function UI:obRole(ob)
         (#cands == 0 or (role.test_label and (picked or role.test_any))) and "normal" or "off")
     self:button(6 + (bw + 4) * 2, by, bw, 22, "SKIP", role.optional and "ob:skip" or nil, role.optional and "normal" or "off",
         role.optional and "NOT FITTED" or nil)
-    self:button(6 + (bw + 4) * 3, by, lw - (bw + 4) * 3, 22, ob.idx == ob.total and "FINISH" or "NEXT >", "ob:next",
+    self:button(6 + (bw + 4) * 3, by, lw - (bw + 4) * 3, 22, ob.idx == ob.total and (ob.next_label or "FINISH") or "NEXT >", "ob:next",
         picked and "primary" or "off")
+end
+
+-- SET UP step 1: the steam engine is started by hand.
+function UI:obEngines(ob)
+    local W, H = D.W, D.H
+    obHeader("SHIP SETUP: ENGINES", nil, 0.05)
+    D.text(W / 2, TOP + 10, "START THE ENGINES", C.white, C.bg, 2, "c")
+    local lines = {
+        "1. KEEP THE SHIP LANDED. NOBODY NEAR THE PROPS.",
+        "2. OPEN THE STEAM ENGINE'S WATER INPUT VALVE",
+        "   AND LIGHT IT, BY HAND.",
+        "3. THEN THE COMPUTER FIRES EACH RELAY IN TURN",
+        "   AND ASKS YOU WHAT MOVED.",
+    }
+    for i, l in ipairs(lines) do D.slot(10, TOP + 32 + (i - 1) * 11, W - 20, l, C.text, C.bg) end
+    D.slot(10, TOP + 92, W - 20, "THE PROPS ONLY EVER TURN SLOWLY OR FOR A BLINK.", C.dim, C.bg)
+    self:button(6, TOP + 106, W - 12, 44, "ENGINES RUNNING", "ob:engines", "primary", "THE ENGINE IS STEAMING")
+    if ob.msg then D.slot(6, H - 40, W - 12, ob.msg, ob.msg_color or C.accent, C.bg, 1, "c") end
+    self:button(6, H - 28, math.floor((W - 12) / 4), 22, "< BACK", "ob:back", "normal")
+end
+
+-- SET UP: one face fired, the player says what moved (then how).
+function UI:obFire(ob)
+    local W, H = D.W, D.H
+    local n, total = ob.known_n or 0, math.max(ob.known_total or 1, 1)
+    obHeader("SHIP SETUP: WHAT MOVED?", n .. "/" .. total .. " FOUND", n / total)
+    local cur = ob.cur or {}
+    local round = ({ [0] = "ROUND 1B: CLUTCH", "ROUND 1: LOOK", "ROUND 2: SPIN", "ROUND 3: REVERSE" })[ob.phase or 1] or ""
+    D.slot(6, TOP + 5, W - 12, round, C.dim, C.bg)
+    D.slot(W - 106, TOP + 5, 100, ob.firing and "FIRING..." or "DONE: WHAT MOVED?", ob.firing and C.warn or C.good, C.bg, 1, "r")
+    local what = tostring(cur.relay or "?"):upper() .. "  " .. tostring(cur.face or "?"):upper()
+    local sc = (D.textW(what, 2) <= W - 12) and 2 or 1
+    D.slot(6, TOP + 16, W - 12, what, C.white, C.bg, sc)
+    D.slot(6, TOP + 34, W - 12, ob.hint or "", C.text, C.bg)
+    local gy, gap = TOP + 48, 4
+    if ob.part then
+        local p
+        for _, v in ipairs(ob.pv or {}) do if v.id == ob.part then p = v end end
+        D.slot(6, gy, W - 12, ((p and (p.label .. " " .. p.sub)) or ob.part) .. ": WHAT DID IT DO?", C.accent, C.bg)
+        local ch = ob.choices or {}
+        local bw = math.floor((W - 12 - gap * (#ch - 1)) / math.max(#ch, 1))
+        for i, c in ipairs(ch) do
+            local x = 6 + (i - 1) * (bw + gap)
+            self:button(x, gy + 12, i == #ch and (W - 6 - x) or bw, 52, c.label, "ob:what:" .. c.slot, "primary", c.sub)
+        end
+    else
+        local pv = ob.pv or {}
+        local cols = 4
+        local bw = math.floor((W - 12 - gap * (cols - 1)) / cols)
+        for i, v in ipairs(pv) do
+            local col, row = (i - 1) % cols, math.floor((i - 1) / cols)
+            local x, y = 6 + col * (bw + gap), gy + row * (32 + gap)
+            local style = v.id == "NOTHING" and "warn" or (v.done and "off" or "normal")
+            self:button(x, y, col == cols - 1 and (W - 6 - x) or bw, 32, v.label, "ob:part:" .. v.id, style, v.sub)
+        end
+    end
+    if ob.msg then D.slot(6, H - 42, W - 12, ob.msg, ob.msg_color or C.accent, C.bg) end
+    local by = H - 28
+    local bw = math.floor((W - 12 - 8) / 3)
+    if ob.part then self:button(6, by, bw, 22, "< PARTS", "ob:parts", "normal")
+    else self:button(6, by, bw, 22, "< BACK", "ob:back", "normal") end
+    self:button(6 + bw + 4, by, bw, 22, "FIRE AGAIN", "ob:again", "normal")
+    self:button(6 + (bw + 4) * 2, by, W - 12 - (bw + 4) * 2, 22, "REVIEW >", "ob:review", "normal")
+end
+
+-- SET UP: what the firing found, per part.
+function UI:obReview(ob)
+    local W, H = D.W, D.H
+    local n, total = ob.known_n or 0, math.max(ob.known_total or 1, 1)
+    obHeader("SHIP SETUP: FOUND", n .. "/" .. total .. " FACES SEEN", n / total)
+    local y = TOP + 6
+    for _, r in ipairs(ob.rows or {}) do
+        D.slot(6, y, 70, r.label, C.text, C.bg)
+        D.slot(78, y, 106, r.relay and r.relay:upper() or "NOT FOUND", r.relay and C.white or C.warn, C.bg)
+        local x = 186
+        for _, f in ipairs(r.faces) do
+            local t = (f.lbl ~= "" and (f.lbl .. ":") or "") .. (f.face and f.face:upper() or "-") .. (f.seen and "" or "?")
+            local w = D.textW(t) + 6
+            if x + w > W - 4 then break end
+            D.text(x, y, t, f.seen and C.good or C.warn, C.bg)
+            x = x + w
+        end
+        y = y + 13
+    end
+    D.slot(6, y + 2, W - 12, "? = NOT SEEN: THE TEMPLATE'S FACE IS USED", C.dim, C.bg)
+    if ob.msg then D.slot(6, H - 42, W - 12, ob.msg, ob.msg_color or C.accent, C.bg) end
+    local by = H - 28
+    local bw = math.floor((W - 12 - 8) / 3)
+    self:button(6, by, bw, 22, "< BACK", "ob:back", "normal")
+    self:button(6 + bw + 4, by, bw, 22, "FIRE MISSING", "ob:more", "normal")
+    self:button(6 + (bw + 4) * 2, by, W - 12 - (bw + 4) * 2, 22, "NEXT >", "ob:next", ob.can_next and "primary" or "off")
+end
+
+-- SET UP: an input on a relay the firing found (press it / it reads itself).
+function UI:obPress(ob)
+    local W, H = D.W, D.H
+    local pr = ob.press or {}
+    local it = pr.item or {}
+    obHeader("SHIP SETUP: BUTTONS", string.format("%d/%d", ob.pi or 1, ob.pn or 1), (ob.pi or 1) / (ob.pn or 1))
+    D.slot(6, TOP + 6, W - 12, it.label or "", C.white, C.bg, 2)
+    for i, l in ipairs(wrap(it.desc or "", maxChars(W - 12))) do
+        if i > 2 then break end
+        D.slot(6, TOP + 24 + (i - 1) * 10, W - 12, l, C.text, C.bg)
+    end
+    D.slot(6, TOP + 48, W - 12, "ON " .. tostring(it.relay or "?"):upper() .. "  (TEMPLATE: " .. tostring(it.tpl or "-"):upper() .. ")", C.dim, C.bg)
+    local gap = 4
+    local bw = math.floor((W - 12 - gap * 5) / 6)
+    for i, f in ipairs(pr.faces or {}) do
+        local x = 6 + (i - 1) * (bw + gap)
+        local on = f.face == pr.found
+        local bg = on and C.accent_dk or C.panel
+        D.rect(x, TOP + 62, bw, 30, bg)
+        D.frame(x, TOP + 62, bw, 30, on and C.good or C.line)
+        D.text(x + math.floor(bw / 2), TOP + 67, f.face:upper(), on and C.white or C.text, bg, 1, "c")
+        D.text(x + math.floor(bw / 2), TOP + 79, tostring(f.level), f.level > 0 and C.good or C.dim, bg, 1, "c")
+    end
+    local status = pr.found and ("FOUND: THE " .. pr.found:upper() .. " FACE")
+        or (it.auto and "NOTHING READ YET" or "WAITING FOR A PRESS...")
+    D.slot(6, TOP + 98, W - 12, status, pr.found and C.good or C.warn, C.bg)
+    if ob.msg then D.slot(6, H - 42, W - 12, ob.msg, ob.msg_color or C.accent, C.bg) end
+    local by = H - 28
+    local b3 = math.floor((W - 12 - 8) / 3)
+    self:button(6, by, b3, 22, "< BACK", "ob:back", "normal")
+    self:button(6 + b3 + 4, by, b3, 22, "SKIP", "ob:skip", "normal", nil)
+    self:button(6 + (b3 + 4) * 2, by, W - 12 - (b3 + 4) * 2, 22, (ob.pi == ob.pn) and "FINISH" or "NEXT >", "ob:next",
+        pr.found and "primary" or "off")
 end
 
 function UI:obGuide(ob)
@@ -1104,7 +1230,11 @@ function UI:onboard(m)
         self.hits = {}
         D.rect(0, 0, D.W, D.H, C.bg)
         if ob.screen == "welcome" then self:obWelcome(ob)
+        elseif ob.screen == "engines" then self:obEngines(ob)
         elseif ob.screen == "role" then self:obRole(ob)
+        elseif ob.screen == "fire" then self:obFire(ob)
+        elseif ob.screen == "review" then self:obReview(ob)
+        elseif ob.screen == "press" then self:obPress(ob)
         elseif ob.screen == "guide" then self:obGuide(ob)
         else self:obBusy(ob) end
     end)

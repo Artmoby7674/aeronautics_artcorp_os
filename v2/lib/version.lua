@@ -5,6 +5,7 @@
 -- start-up, in the log and on the error screen; the cockpit screen (start
 -- screen, SHIP tab) shows the number only. Newest first.
 local history = {
+    { "2.38", "SHOW ME", "setup fires each relay face and asks what moved: learns relays AND faces, any wiring" },
     { "2.37", "WELCOME", "first-launch setup (wiring, first-flight guide, tour) and a save-slot manager" },
     { "2.36", "CALIBRATE", "trims kept across engine starts; after RESET: hover hands-off, calibrate, freeze" },
     { "2.35", "FULL THRUST", "A/P cruises at full rear thrust; no more cruise timeout on long trips" },
@@ -40,8 +41,8 @@ return {
     number = latest[1],
     keyword = latest[2],
     note = latest[3],
-    date = "2026-11-24",
+    date = "2026-11-26",
     history = history,
-    -- "v2.37 WELCOME"
+    -- "v2.38 SHOW ME"
     label = "v" .. latest[1] .. " " .. latest[2],
 }
